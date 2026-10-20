@@ -1,0 +1,46 @@
+# 状态机 · 声明真源（issue 状态的唯一家）
+# 状态存在 issue 的 state:* label 上；平台不存第二份状态。
+# none = 「还没有 state 标签」，只作为起点出现，不是真实状态。
+version: 1
+label_prefix: "state:"
+issue_types:
+  - proposed
+  - bugfix
+states:
+  triage: { terminal: false, meaning: "已入库，未分发" }
+  analyzing: { terminal: false, meaning: "分析中，可含交叉验证" }
+  needs-info: { terminal: false, meaning: "等提议人补信息" }
+  rejected: { terminal: true, meaning: "不受理（owner 裁决）" }
+  accepted: { terminal: false, meaning: "受理，等认领" }
+  in-progress: { terminal: false, meaning: "有 PR 在途" }
+  blocked: { terminal: false, meaning: "需修订后重提" }
+  done: { terminal: true, meaning: "已合并且 merge gate 守卫通过" }
+  cancelled: { terminal: true, meaning: "放弃或关闭未合并" }
+transitions:
+  - { from: none, to: triage, by: ci, event: "issues.opened" }
+  - { from: triage, to: analyzing, by: ci, event: "issues.labeled" }
+  - { from: analyzing, to: accepted, by: owner, comment_required: true }
+  - { from: analyzing, to: rejected, by: owner, comment_required: true }
+  - { from: analyzing, to: needs-info, by: owner, comment_required: true }
+  - { from: needs-info, to: analyzing, by: proposer, comment_required: true }
+  - { from: accepted, to: in-progress, by: ci, event: "pull_request.opened" }
+  - { from: in-progress, to: blocked, by: owner, comment_required: true }
+  - {
+      from: blocked,
+      to: in-progress,
+      by: ci,
+      event: "pull_request.synchronize",
+    }
+  - {
+      from: in-progress,
+      to: done,
+      by: ci,
+      event: "pull_request.closed(merged)",
+      guards: [merge-gate],
+    }
+  - { from: "*", to: cancelled, by: owner, comment_required: true }
+roles:
+  ci: "workflow 内的 GITHUB_TOKEN"
+  owner: "OWNERS.md 登记的 owner"
+  proposer: "issue 正文「发起人」字段所指的人"
+  agent: "任何 agent（分析 / 审核 / 编码）：只能评论"

@@ -1,0 +1,72 @@
+# 状态机唯一写者：issue 状态只在本 workflow 里被改
+# 事件 → 意图（build-intent）→ 判定（state-validate）→ 合法才写，非法回滚并留痕。
+name: state-writer
+
+on:
+  issues:
+    types: [opened, labeled, closed, reopened]
+  pull_request:
+    types: [opened, synchronize, closed]
+
+permissions:
+  issues: write
+  pull-requests: read
+  contents: read
+
+concurrency:
+  group: state-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  write:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci || npm install
+
+      # 事件 → 意图。身份只从宿主字段推，不读调用方自述。
+      - name: build intent
+        env:
+          EVENT: ${{ toJSON(github.event) }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          LAST_COMMENT="$(gh api "repos/${{ github.repository }}/issues/${NUMBER}/comments" --jq '.[-1].body // ""' 2>/dev/null || echo "")"
+          export LAST_COMMENT
+          node scripts/build-intent.mjs > intent.json
+          test -s intent.json || { echo "no state change"; exit 0; }
+
+      - name: validate
+        id: validate
+        run: |
+          set +e
+          node scripts/state-validate.mjs --intent intent.json --json > verdict.json
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          cat verdict.json
+
+      - name: apply
+        if: steps.validate.outputs.exit == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          FROM="$(node -p "require('./verdict.json').from")"
+          TO="$(node -p "require('./verdict.json').to")"
+          if [ "$FROM" != "none" ]; then
+            gh issue edit "$NUMBER" --remove-label "state:$FROM"
+          fi
+          gh issue edit "$NUMBER" --add-label "state:$TO"
+
+      # 拒绝与 INFRA 都留痕；INFRA 额外让本 job 失败，避免「没判定成功」被当成通过。
+      - name: record
+        if: steps.validate.outputs.exit != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          gh issue comment "$NUMBER" --body "$(node -p "const v=require('./verdict.json');`状态未被修改：${v.verdict.toUpperCase()} ${v.code} — ${v.message}`")"
+          test "$(node -p "require('./verdict.json').verdict")" = "rejected" || exit 1
