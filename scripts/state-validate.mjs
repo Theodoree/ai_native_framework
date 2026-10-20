@@ -121,6 +121,14 @@ export function validateIntent(cfg, intent) {
     throw infra("E_INTENT_SHAPE", "意图缺少 labels 数组");
   if (typeof intent.to !== "string")
     throw infra("E_INTENT_SHAPE", "意图缺少目标状态 to");
+  // 意图必须自己说清改哪个 issue：PR 号不是 issue 号，解不出就是 INFRA。
+  if (intent.unresolved || intent.issue === null) {
+    throw infra(
+      "E_ISSUE_UNRESOLVED",
+      `意图没有归属的 issue（${intent.unresolved?.reason ?? "issue 为空"}）——PR 号不作为 issue 号使用`,
+      { unresolved: intent.unresolved ?? null },
+    );
+  }
   if (!(intent.actor_role in roles)) {
     throw infra(
       "E_INTENT_SHAPE",

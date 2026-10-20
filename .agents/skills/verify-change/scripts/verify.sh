@@ -27,6 +27,8 @@ usage() {
 
 每步一行「ok/FAIL  标签（exit N，耗时 Xs）」；失败步骤打印其输出尾部（最多 30 行）。
 结尾一行汇总。命令在本机不存在时该步记 SKIP（不是 PASS）。
+只有裸程序名才做「本机是否存在」预检；带赋值前缀或复合语法的命令一律直接执行，
+以免把真实的失败误降级成 SKIP（那会让失败看起来像通过）。
 退出码：0 = 没有任何步骤失败；1 = 至少一步失败。
 EOF
 }
@@ -46,6 +48,16 @@ take_first() {  # 自动识别：按优先级取第一个命中
   elif [ -f pom.xml ]; then add "mvn -q test" "mvn -q test"
   elif [ -f build.gradle ]; then add "./gradlew test" "./gradlew test"
   fi
+}
+
+first_word() {  # 命令的首个词（去掉前导空白）
+  w="${1#"${1%%[![:space:]]*}"}"
+  printf '%s' "${w%%[[:space:]]*}"
+}
+
+is_simple_prog() {  # 仅裸程序名可预检；空串/赋值前缀/复合语法视为“不确定”，交给 shell 执行
+  case "$1" in "" | *[!A-Za-z0-9_./@+-]*) return 1 ;; esac
+  return 0
 }
 
 DRY=0
@@ -83,8 +95,8 @@ mkdir -p "$WORK"
 i=0
 while [ "$i" -lt "$NSTEP" ]; do
   label="${LBL[$i]}"; cmd="${CMD[$i]}"; i=$((i + 1))
-  prog="${cmd%% *}"
-  if ! command -v "$prog" >/dev/null 2>&1; then
+  prog="$(first_word "$cmd")"
+  if is_simple_prog "$prog" && ! command -v "$prog" >/dev/null 2>&1; then
     printf 'SKIP  %s（本机没有 %s，跳过该步）\n' "$label" "$prog"
     SKIP=$((SKIP + 1)); continue
   fi

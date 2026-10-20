@@ -1,7 +1,7 @@
 # P-06 验证脚本的反向用例
 
 - **日期**：2026-10-20
-- **状态**：proposed
+- **状态**：implemented（M1 机制侧已落地；真事件验收待 P-03 远端）
 - **里程碑**：M1 · 写者闭环
 - **依赖**：无
 
@@ -18,3 +18,12 @@
 ## 放弃了什么
 
 - **把 verify.sh 直接加进 `npm run check`**：它自动识别到 `npm test`，会让测试跑两遍，检查时间翻倍而判别力不变。
+
+## 落地记录
+
+- 先证缺陷再修：`--run " echo spaced"` 在旧实现里被记成 `SKIP  run-1（本机没有 ，跳过该步）` 且退出 0 —— 该跑的没跑，失败与成功都被吞成「跳过」。根因是 `prog="${cmd%% *}"` 把任何以空白开头的命令都解析成空程序名。
+- 修法收窄预检，而不是删掉预检：只有「首词是裸程序名且字面量安全」才做 `command -v` 预检，其余交给 shell 真跑；`first_word()` + `is_simple_prog()`（case 字形判断，bash 3.2 兼容）。
+- 反向用例 `tests/verify-script.test.mjs`（8 例）：正常仓 `PASS=1 FAIL=0 SKIP=0` exit 0；test 脚本 `exit 1` → 打印输出尾部 + `FAIL=1` exit 1；空目录 SKIP exit 0 且明说不等于通过。
+- 变异测试证明断言不空：把汇总后的 `[ "$FAIL" -eq 0 ] || exit 1` 改成 `:`，或删掉 `FAIL=$((FAIL + 1))`，用例都会红。
+- 仍然没有把 verify.sh 塞进 `npm run check`：理由不变（会让 `npm test` 跑两遍）。
+

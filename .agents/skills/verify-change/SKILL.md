@@ -16,4 +16,5 @@ description: "Use when finishing a change — run the verification loop: tests, 
 ## 规则
 
 - 验证优先于声称完成：没有测试通过，不算完成
+- 改 `scripts/verify.sh` 必须跑 `tests/verify-script.test.mjs`：它用正/反用例证明脚本抓得住失败（有测试却跑不通时报 FAIL），而不只是会打印 ok
 - 状态标记与 `docs/AGENTS.md` 同步

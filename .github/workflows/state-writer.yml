@@ -28,7 +28,11 @@ jobs:
       - run: npm ci || npm install
 
       # 事件 → 意图。身份只从宿主字段推，不读调用方自述。
+      # NUMBER 是事件自身的号（issue 或 PR），只用来取上下文与留痕位置，不当 issue 号用。
+      # 有没有意图由 build-intent 自己写进 has_intent（它是意图的产地），
+      # YAML 不猜、也不在这里做任何判定：没有意图 = 后续三步全部不跑，job 保持绿。
       - name: build intent
+        id: intent
         env:
           EVENT: ${{ toJSON(github.event) }}
           EVENT_NAME: ${{ github.event_name }}
@@ -38,35 +42,37 @@ jobs:
           LAST_COMMENT="$(gh api "repos/${{ github.repository }}/issues/${NUMBER}/comments" --jq '.[-1].body // ""' 2>/dev/null || echo "")"
           export LAST_COMMENT
           node scripts/build-intent.mjs > intent.json
-          test -s intent.json || { echo "no state change"; exit 0; }
 
       - name: validate
         id: validate
+        if: steps.intent.outputs.has_intent == '1'
         run: |
           set +e
           node scripts/state-validate.mjs --intent intent.json --json > verdict.json
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           cat verdict.json
 
+      # PR 事件也不改 PR 号上的标签：改的是意图解析出的 issue。
       - name: apply
-        if: steps.validate.outputs.exit == '0'
+        if: steps.intent.outputs.has_intent == '1' && steps.validate.outputs.exit == '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
         run: |
+          ISSUE="$(node -p "require('./intent.json').issue")"
           FROM="$(node -p "require('./verdict.json').from")"
           TO="$(node -p "require('./verdict.json').to")"
           if [ "$FROM" != "none" ]; then
-            gh issue edit "$NUMBER" --remove-label "state:$FROM"
+            gh issue edit "$ISSUE" --remove-label "state:$FROM"
           fi
-          gh issue edit "$NUMBER" --add-label "state:$TO"
+          gh issue edit "$ISSUE" --add-label "state:$TO"
 
-      # 拒绝与 INFRA 都留痕；INFRA 额外让本 job 失败，避免「没判定成功」被当成通过。
+      # 拒绝与 INFRA 都留痕（留在事件自身的号上，PR 事件就留在 PR 上）；
+      # 正文格式与 job 红绿只由 writer-record.mjs 决定：rejected→0，infra→1。
+      # has_intent 必须为 1：没有意图就没有判定结果可留痕，空 intent.json 绝不能进到这里
+      # （validate 被跳过时它的 exit 输出为空，单看 exit != '0' 会误命中）。
       - name: record
-        if: steps.validate.outputs.exit != '0'
+        if: steps.intent.outputs.has_intent == '1' && steps.validate.outputs.exit != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
-        run: |
-          gh issue comment "$NUMBER" --body "$(node -p "const v=require('./verdict.json');`状态未被修改：${v.verdict.toUpperCase()} ${v.code} — ${v.message}`")"
-          test "$(node -p "require('./verdict.json').verdict")" = "rejected" || exit 1
+        run: node scripts/writer-record.mjs --verdict verdict.json --issue "$NUMBER"
