@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 原生研发交付引擎</title>
+  <link rel="stylesheet" href="/style.css" />
+  <body>
+    <header>
+      <h1>交付引擎</h1>
+      <span id="flow" class="tag"></span>
+    </header>
+
+    <main>
+      <section>
+        <h2>需求看板</h2>
+        <div id="board" class="board">加载中…</div>
+      </section>
+
+      <section>
+        <h2>提需求</h2>
+        <input id="title" placeholder="标题" />
+        <textarea id="body" rows="3" placeholder="正文 / 验收判据"></textarea>
+        <button id="submit">提交（按 default_flow 自动落状态）</button>
+        <p id="submit-msg" class="msg"></p>
+      </section>
+
+      <section>
+        <h2>证据</h2>
+        <button id="verify">跑一次验证</button>
+        <pre id="evidence">未运行</pre>
+      </section>
+
+      <section>
+        <h2>声明（state-machine.yml）</h2>
+        <textarea id="config" rows="14" spellcheck="false"></textarea>
+        <button id="save-config">保存（先过配置自检，不通过不落盘）</button>
+        <p id="config-msg" class="msg"></p>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

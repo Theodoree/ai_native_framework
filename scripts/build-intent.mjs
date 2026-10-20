@@ -10,6 +10,7 @@ export function buildIntent({
   payload,
   comment = "",
   actorRole,
+  defaultFlow,
 }) {
   const issue = payload.issue ?? {};
   const pr = payload.pull_request ?? {};
@@ -27,8 +28,11 @@ export function buildIntent({
     comment,
   });
 
+  // default_flow=auto：新需求直接受理，actor 是平台自己；缺省仍是入库分发。
   if (eventName === "issues" && action === "opened")
-    return make("triage", "ci");
+    return defaultFlow === "auto"
+      ? make("accepted", "platform")
+      : make("triage", "ci");
   if (eventName === "issues" && action === "labeled") {
     const label = payload.label?.name ?? "";
     if (!label.startsWith("state:")) return null;
@@ -65,6 +69,7 @@ function main() {
     payload,
     comment,
     actorRole: roleFromAssociation(association),
+    defaultFlow: process.env.DEFAULT_FLOW,
   });
   if (!intent) {
     process.stderr.write(`no-state-change ${eventName}.${action}\n`);

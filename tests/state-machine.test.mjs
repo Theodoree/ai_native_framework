@@ -60,7 +60,7 @@ test("正控 4：两个 state 标签报 INFRA", () => {
   expect(error.kind).toBe("infra");
 });
 
-test("新 issue 由 none 起点进入 triage", () => {
+test("manual flow 下新 issue 由 none 起点进入 triage", () => {
   const result = validateIntent(cfg, {
     issue: 1,
     to: "triage",
@@ -68,16 +68,19 @@ test("新 issue 由 none 起点进入 triage", () => {
     actor_role: "ci",
     labels: [],
     comment: "",
+    flow: "manual",
   });
   expect(result.from).toBe("none");
   expect(result.to).toBe("triage");
 });
 
-test("没有 state 标签却想跳到 accepted 被拒（起点只通向 triage）", () => {
+test("没有 state 标签时 owner 不能自己受理（入口只由 platform / ci 走）", () => {
+  // 默认 flow 是 auto，none → accepted 已存在，但只允许 platform 触发；
+  // 人不许自证「这个需求已经被受理了」。
   const error = failure(() =>
     validateIntent(cfg, intent({ labels: ["type:proposed"] })),
   );
-  expect(error.code).toBe("E_NO_TRANSITION");
+  expect(error.code).toBe("E_ROLE_MISMATCH");
 });
 
 test("需要评论的转换缺评论被拒", () => {

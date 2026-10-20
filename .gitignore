@@ -21,6 +21,9 @@ logs/
 # 临时脚本与本地验证落点
 tmp/
 
+# 平台运行态账本（每台实例各自累积，不入库）
+.agents/platform/ledger.jsonl
+
 # 密钥与本地配置
 .env
 .env.*

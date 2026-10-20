@@ -59,7 +59,17 @@ export function loadConfig(path) {
   if (typeof prefix !== "string" || prefix.length === 0) {
     throw infra("E_CONFIG_PREFIX", "配置缺少 label_prefix");
   }
+  const defaultFlow = cfg.policy?.default_flow;
+  if (defaultFlow !== undefined && typeof defaultFlow !== "string") {
+    throw infra("E_CONFIG_POLICY", "policy.default_flow 必须是字符串");
+  }
   for (const t of transitions) {
+    if (t?.flow !== undefined && typeof t.flow !== "string") {
+      throw infra(
+        "E_CONFIG_TRANSITION_SHAPE",
+        `转换的 flow 必须是字符串: ${JSON.stringify(t)}`,
+      );
+    }
     for (const key of ["from", "to", "by"]) {
       if (typeof t?.[key] !== "string") {
         throw infra(
@@ -83,6 +93,24 @@ export function loadConfig(path) {
     }
   }
   return cfg;
+}
+
+// 入口转换同样只在声明里：from=none 的适用转换必须恰好一条。
+// 这样「新需求落到哪、由谁触发」改声明即可，代码不用动。
+export function resolveEntry(cfg, flow) {
+  const effective = flow ?? cfg.policy?.default_flow ?? null;
+  const candidates = (cfg.transitions ?? []).filter(
+    (t) =>
+      t.from === NONE && ((t.flow ?? null) === null || t.flow === effective),
+  );
+  if (candidates.length !== 1) {
+    throw infra(
+      "E_ENTRY_AMBIGUOUS",
+      `flow=${effective} 下入口转换命中 ${candidates.length} 条，必须恰好一条`,
+      { flow: effective, matched: candidates.length },
+    );
+  }
+  return { ...candidates[0], flow: effective };
 }
 
 export function validateIntent(cfg, intent) {
@@ -129,13 +157,27 @@ export function validateIntent(cfg, intent) {
     });
   }
 
-  const transition = transitions.find(
+  // flow 缺省时不猜默认值：只匹配通用转换，flow 专属转换一律不命中。
+  const flow = intent.flow ?? cfg.policy?.default_flow ?? null;
+  const candidates = transitions.filter(
     (t) => t.to === intent.to && (t.from === from || t.from === "*"),
   );
+  const applicable = candidates.filter(
+    (t) => (t.flow ?? null) === null || t.flow === flow,
+  );
+  if (applicable.length > 1) {
+    throw infra(
+      "E_TRANSITION_AMBIGUOUS",
+      `${from} → ${intent.to} 在 flow=${flow} 下命中 ${applicable.length} 条转换，必须恰好一条`,
+      { from, to: intent.to, flow, matched: applicable.length },
+    );
+  }
+  const transition = applicable[0];
   if (!transition) {
     throw reject("E_NO_TRANSITION", `没有从 ${from} 到 ${intent.to} 的转换`, {
       from,
       to: intent.to,
+      flow,
     });
   }
   if (transition.by !== intent.actor_role) {
@@ -159,6 +201,7 @@ export function validateIntent(cfg, intent) {
     from,
     to: intent.to,
     by: transition.by,
+    flow: transition.flow ?? null,
     event: transition.event ?? null,
   };
 }
