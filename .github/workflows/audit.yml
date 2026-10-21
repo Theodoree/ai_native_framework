@@ -11,9 +11,13 @@ name: audit
 # 路由（哪家模型）不在 CI 里：本文件只出现逻辑名 review-a / review-b，真源在
 # .agents/platform/routing.yml（docs/audit-contract.md 四）。
 
+# 触发面刻意只有手动：在 AUDIT_FINDINGS_A/B 有真注入源之前，本 workflow 只能产出
+# action_required（「审计还没真跑」）。而 merge-gate 的 G3 要求每个非自身 check 都是
+# success，于是一个只会 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
+# 那是结构性死锁，而且会训练人忽略红灯。所以等 P-14 接上真执行器之后再打开
+# pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read

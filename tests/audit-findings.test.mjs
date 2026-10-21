@@ -263,6 +263,12 @@ describe("wiring: .github/workflows/audit.yml", () => {
     });
   });
 
+  it("触发面只有手动：注入源就绪前不挂 PR（否则只会 action_required 把每次合并挡死）", () => {
+    // 理由：merge-gate G3 要求非自身 check 全部 success，而本 job 在注入源就绪前只能产
+    // action_required。挂上 pull_request 等于让仓库进入「每次合并都被自己挡」的结构性死锁。
+    expect(Object.keys(doc.on)).toEqual(["workflow_dispatch"]);
+  });
+
   it("真的回写 Check Run（不是只发评论）", () => {
     const calls = steps.filter((s) => typeof s.run === "string");
     const checkRun = calls.filter((s) => s.run.includes("repos/$GITHUB_REPOSITORY/check-runs"));
