@@ -8,7 +8,21 @@
 // 解析不出（0 个或 ≥2 个引用）就把事实如实交出去（issue=null + unresolved），
 // 由判定器判 INFRA —— 这里不做裁决，也不静默退回用 PR 号。
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
+import YAML from "yaml";
+
+// 默认流程的唯一真相源是声明（.agents/platform/state-machine.yml 的 policy.default_flow）。
+// 环境变量只是覆盖：CI 若没传，就按声明走，不允许在这里再留一份默认值。
+const DECLARATION = ".agents/platform/state-machine.yml";
+
+export function defaultFlowFromDeclaration(path = DECLARATION) {
+  try {
+    const cfg = YAML.parse(readFileSync(path, "utf8"));
+    return cfg?.policy?.default_flow ?? null;
+  } catch {
+    return null;
+  }
+}
 
 // GitHub 认的 close 类关键字：close/closes/closed、fix/fixes/fixed、resolve/resolves/resolved。
 // 只认「关键字 + #N」的显式引用：链接、正文里的裸数字都不猜。
@@ -123,7 +137,7 @@ function main() {
     payload,
     comment,
     actorRole: roleFromAssociation(association),
-    defaultFlow: process.env.DEFAULT_FLOW,
+    defaultFlow: process.env.DEFAULT_FLOW ?? defaultFlowFromDeclaration(),
   });
   if (!intent) {
     publishHasIntent(false);

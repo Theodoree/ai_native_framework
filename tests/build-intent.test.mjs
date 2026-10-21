@@ -202,18 +202,21 @@ test("角色只认 author_association：OWNER/MEMBER 是 owner，其余是 propo
 
 // CLI 契约：这次事件有没有意图，由 build-intent 自己公布（它是意图的产地），
 // 调用方不该拿 intent.json 的大小去猜 —— 猜错就会把空文件送进判定与留痕。
-function runCli(eventName, event) {
+function runCli(eventName, event, extraEnv = {}) {
   const dir = mkdtempSync(join(tmpdir(), "build-intent-"));
   const output = join(dir, "gh_output");
   writeFileSync(output, "");
+  const env = {
+    ...process.env,
+    EVENT_NAME: eventName,
+    EVENT: JSON.stringify(event),
+    GITHUB_OUTPUT: output,
+    ...extraEnv,
+  };
+  if (!("DEFAULT_FLOW" in extraEnv)) delete env.DEFAULT_FLOW;
   const r = spawnSync(process.execPath, ["scripts/build-intent.mjs"], {
     encoding: "utf8",
-    env: {
-      ...process.env,
-      EVENT_NAME: eventName,
-      EVENT: JSON.stringify(event),
-      GITHUB_OUTPUT: output,
-    },
+    env,
   });
   return { ...r, output: readFileSync(output, "utf8") };
 }
@@ -236,6 +239,33 @@ test("CLI：有意图时 has_intent=1，并照旧输出意图 JSON", () => {
   expect(r.status).toBe(0);
   expect(r.output).toBe("has_intent=1\n");
   expect(JSON.parse(r.stdout)).toMatchObject({ issue: 7, to: "accepted" });
+});
+
+// 默认流程的唯一真相源是声明，不是 CI 的 env：workflow 没传 DEFAULT_FLOW 时
+// 必须仍按 state-machine.yml 的 policy.default_flow 走，否则 M0 判据（新 issue 自动 accepted）就落空。
+test("CLI：没有 DEFAULT_FLOW 时按声明走 auto（CI 的真实情形）", () => {
+  const r = runCli("issues", {
+    action: "opened",
+    issue: { number: 101, labels: [], author_association: "OWNER" },
+  });
+  expect(r.status).toBe(0);
+  expect(JSON.parse(r.stdout)).toMatchObject({
+    issue: 101,
+    to: "accepted",
+    actor_role: "platform",
+  });
+});
+
+test("CLI：DEFAULT_FLOW 仍能覆盖声明（manual → triage）", () => {
+  const r = runCli(
+    "issues",
+    {
+      action: "opened",
+      issue: { number: 102, labels: [], author_association: "OWNER" },
+    },
+    { DEFAULT_FLOW: "manual" },
+  );
+  expect(JSON.parse(r.stdout)).toMatchObject({ issue: 102, to: "triage" });
 });
 
 test("wiring：apply 用意图解析出的 issue，record 只调用 writer-record", () => {
