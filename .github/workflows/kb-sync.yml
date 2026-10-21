@@ -1,0 +1,90 @@
+# 知识库汇入：合并到默认分支后，从 commit 区间算出要汇入的记录清单。
+# 契约见 docs/knowledge-base.md（单向、按 commit 增量、path + sha256 幂等、失败不阻断合并）。
+#
+# 为什么汇入失败不会阻断合并——三层，缺一层都不够：
+#   1. 触发只在 push 到默认分支（合并已完成），本 workflow 不参与合并判定；
+#   2. export 步骤 continue-on-error：脚本退出 3（INFRA）或崩掉都不让 job 变红；
+#   3. 失败只走「record infra」：warning 注解 + 把 INFRA 记录打进日志，该步骤自己 exit 0。
+#      失败项的路径留在 kb-infra.yml 的 retry_paths 里，下一次合并按当前快照重算。
+name: kb-sync
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: kb-sync
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci || npm install
+
+      # 上一次的产物：清单用来按 path + sha256 去重，INFRA 记录用来重试失败路径。
+      # 取不到（首次汇入 / gh 不可用）不算错——脚本把缺失的文件当空集。
+      - name: restore previous artifacts
+        id: restore
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          RUN_ID="$(gh run list --workflow kb-sync.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          gh run download "$RUN_ID" --name kb-manifest --dir .kb-out/prev
+          gh run download "$RUN_ID" --name kb-infra --dir .kb-out/prev
+
+      - name: export manifest
+        id: export
+        continue-on-error: true
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          mkdir -p .kb-out
+          set +e
+          node scripts/kb-export.mjs \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "${{ github.ref_name }}" \
+            --from "${{ github.event.before }}" \
+            --to "${{ github.event.after }}" \
+            --existing .kb-out/prev/kb-manifest.yml \
+            --retry .kb-out/prev/kb-infra.yml \
+            --out .kb-out/kb-manifest.yml \
+            --infra-out .kb-out/kb-infra.yml
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          cat .kb-out/kb-manifest.yml
+
+      # INFRA 走这里：只留痕，不红 job，也不改合并结论。
+      - name: record infra
+        if: steps.export.outputs.exit != '0'
+        run: |
+          echo "::warning title=kb-sync INFRA::汇入失败已记 INFRA，不阻断合并；下次合并重试同一路径的当前快照"
+          cat .kb-out/kb-infra.yml || true
+          exit 0
+
+      - name: upload manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kb-manifest
+          path: .kb-out/kb-manifest.yml
+          if-no-files-found: warn
+
+      - name: upload infra
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kb-infra
+          path: .kb-out/kb-infra.yml
+          if-no-files-found: warn

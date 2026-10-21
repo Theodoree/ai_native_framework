@@ -1,11 +1,11 @@
 # P-02 写者按策略落状态
 
 - **日期**：2026-10-20
-- **状态**：proposed
+- **状态**：implemented（2026-10-21 真事件验收通过）
 - **里程碑**：M0 · 自举
 - **依赖**：P-01
 
-> **进度**：机制侧已落地（`build-intent.mjs` 按 `defaultFlow` 决定目标状态；判定器按 flow 选转换且要求恰好一条）。剩余：workflow 注入 `DEFAULT_FLOW`。
+> **进度**：已闭环。机制侧（`build-intent.mjs` 按 `defaultFlow` 决定目标状态；判定器按 flow 选转换且要求恰好一条）与 workflow 侧的默认值来源均已落地。
 
 ## 背景
 
@@ -26,3 +26,8 @@ P-01 把策略声明出来之后，事件归一还得按策略选目标。现在
 
 - **在 workflow 里用 `if:` 判断策略**：判定逻辑跑进 YAML 就不可单测了。
 - **写死 accepted**：同 P-01。
+
+## 落地记录
+
+- **默认值一度写在使用方，导致 CI 与本地行为分叉**：`build-intent.mjs` 原本只读 `process.env.DEFAULT_FLOW`，而 `state-writer.yml` 的 build intent 步骤从未设置它——本地手动带 env 的验证全绿，CI 上却会落 `triage`。修法不是「在 YAML 里补一个 env」，而是让脚本自己读声明的 `policy.default_flow`，env 仅作覆盖：默认值的主人在声明里，使用方不该持有第二份。
+- **交付的验证形态**：两条用例分别钉「没有 env 时按声明走 auto」与「env 仍能覆盖声明」。前一条是 CI 的真实情形，此前没有任何用例覆盖——它缺席的时候，机制看起来是完全正确的。

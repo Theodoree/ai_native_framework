@@ -1,0 +1,56 @@
+# 门牌唯一产地：PR 里那张 LAST-CHANGE 表只在这里被重算与写入。
+# 门牌是派生物（docs/last-change.md）→ 同一份输入重算任意次都给同一答案，
+# 所以覆盖写安全，写回 body 也不会自激：内容没变就 changed=0，不再写、不再触发 edited。
+name: last-change
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, closed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: last-change-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci || npm install
+
+      # 输入只有宿主事件 + git 区间：提议人/审核人/合并人全取事件字段，不读任何自述身份；
+      # 合并日期取事件的 merged_at，脚本里没有时钟。
+      # 区间用 ...（merge-base → head），算出来的是这个 PR 自己的改动；
+      # 合并后 head 分支可能已被删，所以合并时改取 merge_commit_sha（它在 base 分支上，一定在）。
+      # 算不出来（没引用 issue、区间为空、合并事件缺 merged_at/merged_by）就红 job，绝不写空表。
+      - name: render
+        id: render
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ toJSON(github.event) }}
+          EVENT_NAME: ${{ github.event_name }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.merged && github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha }}
+        run: |
+          gh pr view "$NUMBER" --json body --jq .body > body.in.md
+          node scripts/last-change.mjs --in body.in.md --out body.out.md
+
+      # 只在真的不同时写回：同一次输入的第二次运行不改 PR（幂等的可见后果）。
+      # render 失败时它没有发布 changed，这一步被跳过 —— 已有字段原样还在。
+      - name: write
+        id: write
+        if: steps.render.outputs.changed == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$NUMBER" --body-file body.out.md

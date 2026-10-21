@@ -1,11 +1,11 @@
 # P-01 默认流程：proposed 自动受理
 
 - **日期**：2026-10-20
-- **状态**：proposed
+- **状态**：implemented（2026-10-21 真事件验收通过）
 - **里程碑**：M0 · 自举
 - **依赖**：无
 
-> **进度**：声明侧已落地（`policy.default_flow: auto`、`none → accepted` by platform、`accepted` 增加 owner 驳回到 `rejected` / `needs-info`）。剩余：GitHub 侧 `issues.opened` 消费 `DEFAULT_FLOW`。
+> **进度**：已闭环。声明侧（`policy.default_flow: auto`、`none → accepted` by platform、`accepted` 增加 owner 驳回到 `rejected` / `needs-info`）与 GitHub 侧（`issues.opened` 消费声明的 `default_flow`）均已落地并通过真事件验收。
 
 ## 背景
 
