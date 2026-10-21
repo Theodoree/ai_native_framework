@@ -1,0 +1,32 @@
+# routing.yml · 逻辑名 → 目标模型的声明真源（唯一家）
+#
+# 这里不是网关配置，是映射的真源：网关只执行这张表，不定义它。
+# 依据 docs/audit-contract.md 第四节「路由不进 CI 配置」——
+#   workflow 里只写逻辑名（review-a / review-b / impl），真实模型由网关映射；
+#   网关必须回传上游真实模型名 + request_id + token 用量。
+# 推论（也是本文件的全部价值）：真实模型名只允许出现在这里。
+#   「换模型」= 改这一行，不动任何 workflow；workflow 里出现模型名 = 绕过真源。
+#
+# 字段：
+#   name      逻辑名 —— workflow / 审计 evidence.agent 里引用的就是这个字符串
+#   provider  模型归属方（非空字符串；本仓库不拥有 provider 枚举，故不做枚举校验）
+#   model     上游真实模型名（非空字符串）
+#   purpose   一句话：这条路由为什么存在（说不清用途的路由不该存在）
+#
+# model 当前是占位值（pending-*），只是把结构声明清楚；绑定真实模型是 owner 的动作，
+# 占位值不参与任何真伪校验，但已经足以让「workflow 硬编码模型名」这条判定生效。
+# 校验器不看值像不像真模型名（那要发明平台事实），只看结构自洽。
+version: 1
+routes:
+  - name: review-a
+    provider: anthropic
+    model: pending-review-a
+    purpose: 交叉验证的 A 侧审计，负责契约判据类 finding
+  - name: review-b
+    provider: openai
+    model: pending-review-b
+    purpose: 交叉验证的 B 侧审计，与 review-a 的结论逐条比对
+  - name: impl
+    provider: deepseek
+    model: pending-impl
+    purpose: 实现与修复类作业，成本优先
