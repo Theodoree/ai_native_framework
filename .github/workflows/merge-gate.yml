@@ -1,0 +1,60 @@
+# 合并资格的机械判定：四条守卫各自能独立失败，全过才允许合并。
+# 判决与执行分离（docs/architecture.md 不变式 2）：本 workflow 只判定，不合并 PR、
+# 不改 issue 状态、不写门牌。分支保护里把 job 名 merge-gate 设成 required status
+# check（P-09）：GitHub 只看退出码判红绿，0 绿 / 1 红 / 3 红（INFRA）。
+#
+# 取数全在这里发生，脚本只收文件、不直连网络 —— 否则 G3 那一类最容易被
+# 「看起来绿」骗过的判定就没法单测：
+#   .gate/event.json  = 宿主事件（PR 号 / 正文 / head sha）
+#   .gate/issue.json  = 门关联 issue 的当前 label（当前状态的家）
+#   .gate/checks.json = PR head commit 的 check runs（结论逐条看，不认「上游说绿」）
+#   .gate/infra.json  = 仍未结的 INFRA 记录（INFRA 必须留痕，留痕载体是 issue）
+name: merge-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  issues: read
+  checks: read
+  pull-requests: read
+
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  merge-gate:
+    runs-on: ubuntu-latest
+    steps:
+      # 直接检出 PR head：门牌文件的存在性靠 git cat-file 取证，取的就是这个 commit。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci || npm install
+
+      - name: collect inputs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ toJSON(github.event) }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -e
+          mkdir -p .gate
+          printf '%s' "$EVENT" > .gate/event.json
+          # issue 号也由脚本解析（引用只有一个家），不在这里再写一遍正则。
+          node scripts/merge-gate.mjs --event .gate/event.json --print-issue > .gate/issue.number
+          gh api "repos/$GITHUB_REPOSITORY/issues/$(cat .gate/issue.number)" > .gate/issue.json
+          gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD/check-runs" > .gate/checks.json
+          gh issue list --label infra --state open --json number,title,url --limit 100 > .gate/infra.json
+
+      - name: gate
+        run: node scripts/merge-gate.mjs --event .gate/event.json --issue .gate/issue.json --checks .gate/checks.json --infra .gate/infra.json

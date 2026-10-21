@@ -1,0 +1,29 @@
+# 机器闸门：状态机自检 + lint + 测试，一次全跑。
+# 它是 required status check 的承载体：没有这个 workflow，「check」这个结论就没有出处，
+# 分支保护挂上去只会得到一个永远等不到的 check。
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci || npm install
+      # 一个入口跑完三件事（配置自洽 + lint + 测试），结论只有一个退出码。
+      - run: npm run check
