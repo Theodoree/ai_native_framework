@@ -288,7 +288,8 @@ test("(e) 同名先红后绿：最新的成功说了算，不拿旧红否决重�
     },
   ];
   const g = gate({ checks: runs });
-  expect(g.status).toBe(0);
+  // 失败时把门的原话带出来：CI 上「本地绿、那里红」不能只留一个数字。
+  expect(g.status, `${g.out}\n${g.err}`).toBe(0);
   expect(g.line("G3")).toContain("PASS OK");
 });
 
