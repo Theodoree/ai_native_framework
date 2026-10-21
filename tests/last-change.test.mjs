@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
+import { changedFiles } from "../scripts/last-change.mjs";
 
 // 门牌的判据是幂等：同一份输入重算两次必须逐字相同，否则它不是派生物。
 // 下面每条都用真 git 区间 + 真 PR 事件跑脚本，只有 workflow 那条把 YAML 里的
@@ -56,6 +57,29 @@ function range(dir, patch) {
   const head = commit(dir, patch, "pr");
   return { base, head };
 }
+
+// 门牌列的文件必须在 head 上真的存在（G2 的判据）：一次 git mv 曾经让门牌列出
+// 已经不存在的旧路径，门据此判 E_FILE_MISSING —— 生产者自己造的矛盾。
+test("changedFiles：重命名只留新路径、删掉的不进门牌（列出的必须在 head 上存在）", () => {
+  const dir = tempRepo();
+  const base = commit(
+    dir,
+    { "docs/old.md": "same\nsame\nsame\n", "docs/gone.md": "bye\n" },
+    "base",
+  );
+  execFileSync("git", ["mv", "docs/old.md", "docs/new.md"], { cwd: dir });
+  execFileSync("git", ["rm", "-q", "docs/gone.md"], { cwd: dir });
+  const head = commit(dir, { "docs/kept.md": "k\n" }, "pr");
+
+  const files = changedFiles({ base, head, cwd: dir });
+  expect(files).toEqual(["docs/kept.md", "docs/new.md"]);
+  // 逐条证明「列出来的都在 head 上」：这就是 G2 那条判据，生产者得自己守。
+  for (const file of files)
+    expect(
+      spawnSync("git", ["cat-file", "-e", `${head}:${file}`], { cwd: dir })
+        .status,
+    ).toBe(0);
+});
 
 const prEvent = ({
   number = 9,

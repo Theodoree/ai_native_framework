@@ -130,7 +130,18 @@ export function changedFiles({ base, head, cwd = process.cwd() }) {
   try {
     out = execFileSync(
       "git",
-      ["diff", "--name-only", "--no-color", "--no-ext-diff", `${b}...${h}`],
+      // 门牌列的文件必须在 head 上真的存在（G2 就是这么判的），所以：
+      // 删掉的不列（--diff-filter=d 排除 D），重命名只留新路径（-M 打开重命名检测）。
+      // 少了这两条，一次 git mv 就会让门牌列出已经不存在的路径，门自己打自己。
+      [
+        "diff",
+        "--name-only",
+        "--diff-filter=d",
+        "-M",
+        "--no-color",
+        "--no-ext-diff",
+        `${b}...${h}`,
+      ],
       { cwd, encoding: "utf8" },
     );
   } catch (error) {
