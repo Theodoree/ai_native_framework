@@ -14,9 +14,21 @@
 //                      —— 上游 JSON 注入，同名多次运行只看最新一次（旧绿不给新红背书）
 //   G4 last-change     门牌写着本 PR 编号 —— 表格格式复用 last-change.mjs 的渲染器
 //
+// 「拒绝」与「未就绪」是两件事，退出码必须分开（真 PR 上四条同红时读不出根因，就是
+// 因为两者被混成一种红）：
+//   FAIL    = 这一笔本身不合格（issue 状态不允许、门牌撒谎、检查项 failure/cancelled…）
+//   INFRA   = 现在还判不了：门牌的生产者还没写完、别家检查还在跑、输入取不到
+// 所有「未就绪」的判定一律 exit 3、绝不当通过；stdout 的汇总行把两者分开计数。
+//
+// 门的结论必须建立在「门牌已由生产者写完」之后。生产者的完成信号是它自己的 check run
+// （last-change 的 job 名，脚本常量 PRODUCER）：job 完成 ⟹ 写回步骤已经跑完。只在生产者
+// 之后的正文上判定 —— 不靠睡一觉碰运气，也绝不把「门牌缺失」判成通过。
+// 宿主事件里的 pull_request.body 是事件发生那一刻的快照，生产者写回后不会回填，
+// 所以正文另有 --pr 输入（workflow 现场取的最新 PR 现况）；缺了它，等多久都读到旧正文。
+//
 // 退出码沿用平台三分（.agents/notes/implemented/platform-design-baseline.md 三）：
-//   0 允许合并（四条全过）· 1 拒绝（至少一条失败，stdout 指名是哪条、为什么）
-//   3 INFRA（配置或输入不可判定、检查项根本没跑 —— 绝不当通过）
+//   0 允许合并（四条全过）· 1 拒绝（至少一条 FAIL；未就绪的也一并列出）
+//   3 INFRA（一条 FAIL 都没有，但还判不了 —— 绝不当通过）
 //
 // Check 名是 workflow 的 job 名 merge-gate：GitHub 用退出码判红绿，非零即红。
 // stdout 每行一个判定（判据本身）；stderr 只放意外错误，不做调试输出。
@@ -25,15 +37,16 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolveIssueRefs } from "./build-intent.mjs";
-import {
-  BLOCK_BEGIN,
-  BLOCK_END,
-  renderLastChange,
-} from "./last-change.mjs";
+import { BLOCK_BEGIN, BLOCK_END, renderLastChange } from "./last-change.mjs";
 import { loadConfig, validateIntent } from "./state-validate.mjs";
 
 const CHECK = "merge-gate";
 const DEFAULT_CONFIG = ".agents/platform/state-machine.yml";
+// 门牌的生产者 = last-change workflow 的 job 名。它的 check run 完成 ⟹ 写回步骤已跑完，
+// 门牌此刻才可信。名字是跨 workflow 的契约：workflow 名不等于 job 名，挂在 check_runs
+// 里的是 job 名，所以这里要 job 名；测试钉住它与 last-change.yml 的 job 键一致。
+const PRODUCER = "render";
+const PENDING_WORD = "未就绪";
 
 class Fail extends Error {
   constructor(kind, code, message) {
@@ -70,7 +83,10 @@ function readJson(path, what) {
   try {
     return JSON.parse(raw);
   } catch (error) {
-    throw infra("E_INPUT_UNPARSABLE", `${what} 不是合法 JSON: ${error.message}`);
+    throw infra(
+      "E_INPUT_UNPARSABLE",
+      `${what} 不是合法 JSON: ${error.message}`,
+    );
   }
 }
 
@@ -120,17 +136,23 @@ function shape() {
       );
     return i;
   };
-  SHAPE = { rows: rows.length, pr: at("#424242"), files: at("`__probe__.mjs`") };
+  SHAPE = {
+    rows: rows.length,
+    pr: at("#424242"),
+    files: at("`__probe__.mjs`"),
+  };
   return SHAPE;
 }
 
 function lastChange(text) {
   const begin = text.indexOf(BLOCK_BEGIN);
   const end = text.indexOf(BLOCK_END);
+  // 门牌缺失不是「这一笔不合格」，是「上游还没写好」：生产者没写、写失败、或者
+  // 本进程读到的是旧快照。判成拒绝等于把别人的未完成记在 PR 头上，也让读者去追错方向。
   if (begin === -1 || end < begin)
-    throw reject(
+    throw infra(
       "E_LAST_CHANGE_MISSING",
-      "PR 正文没有 LAST-CHANGE 节：门牌缺失，无从判定",
+      "PR 正文没有 LAST-CHANGE 节：门牌还没写完，等 last-change 生产者写回后再判",
     );
   const lines = text
     .slice(begin + BLOCK_BEGIN.length, end)
@@ -145,9 +167,9 @@ function lastChange(text) {
       `门牌表格 ${rows.length} 行，last-change.mjs 的模板 ${s.rows} 行：门牌不是派生物`,
     );
   const pr = cells(rows[s.pr])[1] ?? "";
-  const files = [
-    ...(cells(rows[s.files])[1] ?? "").matchAll(/`([^`]+)`/g),
-  ].map((m) => m[1].replace(/\\\|/g, "|"));
+  const files = [...(cells(rows[s.files])[1] ?? "").matchAll(/`([^`]+)`/g)].map(
+    (m) => m[1].replace(/\\\|/g, "|"),
+  );
   if (files.length === 0)
     throw reject(
       "E_LAST_CHANGE_FILES",
@@ -163,7 +185,11 @@ function gitOk(args, repo) {
   const r = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
   if (r.error)
     throw infra("E_GIT_UNAVAILABLE", `无法执行 git: ${r.error.message}`);
-  return { ok: r.status === 0, status: r.status, err: String(r.stderr ?? "").trim() };
+  return {
+    ok: r.status === 0,
+    status: r.status,
+    err: String(r.stderr ?? "").trim(),
+  };
 }
 
 function existsAt(head, path, repo) {
@@ -174,6 +200,46 @@ function existsAt(head, path, repo) {
       `取不到 commit ${head}（git 退出 ${commit.status}）：${commit.err}`,
     );
   return gitOk(["cat-file", "-e", `${head}:${path}`], repo).ok;
+}
+
+// ---- 上游就绪：判定只能在生产者之后发生 ----
+
+function checkRuns(ctx) {
+  const runs = Array.isArray(ctx.checks) ? ctx.checks : ctx.checks?.check_runs;
+  if (!Array.isArray(runs))
+    throw infra(
+      "E_CHECKS_SHAPE",
+      "check runs 输入应为数组或 { check_runs: [...] }",
+    );
+  return runs;
+}
+
+// 同名多次运行（重跑 / 重推）只看 id 最大的一次：旧的成功不能替新的失败背书，
+// 这正是「看起来绿」的典型形状。
+const newest = (list) =>
+  list.reduce((a, b) => (Number(b?.id ?? 0) >= Number(a?.id ?? 0) ? b : a));
+
+// 生产者的完成信号就是它自己的 check run（job 完成 ⟹ 写回步骤已经跑过）。
+// 没出现 / 还在跑 = 门牌可能是旧的或半截 → 未就绪；生产者自己红了 = 这次没写成。
+function assertProducerSettled(ctx) {
+  const mine = checkRuns(ctx).filter((r) => r?.name === ctx.producer);
+  if (mine.length === 0)
+    throw infra(
+      "E_LAST_CHANGE_PENDING",
+      `生产者 ${ctx.producer} 还没在 ${short(ctx.head)} 上出现：门牌可能还没开始写，不判`,
+    );
+  const run = newest(mine);
+  if (run.status !== "completed")
+    throw infra(
+      "E_LAST_CHANGE_PENDING",
+      `生产者 ${ctx.producer}(id ${run?.id}) 还在 ${run.status}：门牌写到一半不判`,
+    );
+  if (run.conclusion !== "success")
+    throw infra(
+      "E_LAST_CHANGE_FAILED",
+      `生产者 ${ctx.producer}(id ${run?.id}) ${run.status}/${run.conclusion}：门牌这次没写成，先修生产者再判`,
+    );
+  return run;
 }
 
 // ---- 四条守卫 ----
@@ -195,6 +261,7 @@ function guardIssueState(ctx) {
 }
 
 function guardIssueAndFiles(ctx) {
+  assertProducerSettled(ctx);
   const ref = resolvePrIssue(ctx.pr);
   if (ref !== ctx.issue.number)
     throw reject(
@@ -218,43 +285,48 @@ function normalizeInfra(input) {
   return list;
 }
 
+// 「还没跑完」和「跑完是红的」是两种结论：
+//   未完成（queued/in_progress/…）→ 未就绪，exit 3：别家检查在跑不是不合格，是还判不了
+//   completed 且非 success（failure/cancelled/timed_out/skipped/…）→ 真失败，exit 1
+// 自己不能给自己背书：check 名就是我们自己（CHECK）的那条一律不看 —— 要求「自己已经绿」
+// 是逻辑死结（本 job 此刻必然 in_progress），把它算进去就等于永远红。
 function guardChecks(ctx) {
-  const runs = Array.isArray(ctx.checks) ? ctx.checks : ctx.checks?.check_runs;
-  if (!Array.isArray(runs))
-    throw infra(
-      "E_CHECKS_SHAPE",
-      "check runs 输入应为数组或 { check_runs: [...] }",
-    );
-  // 检查没跑 ≠ 绿：没有检查项就判不出资格，走 INFRA 而不是放行。
-  if (runs.length === 0)
-    throw infra(
-      "E_CHECKS_EMPTY",
-      `上游没有为 ${short(ctx.head)} 报告任何 check run：检查没跑不等于绿`,
-    );
-  // 同名多次运行（重跑 / 重推）只看最新一次（id 递增）：
-  // 旧的成功不能替新的失败背书，这正是「看起来绿」的典型形状。
+  const all = checkRuns(ctx);
+  // 同名多次运行（重跑 / 重推）只看最新一次，再剔除自己。
   const latest = new Map();
-  for (const run of runs) {
+  for (const run of all) {
     const prev = latest.get(run?.name);
     if (!prev || Number(run?.id ?? 0) >= Number(prev?.id ?? 0))
       latest.set(run?.name, run);
   }
-  const all = [...latest.values()];
-  const stale = all.filter((r) => r.head_sha && r.head_sha !== ctx.head);
+  const others = [...latest.values()].filter((r) => r?.name !== CHECK);
+  // 检查没跑 ≠ 绿：没有别的检查项就判不出资格，走 INFRA 而不是放行。
+  if (others.length === 0)
+    throw infra(
+      "E_CHECKS_EMPTY",
+      `上游没有为 ${short(ctx.head)} 报告任何别人的 check run：检查没跑不等于绿`,
+    );
+  const stale = others.filter((r) => r.head_sha && r.head_sha !== ctx.head);
   if (stale.length)
     throw reject(
       "E_CHECK_STALE",
-      `这些检查项不是 ${short(ctx.head)} 的: ${stale.map((r) => r.name).join(", ")}`,
+      `这些检查项不是 ${short(ctx.head)} 的: ${stale
+        .map((r) => r.name)
+        .join(", ")}`,
     );
-  const bad = all.filter(
-    (r) => !(r.status === "completed" && r.conclusion === "success"),
-  );
+  const label = (r) =>
+    `${r.name}(id ${r.id}) ${r.status}/${r.conclusion ?? "null"}`;
+  const pending = others.filter((r) => r.status !== "completed");
+  if (pending.length)
+    throw infra(
+      "E_CHECK_PENDING",
+      `${pending.length} 项还没跑完: ${pending.map(label).join(", ")} —— 等它们出结论再算`,
+    );
+  const bad = others.filter((r) => r.conclusion !== "success");
   if (bad.length)
     throw reject(
       "E_CHECK_NOT_GREEN",
-      `不是绿的 ${bad.length} 项: ${bad
-        .map((r) => `${r.name}(id ${r.id}) ${r.status}/${r.conclusion}`)
-        .join(", ")}`,
+      `不是绿的 ${bad.length} 项: ${bad.map(label).join(", ")}`,
     );
   const open = normalizeInfra(ctx.infra);
   if (open.length)
@@ -264,10 +336,11 @@ function guardChecks(ctx) {
         .map((i) => i?.id ?? JSON.stringify(i))
         .join(", ")}`,
     );
-  return `${all.length} 项全绿（同名取最新），无未结 INFRA`;
+  return `${others.length} 项别人家的检查全绿（同名取最新，自己不算），无未结 INFRA`;
 }
 
 function guardLastChangePr(ctx) {
+  assertProducerSettled(ctx);
   const { pr } = lastChange(ctx.body);
   const m = /^#(\d+)$/.exec(pr);
   if (!m)
@@ -296,12 +369,15 @@ function runGuard(id, title, body) {
     return { id, title, verdict: "PASS", code: "OK", detail: body() };
   } catch (error) {
     if (!isVerdict(error)) throw error;
+    const notReady = error.kind === "infra";
     return {
       id,
       title,
-      verdict: error.kind === "infra" ? "INFRA" : "FAIL",
+      verdict: notReady ? "INFRA" : "FAIL",
       code: error.code,
-      detail: error.message,
+      // 逐行也要能读出「这是等上游」而不是「这一笔不合格」：
+      // 真 PR 上四条同红时，读者靠这个词判断该去修 PR 还是去看生产者。
+      detail: notReady ? `${PENDING_WORD}：${error.message}` : error.message,
     };
   }
 }
@@ -314,20 +390,33 @@ function collect(argv) {
     ? readText(eventPath, "事件输入（--event）")
     : (process.env.EVENT ?? "");
   if (!String(raw).trim())
-    throw infra("E_EVENT_MISSING", "没有事件输入：--event <file> 或 EVENT 环境变量");
+    throw infra(
+      "E_EVENT_MISSING",
+      "没有事件输入：--event <file> 或 EVENT 环境变量",
+    );
   let event;
   try {
     event = JSON.parse(raw);
   } catch (error) {
     throw infra("E_EVENT_UNPARSABLE", `事件不是合法 JSON: ${error.message}`);
   }
-  const pr = event?.pull_request;
-  if (!pr || typeof pr !== "object" || typeof pr.number !== "number")
+  const eventPr = event?.pull_request;
+  if (
+    !eventPr ||
+    typeof eventPr !== "object" ||
+    typeof eventPr.number !== "number"
+  )
     throw infra(
       "E_EVENT_SHAPE",
       "事件里没有 pull_request.number：gate 只判 PR 的合并资格",
     );
-  const head = arg(argv, "--head") ?? pr.head?.sha ?? "";
+  // 事件里的正文是「事件发生那一刻」的快照。门牌由 last-change 之后写回，写回不会
+  // 回填这份快照 —— 所以正文另取最新的 PR 现况（--pr），否则等到天亮也读到旧正文。
+  const prPath = arg(argv, "--pr");
+  const live = prPath ? readJson(prPath, "PR 现况（--pr）") : null;
+  const pr = live && typeof live.number === "number" ? live : eventPr;
+  // 判的是这次运行的 head（事件里的），不是现况里可能已经又推一版的 head。
+  const head = arg(argv, "--head") ?? eventPr.head?.sha ?? pr.head?.sha ?? "";
   if (!head)
     throw infra(
       "E_HEAD_MISSING",
@@ -337,6 +426,7 @@ function collect(argv) {
     pr,
     body: String(pr.body ?? ""),
     head,
+    producer: PRODUCER,
     repo: arg(argv, "--repo") ?? process.cwd(),
     configPath: arg(argv, "--config") ?? DEFAULT_CONFIG,
   };
@@ -347,18 +437,21 @@ function report(ctx, results) {
   out(`${CHECK} PR #${ctx.pr.number} @ ${short(ctx.head)}`);
   for (const r of results)
     out(`${CHECK} ${r.id} ${r.title} ${r.verdict} ${r.code} ${r.detail}`);
-  const bad = results.filter((r) => r.verdict !== "PASS");
-  if (bad.length === 0) {
+  // 汇总行必须把「真失败」与「未就绪」分开数：G2/G4 在门牌缺失时说的是同一件事，
+  // 混成「k 条全错」会让读者去查两个不存在的缺陷。
+  const rejected = results.filter((r) => r.verdict === "FAIL");
+  const pending = results.filter((r) => r.verdict === "INFRA");
+  if (rejected.length === 0 && pending.length === 0) {
     out(`${CHECK} PASS ${results.length}/${results.length}`);
     process.exit(0);
   }
-  const infraHit = bad.some((r) => r.verdict === "INFRA");
+  const ids = (list) =>
+    list.length ? `(${list.map((r) => r.id).join(",")})` : "";
   out(
-    `${CHECK} ${infraHit ? "INFRA" : "FAIL"} ${bad.length}/${results.length} ${bad
-      .map((r) => r.id)
-      .join(",")}`,
+    `${CHECK} ${rejected.length ? "FAIL" : "INFRA"} ${rejected.length + pending.length}/${results.length} 真失败=${rejected.length}${ids(rejected)} 未就绪=${pending.length}${ids(pending)}`,
   );
-  process.exit(infraHit ? 3 : 1);
+  // 有真失败就是拒绝（可动手的部分已经明确）；一条真失败都没有才是 INFRA。
+  process.exit(rejected.length ? 1 : 3);
 }
 
 function main(argv) {
@@ -391,7 +484,6 @@ function main(argv) {
 // 入口判定走 realpath：检出目录可能是符号链接（worktree、npm link、CI 的挂载点），
 // 那时 argv[1] 与 import.meta.url 不是同一条字面路径。判不中不是报错而是静默不判定、
 // 退出 0 —— 对门来说这是最坏的失败形态（看起来绿），所以这里必须认得出自己。
-const invoked = process.argv[1]
-  ? realpathSync(process.argv[1])
-  : undefined;
-if (invoked === realpathSync(fileURLToPath(import.meta.url))) main(process.argv.slice(2));
+const invoked = process.argv[1] ? realpathSync(process.argv[1]) : undefined;
+if (invoked === realpathSync(fileURLToPath(import.meta.url)))
+  main(process.argv.slice(2));

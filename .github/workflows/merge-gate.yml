@@ -1,14 +1,23 @@
 # 合并资格的机械判定：四条守卫各自能独立失败，全过才允许合并。
 # 判决与执行分离（docs/architecture.md 不变式 2）：本 workflow 只判定，不合并 PR、
 # 不改 issue 状态、不写门牌。分支保护里把 job 名 merge-gate 设成 required status
-# check（P-09）：GitHub 只看退出码判红绿，0 绿 / 1 红 / 3 红（INFRA）。
+# check（P-09）：GitHub 只看退出码判红绿，0 绿 / 1 红（拒绝）/ 3 红（未就绪）。
 #
 # 取数全在这里发生，脚本只收文件、不直连网络 —— 否则 G3 那一类最容易被
 # 「看起来绿」骗过的判定就没法单测：
-#   .gate/event.json  = 宿主事件（PR 号 / 正文 / head sha）
+#   .gate/event.json  = 宿主事件（PR 号 / head sha，正文是事件那一刻的快照）
+#   .gate/pr.json     = PR 现况（gh api pulls/N）：正文的当前值，门牌写回后才有表
 #   .gate/issue.json  = 门关联 issue 的当前 label（当前状态的家）
-#   .gate/checks.json = PR head commit 的 check runs（结论逐条看，不认「上游说绿」）
+#   .gate/checks.json = PR head 的 check runs（结论逐条看，不认「上游说绿」）
 #   .gate/infra.json  = 仍未结的 INFRA 记录（INFRA 必须留痕，留痕载体是 issue）
+#
+# 为什么不能只靠事件重跑（真 PR #2 暴露的竞态）：门牌由 last-change 用 GITHUB_TOKEN
+# 写回 PR 正文，而 GITHUB_TOKEN 造成的改动不会再触发 workflow（防自激），所以
+# 「等 edited 把门重新叫醒」这条路根本不会发生，门就停在读到旧正文的红上。
+# 因此本 workflow 的结论不靠事件，而靠「等上游到终态」：取数之前的
+# wait for upstream to settle 把同一个 head 上除自己以外的 check run 全部等到终态
+# （last-change 的 render 在里面 —— 它完成 ⟹ 写回步骤已跑完），然后才取数判定。
+# 等待有上限，超时也照样往下走，由门判成「未就绪」（exit 3）而不是「通过」。
 name: merge-gate
 
 on:
@@ -41,20 +50,57 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
+      # 门牌的生产者名（render）只有一个家：scripts/merge-gate.mjs 的 PRODUCER，
+      # 由 tests/merge-gate.test.mjs 钉住它与 last-change.yml 的 job 键一致。
+      # 等的是「别人的结论」，所以自己（SELF=merge-gate）要排除 —— 自己此刻必然
+      # in_progress，等自己就是死等，也是逻辑死结。
+      - name: wait for upstream to settle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          SELF: merge-gate
+          DEADLINE_SECONDS: 600
+          INTERVAL_SECONDS: 10
+        run: |
+          set -u
+          mkdir -p .gate
+          elapsed=0
+          while :; do
+            gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD/check-runs" > .gate/wait.json 2>/dev/null || true
+            # 计数交给 node：别在 YAML 里再写一遍 jq 方言，取数与解析用同一个运行时。
+            counts=$(node -e 'const r = JSON.parse(require("node:fs").readFileSync(".gate/wait.json", "utf8")); const o = (r.check_runs || []).filter((x) => x.name !== process.env.SELF); process.stdout.write(o.length + " " + o.filter((x) => x.status !== "completed").length)' 2>/dev/null || echo "0 0")
+            total=${counts%% *}
+            pending=${counts##* }
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              echo "upstream settled: $total check run(s) on $HEAD"
+              exit 0
+            fi
+            if [ "$elapsed" -ge "$DEADLINE_SECONDS" ]; then
+              echo "::warning::upstream not settled after ${DEADLINE_SECONDS}s (total=$total pending=$pending): 交给门判「未就绪」"
+              exit 0
+            fi
+            sleep "$INTERVAL_SECONDS"
+            elapsed=$((elapsed + INTERVAL_SECONDS))
+          done
+
       - name: collect inputs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT: ${{ toJSON(github.event) }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+          NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -e
           mkdir -p .gate
           printf '%s' "$EVENT" > .gate/event.json
+          # 正文取现况：事件里的正文是快照，门牌写回不会回填它。
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER" > .gate/pr.json
           # issue 号也由脚本解析（引用只有一个家），不在这里再写一遍正则。
-          node scripts/merge-gate.mjs --event .gate/event.json --print-issue > .gate/issue.number
+          node scripts/merge-gate.mjs --event .gate/event.json --pr .gate/pr.json --print-issue > .gate/issue.number
           gh api "repos/$GITHUB_REPOSITORY/issues/$(cat .gate/issue.number)" > .gate/issue.json
+          # 等完之后才取：取的是别人的最终结论，不是起跑时的半截。
           gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD/check-runs" > .gate/checks.json
           gh issue list --label infra --state open --json number,title,url --limit 100 > .gate/infra.json
 
       - name: gate
-        run: node scripts/merge-gate.mjs --event .gate/event.json --issue .gate/issue.json --checks .gate/checks.json --infra .gate/infra.json
+        run: node scripts/merge-gate.mjs --event .gate/event.json --pr .gate/pr.json --issue .gate/issue.json --checks .gate/checks.json --infra .gate/infra.json

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildIntent,
+  readIssueLabels,
   resolveIssueRefs,
   roleFromAssociation,
 } from "../scripts/build-intent.mjs";
@@ -87,6 +88,7 @@ test("(a) body 含 Fixes #12 → issue 是 12，不是 PR 号", () => {
     eventName: "pull_request",
     action: "opened",
     payload: prWith({ number: 9, body: "这个补丁 Fixes #12" }),
+    issueLabelsFromHost: ["state:accepted"],
   });
   expect(out.issue).toBe(12);
   expect(out.unresolved).toBeUndefined();
@@ -128,8 +130,9 @@ test("(b) 上链路：无引用的 PR 事件被判定器判 INFRA，CLI 退出�
       "scripts/state-validate.mjs",
       "--config",
       CONFIG,
+      // "-" = stdin。不用 /dev/stdin：Linux（CI）上读管道会失败。
       "--intent",
-      "/dev/stdin",
+      "-",
     ],
     { encoding: "utf8", input: JSON.stringify(out) },
   );
@@ -266,6 +269,213 @@ test("CLI：DEFAULT_FLOW 仍能覆盖声明（manual → triage）", () => {
     { DEFAULT_FLOW: "manual" },
   );
   expect(JSON.parse(r.stdout)).toMatchObject({ issue: 102, to: "triage" });
+});
+
+// 真 PR #2 的形状：事件是 PR（number=2），它引用 issue #1，issue #1 的当前状态是
+// state:accepted —— 而那些标签只存在于宿主，payload 里没有。
+const realPr = (fields = {}) =>
+  prWith({ number: 2, body: "Fixes #1", title: "feat: 状态机", ...fields });
+
+const validateStdin = (stdout) =>
+  spawnSync(
+    process.execPath,
+    [
+      "scripts/state-validate.mjs",
+      "--config",
+      CONFIG,
+      "--intent",
+      "-",
+      "--json",
+    ],
+    { encoding: "utf8", input: stdout },
+  );
+
+test("(a) PR 事件：宿主注入 state:accepted → from=accepted、to=in-progress、判定 allowed", () => {
+  const out = buildIntent({
+    eventName: "pull_request",
+    action: "opened",
+    payload: realPr(),
+    issueLabelsFromHost: ["state:accepted"],
+  });
+  expect(out).toMatchObject({
+    issue: 1,
+    to: "in-progress",
+    actor_role: "ci",
+    labels: ["state:accepted"],
+  });
+  expect(out.unresolved).toBeUndefined();
+  const verdict = validateIntent(loadConfig(CONFIG), out);
+  expect(verdict).toMatchObject({
+    from: "accepted",
+    to: "in-progress",
+    by: "ci",
+  });
+});
+
+test("(b) PR 事件：宿主注入终态 state:done → 拒绝 E_TERMINAL_STATE，意图仍指 issue 1（不是 PR 号 2）", () => {
+  // 本地绿、CI 红的教训：from 只能来自宿主取数（ISSUE_STATE_FILE 注入），
+  // 不能把 payload 里「没有 issue 标签」读成 none —— 旧实现正是这么判出 E_NO_TRANSITION，
+  // 而单元测试伪造的 payload 自带 labels，所以本地看不出来。
+  const out = buildIntent({
+    eventName: "pull_request",
+    action: "opened",
+    payload: realPr(),
+    issueLabelsFromHost: ["state:done"],
+  });
+  expect(out.issue).toBe(1);
+  expect(out.issue).not.toBe(2);
+  let error;
+  try {
+    validateIntent(loadConfig(CONFIG), out);
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error.kind).toBe("rejected");
+  expect(error.code).toBe("E_TERMINAL_STATE");
+});
+
+test("解出 issue 但宿主没交状态 → 判 INFRA，绝不把缺席读成 none", () => {
+  const out = buildIntent({
+    eventName: "pull_request",
+    action: "opened",
+    payload: realPr(),
+    issueLabelsFromHost: null,
+  });
+  expect(out.labels).toEqual([]);
+  expect(out.unresolved).toEqual({
+    reason: "issue-state-unavailable",
+    candidates: [1],
+  });
+  let error;
+  try {
+    validateIntent(loadConfig(CONFIG), out);
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error.kind).toBe("infra");
+  expect(error.code).toBe("E_ISSUE_UNRESOLVED");
+});
+
+test("issues.* 事件不用注入：payload 自带标签（回归）", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "labeled",
+    payload: issue(["state:accepted"], { label: { name: "state:in-progress" } }),
+    actorRole: "owner",
+    issueLabelsFromHost: null,
+  });
+  expect(out.labels).toEqual(["state:accepted"]);
+  expect(out.to).toBe("in-progress");
+});
+
+test("readIssueLabels：拿不到返回 null，拿到零个标签返回 []（两种事实不能混）", () => {
+  const dir = mkdtempSync(join(tmpdir(), "issue-state-"));
+  const write = (name, body) => {
+    const path = join(dir, name);
+    writeFileSync(path, body);
+    return path;
+  };
+  expect(readIssueLabels(undefined)).toBeNull();
+  expect(readIssueLabels(join(dir, "missing.json"))).toBeNull();
+  expect(readIssueLabels(write("empty.json", ""))).toBeNull();
+  expect(readIssueLabels(write("bad.json", "not json"))).toBeNull();
+  expect(readIssueLabels(write("shape.json", '{"name":"x"}'))).toBeNull();
+  expect(readIssueLabels(write("none.json", '{"labels":[]}'))).toEqual([]);
+  expect(
+    readIssueLabels(
+      write("ok.json", '{"labels":["state:accepted","type:bugfix"]}'),
+    ),
+  ).toEqual(["state:accepted", "type:bugfix"]);
+});
+
+const stateFile = (body) => {
+  const path = join(
+    mkdtempSync(join(tmpdir(), "issue-state-cli-")),
+    "issue-state.json",
+  );
+  writeFileSync(path, body);
+  return path;
+};
+
+test("CLI：(a) 注入 accepted → 判定 allowed（exit 0），from 来自注入而不是 payload", () => {
+  const r = runCli("pull_request", { ...realPr(), action: "opened" }, {
+    ISSUE_STATE_FILE: stateFile('{"labels":["state:accepted"]}'),
+  });
+  expect(r.status).toBe(0);
+  const intent = JSON.parse(r.stdout);
+  expect(intent).toMatchObject({
+    issue: 1,
+    to: "in-progress",
+    labels: ["state:accepted"],
+  });
+  const v = validateStdin(r.stdout);
+  expect(v.status).toBe(0);
+  expect(JSON.parse(v.stdout)).toMatchObject({
+    verdict: "allowed",
+    from: "accepted",
+    to: "in-progress",
+  });
+});
+
+test("CLI：(b) 注入终态 done → rejected E_TERMINAL_STATE（exit 1），issue 仍是 1", () => {
+  const r = runCli("pull_request", { ...realPr(), action: "opened" }, {
+    ISSUE_STATE_FILE: stateFile('{"labels":["state:done"]}'),
+  });
+  const intent = JSON.parse(r.stdout);
+  expect(intent.issue).toBe(1);
+  const v = validateStdin(r.stdout);
+  expect(v.status).toBe(1);
+  expect(JSON.parse(v.stdout)).toMatchObject({
+    verdict: "rejected",
+    code: "E_TERMINAL_STATE",
+    from: "done",
+  });
+});
+
+test("CLI：(c) 解不出 issue → 仍是 INFRA（exit 3），不回退 PR 号", () => {
+  const r = runCli(
+    "pull_request",
+    {
+      ...prWith({ number: 9, body: "随手改点东西", title: "chore: nits" }),
+      action: "opened",
+    },
+    { ISSUE_STATE_FILE: stateFile('{"labels":["state:accepted"]}') },
+  );
+  expect(r.status).toBe(0);
+  const intent = JSON.parse(r.stdout);
+  expect(intent.issue).toBeNull();
+  expect(intent.unresolved.reason).toBe("no-issue-reference");
+  const v = validateStdin(r.stdout);
+  expect(v.status).toBe(3);
+  expect(JSON.parse(v.stdout).code).toBe("E_ISSUE_UNRESOLVED");
+});
+
+test("CLI --resolve-issue：只解析 issue 号，解不出什么都不打印", () => {
+  const ok = spawnSync(
+    process.execPath,
+    ["scripts/build-intent.mjs", "--resolve-issue"],
+    {
+      encoding: "utf8",
+      env: { ...process.env, EVENT: JSON.stringify(realPr()) },
+    },
+  );
+  expect(ok.status).toBe(0);
+  expect(ok.stdout).toBe("1\n");
+  expect(ok.stderr).toBe("");
+
+  const none = spawnSync(
+    process.execPath,
+    ["scripts/build-intent.mjs", "--resolve-issue"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        EVENT: JSON.stringify(prWith({ body: "随手", title: "chore" })),
+      },
+    },
+  );
+  expect(none.status).toBe(0);
+  expect(none.stdout).toBe("");
 });
 
 test("wiring：apply 用意图解析出的 issue，record 只调用 writer-record", () => {

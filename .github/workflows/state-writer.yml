@@ -8,9 +8,12 @@ on:
   pull_request:
     types: [opened, synchronize, closed]
 
+# 合法路径（allowed）本就不评论，但非法路径（rejected/infra）必须能贴上评论：
+# issue 评论走 issues: write；留痕的兜底位置是事件自身的号，PR 号上的评论由
+# gh 走 GraphQL，只有 issues: write 会被拒（真 PR #2：Resource not accessible by integration）。
 permissions:
   issues: write
-  pull-requests: read
+  pull-requests: write
   contents: read
 
 concurrency:
@@ -27,8 +30,34 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
+      # PR 号不是 issue 号，且 PR 事件的 payload 里没有被引用 issue 的标签。
+      # 所以「先解析 issue、再取它的当前状态、再建意图」是三个有先后依赖的步骤，
+      # 顺序用步骤图表达（Actions 按序执行），不塞进一行 shell 拼接里：
+      # 顺序一错（先建意图再取数）就会退回真 PR #2 的 from=none。
+      - name: resolve issue
+        id: resolve
+        env:
+          EVENT: ${{ toJSON(github.event) }}
+        run: |
+          ISSUE="$(node scripts/build-intent.mjs --resolve-issue)"
+          echo "issue=${ISSUE}" >> "$GITHUB_OUTPUT"
+          echo "referenced issue: ${ISSUE:-<none>}"
+
+      # 唯一有网络权限的地方：取被引用 issue 的**真实当前状态**。
+      # 解不出 issue 就不取（steps.resolve.outputs.issue 为空），判定器会判 INFRA。
+      - name: fetch issue state
+        id: issue_state
+        if: steps.resolve.outputs.issue != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ steps.resolve.outputs.issue }}" \
+            --jq '{labels: [.labels[].name]}' > issue-state.json
+          cat issue-state.json
+
       # 事件 → 意图。身份只从宿主字段推，不读调用方自述。
-      # NUMBER 是事件自身的号（issue 或 PR），只用来取上下文与留痕位置，不当 issue 号用。
+      # 脚本不联网：issue 的当前状态从 ISSUE_STATE_FILE 注入（上一取的产物）。
+      # NUMBER 是事件自身的号（issue 或 PR），只用来取上下文与留痕的兜底位置，不当 issue 号用。
       # 有没有意图由 build-intent 自己写进 has_intent（它是意图的产地），
       # YAML 不猜、也不在这里做任何判定：没有意图 = 后续三步全部不跑，job 保持绿。
       - name: build intent
@@ -38,6 +67,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          ISSUE_STATE_FILE: issue-state.json
         run: |
           LAST_COMMENT="$(gh api "repos/${{ github.repository }}/issues/${NUMBER}/comments" --jq '.[-1].body // ""' 2>/dev/null || echo "")"
           export LAST_COMMENT
@@ -66,8 +96,10 @@ jobs:
           fi
           gh issue edit "$ISSUE" --add-label "state:$TO"
 
-      # 拒绝与 INFRA 都留痕（留在事件自身的号上，PR 事件就留在 PR 上）；
-      # 正文格式与 job 红绿只由 writer-record.mjs 决定：rejected→0，infra→1。
+      # 拒绝与 INFRA 都留痕，位置与 apply 同源：被改动的那个 issue（intent.json 的 issue），
+      # 不是事件自身的 PR 号。只有「连 issue 都解不出」时才没有可落的目标 ——
+      # 那时改动为零，评论只是报告，落在事件主体上，PR 号在那里是主体而非被冒充的 issue 号。
+      # 正文格式与 job 红绿只由 writer-record.mjs 决定：rejected→0，infra→1（留痕失败也红）。
       # has_intent 必须为 1：没有意图就没有判定结果可留痕，空 intent.json 绝不能进到这里
       # （validate 被跳过时它的 exit 输出为空，单看 exit != '0' 会误命中）。
       - name: record
@@ -75,4 +107,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
-        run: node scripts/writer-record.mjs --verdict verdict.json --issue "$NUMBER"
+        run: |
+          TARGET="$(node -p "const i = require('./intent.json').issue; Number.isInteger(i) ? i : process.env.NUMBER")"
+          node scripts/writer-record.mjs --verdict verdict.json --issue "$TARGET"
