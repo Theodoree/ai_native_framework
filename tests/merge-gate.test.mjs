@@ -99,6 +99,8 @@ function gate({
   checks,
   infra = [],
   skip = [],
+  // 只有「故意造一批指向别的 commit 的检查项」的用例才需要打开它（判 E_CHECK_STALE）。
+  allowStrayHeads = false,
 } = {}) {
   const { dir, head } = repo(files);
   const at = (name) => join(dir, ".gate", name);
@@ -107,6 +109,17 @@ function gate({
   // checks 可以是 head 的函数：否则「造一批指向别的 commit 的检查项」会自己先变成 stale。
   const runs =
     typeof checks === "function" ? checks(head) : (checks ?? green(head));
+  // 夹具必须长在「本次判定真正用的那个 head」上：另开一个 repo() 取 head 会让
+  // commit 哈希偶尔与之相同（同内容同秒）、偶尔不同，于是同一个用例在本地绿、CI 红。
+  const stray = allowStrayHeads
+    ? []
+    : runs.filter((r) => r.head_sha && r.head_sha !== head);
+  if (stray.length)
+    throw new Error(
+      `测试夹具缺陷：check runs 指向别的 commit（${stray
+        .map((r) => r.name)
+        .join(", ")}）。用 checks: (head) => ... 造夹具。`,
+    );
   const prView = {
     number: pr,
     title: "feat: gate",
@@ -238,11 +251,12 @@ test("(a4) 门牌表格被手改（少了一行）：G4 判它不是派生物", 
 // ---- (a3)(e) 守卫 3：看起来绿 ----
 
 test("(a3) 只坏 G3：全绿里混着一条 failure", () => {
-  const head = repo().head;
-  const runs = green(head).map((r) =>
-    r.name === "audit" ? { ...r, conclusion: "failure" } : r,
-  );
-  const g = gate({ checks: runs });
+  const g = gate({
+    checks: (head) =>
+      green(head).map((r) =>
+        r.name === "audit" ? { ...r, conclusion: "failure" } : r,
+      ),
+  });
   expect(g.status).toBe(1);
   expect(g.line("G3")).toContain("FAIL E_CHECK_NOT_GREEN");
   expect(g.line("G3")).toContain("audit(id 11) completed/failure");
@@ -251,43 +265,43 @@ test("(a3) 只坏 G3：全绿里混着一条 failure", () => {
 });
 
 test("(e) 看起来绿：同名先绿后红，只看最新一次（旧绿不给新红背书）", () => {
-  const head = repo().head;
-  const runs = [
-    ...green(head),
-    {
-      id: 99,
-      name: "audit",
-      status: "completed",
-      conclusion: "failure",
-      head_sha: head,
-    },
-  ];
-  const g = gate({ checks: runs });
+  const g = gate({
+    checks: (head) => [
+      ...green(head),
+      {
+        id: 99,
+        name: "audit",
+        status: "completed",
+        conclusion: "failure",
+        head_sha: head,
+      },
+    ],
+  });
   expect(g.status).toBe(1);
   expect(g.line("G3")).toContain("E_CHECK_NOT_GREEN");
   expect(g.line("G3")).toContain("audit(id 99) completed/failure");
 });
 
 test("(e) 同名先红后绿：最新的成功说了算，不拿旧红否决重跑", () => {
-  const head = repo().head;
-  const runs = [
-    {
-      id: 11,
-      name: "audit",
-      status: "completed",
-      conclusion: "failure",
-      head_sha: head,
-    },
-    ...green(head),
-    {
-      id: 99,
-      name: "audit",
-      status: "completed",
-      conclusion: "success",
-      head_sha: head,
-    },
-  ];
-  const g = gate({ checks: runs });
+  const g = gate({
+    checks: (head) => [
+      {
+        id: 11,
+        name: "audit",
+        status: "completed",
+        conclusion: "failure",
+        head_sha: head,
+      },
+      ...green(head),
+      {
+        id: 99,
+        name: "audit",
+        status: "completed",
+        conclusion: "success",
+        head_sha: head,
+      },
+    ],
+  });
   // 失败时把门的原话带出来：CI 上「本地绿、那里红」不能只留一个数字。
   expect(g.status, `${g.out}\n${g.err}`).toBe(0);
   expect(g.line("G3")).toContain("PASS OK");
@@ -336,8 +350,7 @@ test("(c) 跑完是红的才是真失败：skipped/neutral/cancelled 都不给�
 });
 
 test("(e) 检查项属于另一个 commit：绿也不算数", () => {
-  const runs = green("0".repeat(40));
-  const g = gate({ checks: runs });
+  const g = gate({ checks: green("0".repeat(40)), allowStrayHeads: true });
   expect(g.status).toBe(1);
   expect(g.line("G3")).toContain("FAIL E_CHECK_STALE");
 });
