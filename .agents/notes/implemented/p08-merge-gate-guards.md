@@ -1,7 +1,7 @@
 # P-08 merge gate 四条守卫
 
 - **日期**：2026-10-20
-- **状态**：proposed
+- **状态**：implemented（真 PR #2 验收通过：`merge-gate` 四守卫在真 Check 上报绿）
 - **里程碑**：M2 · 门与门牌
 - **依赖**：P-07、P-04
 
@@ -80,3 +80,11 @@ merge-gate PASS 4/4
 - 门仍然只判定，不写门牌、不改状态、不合并；脚本内仍无任何网络调用（等待在 workflow 里，判定在脚本里）。
 - `--pr` 与生产者就绪都是「取数」的一部分：取数在 YAML，判据在脚本，可单测。
 - 已知残余：生产者若彻底不出现（last-change 被关掉/坏了），门会在 600s 后判 `E_LAST_CHANGE_PENDING`（exit 3）并留 `::warning::`；修好生产者后任何后续 PR 事件（push/review/人工编辑）都会重算，人工重跑 job 亦可。这条路径没有自动重算，是刻意留的：上游坏掉时门不该替它宣称「已就绪」。
+
+## 落地记录
+
+- **真 PR 验收（PR #2）**：`merge-gate` 作为真 Check 在 PR #2 上跑通，四条守卫先是各自独立红（G1 issue 还在 `accepted` → `E_NO_TRANSITION`；G2/G4 `E_LAST_CHANGE_PENDING`；G3 `E_CHECK_NOT_GREEN` 指向真的红的 `check`），修掉上游缺陷后转绿：`merge-gate PR #2 @ c70e096` 四行全 `PASS OK`、`merge-gate PASS 4/4`、`gh pr checks 2` → `check pass / merge-gate pass / render pass / write pass`。
+- **门的第一次真跑就抓到了自己的三个结构性问题**（竞态、自排除、未完成语义），这三个在本地测试里全绿——因为它们只有在「别人的 check 还没跑完」「门牌由别人写」「GITHUB_TOKEN 改动不触发 workflow」这三个真实条件下才暴露。这是 P-08 必须用真 PR 验收的理由，不是流程仪式。
+- **退出码次序定为「有真失败 → 1，否则有未就绪 → 3」**：反了会把真失败吞成未就绪，读者反而更找不到根因。
+- **已知残余（刻意留）**：生产者彻底不出现时，门在 600s 后判未就绪，不代它宣称已就绪；修好上游后靠后续 PR 事件或人工重跑重算。
+- **已知抖动（未定位）**：`tests/merge-gate.test.mjs` 的「(e) 同名先红后绿」在 `0943684` 的 CI 上红过一次（`expected 1 to be 0`）、本地与随后的 `c70e096` 都绿，未复现。处置：断言改成 `expect(g.status, \`${g.out}\n${g.err}\`).toBe(0)`，下一次复现会直接把门的原话（哪条守卫、哪个 E_ 码）带进失败信息——先留证人，不猜根因。
