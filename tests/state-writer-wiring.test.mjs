@@ -41,10 +41,17 @@ function evalIf(expr, outputs) {
     });
 }
 
-// [object Object] 只做「事件上下文 → 常量」的替换，认不出的表达式直接报错，不静默放过。
-function interpolate(text, ctx) {
+// [object Object] 只做「事件上下文 → 常量」与「上游步骤输出 → 值」的替换，
+// 认不出的表达式直接报错，不静默放过。步骤输出来自当前已跑过的步骤（Actions 语义：
+// 表达式在该步骤执行时求值），这样「先解析 issue 再取标签」的顺序就被真跑检验了。
+function interpolate(text, ctx, outputs = {}) {
   return String(text).replace(/\$\{\{\s*(.+?)\s*\}\}/g, (whole, expr) => {
     if (Object.prototype.hasOwnProperty.call(ctx, expr)) return ctx[expr];
+    const fromStep = /^steps\.([\w-]+)\.outputs\.([\w-]+)$/.exec(expr);
+    if (fromStep) {
+      const got = outputs[fromStep[1]] && outputs[fromStep[1]][fromStep[2]];
+      return got ? got : "";
+    }
     throw new Error("测试未覆盖的表达式: " + whole);
   });
 }
@@ -58,23 +65,35 @@ function sandbox() {
   mkdirSync(join(dir, "bin"));
   const log = join(dir, "calls.log");
   const gh = join(dir, "bin", "gh");
-  // 假 gh：调用记进 calls.log；api 调用回显 GH_LAST_COMMENT，模拟「上一条评论」。
+  // 假 gh：调用记进 calls.log。两类 api 取数必须分开返回 ——
+  // 上一条评论（/comments）与 issue 的当前状态（/issues/<n>）是两次不同的取数。
   writeFileSync(
     gh,
-    "#!/bin/sh\n" +
-      'printf \'%s\\n\' "$*" >> "' +
-      log +
-      '"\n' +
-      'if [ "$1" = "api" ]; then printf ' +
-      "'%s\\n'" +
-      ' "$GH_LAST_COMMENT"; fi\n' +
-      "exit 0\n",
+    [
+      "#!/bin/sh",
+      `printf '%s\\n' "$*" >> "${log}"`,
+      'if [ "$1" = "api" ]; then',
+      '  case "$2" in',
+      '    */comments) printf \'%s\\n\' "$GH_LAST_COMMENT" ;;',
+      '    */issues/*) printf \'%s\\n\' "$GH_ISSUE_STATE" ;;',
+      '    *) : ;;',
+      "  esac",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
   );
   chmodSync(gh, 0o755);
   return { dir, log };
 }
 
-function runWorkflow({ eventName, event, number, lastComment = "" }) {
+function runWorkflow({
+  eventName,
+  event,
+  number,
+  lastComment = "",
+  issueState = "",
+}) {
   const { dir, log } = sandbox();
   const ghOutput = join(dir, "gh_output");
   writeFileSync(ghOutput, "");
@@ -83,6 +102,7 @@ function runWorkflow({ eventName, event, number, lastComment = "" }) {
     HOME: process.env.HOME || "",
     GH_LOG: log,
     GH_LAST_COMMENT: lastComment,
+    GH_ISSUE_STATE: issueState,
     GH_TOKEN: "stub-token",
     GITHUB_OUTPUT: ghOutput,
   };
@@ -108,9 +128,9 @@ function runWorkflow({ eventName, event, number, lastComment = "" }) {
     }
     const stepEnv = { ...env };
     for (const [k, v] of Object.entries(step.env || {}))
-      stepEnv[k] = interpolate(v, ctx);
+      stepEnv[k] = interpolate(v, ctx, outputs);
     const before = readFileSync(ghOutput, "utf8");
-    const r = spawnSync("bash", ["-c", interpolate(step.run, ctx)], {
+    const r = spawnSync("bash", ["-c", interpolate(step.run, ctx, outputs)], {
       cwd: dir,
       env: stepEnv,
       encoding: "utf8",
@@ -274,4 +294,108 @@ test("(d) 有意图但 INFRA（PR 无引用 issue）：record 贴 INFRA 评论�
   );
   expect(r.ok("record").status).toBe(1);
   expect(r.failed.map((s) => s.key)).toEqual(["record"]);
+});
+
+// ---- 真 PR #2 的两个缺口：issue 的当前状态必须由宿主取数、留痕必须落在被改动的 issue 上 ----
+
+test("(a) PR 事件：取回 state:accepted → 在 issue 1 上改成 in-progress，合法路径零评论", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: prEvent("opened", { number: 2, body: "Fixes #1" }),
+    number: 2,
+    issueState: '{"labels":["state:accepted"]}',
+  });
+  // 解析 → 取数 → 建意图，三步都真跑过
+  expect(r.outputs.resolve.issue).toBe("1");
+  expect(r.ok("issue_state").skipped).toBeUndefined();
+  expect(r.outputs.intent.has_intent).toBe("1");
+  expect(r.outputs.validate.exit).toBe("0");
+  // 改的是 issue 1，不是 PR 2
+  expect(r.edits).toEqual([
+    "issue edit 1 --remove-label state:accepted",
+    "issue edit 1 --add-label state:in-progress",
+  ]);
+  expect(r.comments).toEqual([]);
+  expect(r.failed).toEqual([]);
+  // 取数打在被引用的 issue 上，而不是事件自身的 PR 号
+  expect(r.calls).toContain(
+    "api repos/owner/repo/issues/1 --jq {labels: [.labels[].name]}",
+  );
+  expect(r.calls).not.toContain(
+    "api repos/owner/repo/issues/2 --jq {labels: [.labels[].name]}",
+  );
+});
+
+test("(b) PR 事件：取回终态 state:done → rejected，留痕贴在 issue 1 而不是 PR 2", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: prEvent("opened", { number: 2, body: "Fixes #1" }),
+    number: 2,
+    issueState: '{"labels":["state:done"]}',
+  });
+  expect(r.outputs.validate.exit).toBe("1");
+  expect(r.ok("apply").skipped).toBe(true);
+  expect(r.comments).toHaveLength(1);
+  expect(r.comments[0]).toContain(
+    "issue comment 1 --body 状态未被修改：REJECTED E_TERMINAL_STATE",
+  );
+  expect(r.comments[0]).not.toContain("issue comment 2");
+  expect(r.ok("record").status).toBe(0);
+  expect(r.edits).toEqual([]);
+  expect(r.failed).toEqual([]);
+});
+
+test("(c) 解不出 issue：根本不去取状态，仍判 INFRA，不回退 PR 号", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: prEvent("opened", { body: "随手改点东西", title: "chore: nits" }),
+    number: 9,
+    issueState: '{"labels":["state:accepted"]}',
+  });
+  expect(r.outputs.resolve.issue).toBe("");
+  expect(r.ok("issue_state").skipped).toBe(true);
+  // 没有 issue 就没有可取的当前状态：一次状态取数都不该发生
+  expect(r.calls.filter((c) => c.includes(".labels[].name"))).toEqual([]);
+  expect(r.outputs.validate.exit).toBe("3");
+  expect(r.comments).toHaveLength(1);
+  expect(r.comments[0]).toContain("INFRA E_ISSUE_UNRESOLVED");
+  expect(r.ok("record").status).toBe(1);
+});
+
+test("(d) YAML：顺序是「解析 issue → 取标签 → 建意图」，且权限支撑 issue 评论", () => {
+  const yml = readFileSync(join(ROOT, WORKFLOW), "utf8");
+  const doc = YAML.parse(yml);
+  const named = doc.jobs.write.steps.filter((s) => s.name && s.run);
+  const at = (name) => named.findIndex((s) => s.name === name);
+
+  // 顺序钉在 YAML 的步骤图上，不是钉在某个 shell 字符串里
+  expect(at("resolve issue")).toBeGreaterThanOrEqual(0);
+  expect(at("fetch issue state")).toBeGreaterThan(at("resolve issue"));
+  expect(at("build intent")).toBeGreaterThan(at("fetch issue state"));
+
+  const resolve = named[at("resolve issue")];
+  expect(resolve.id).toBe("resolve");
+  expect(resolve.run).toContain("build-intent.mjs --resolve-issue");
+
+  const fetch = named[at("fetch issue state")];
+  expect(fetch.if).toBe("steps.resolve.outputs.issue != ''");
+  expect(fetch.run).toContain("gh api");
+  expect(fetch.run).toContain("steps.resolve.outputs.issue");
+  expect(fetch.run).toContain("--jq");
+  expect(fetch.run).toContain("issue-state.json");
+
+  // 建意图只消费注入的事实：路径与上一步的产物一致
+  const intent = named[at("build intent")];
+  expect(intent.env.ISSUE_STATE_FILE).toBe("issue-state.json");
+
+  // 合法路径不产生评论（issues: write 足够）；非法路径的兜底位置可能是 PR 号，
+  // 那个评论由 gh 走 GraphQL，缺 pull-requests: write 就会被拒（真 PR #2）。
+  expect(doc.permissions.issues).toBe("write");
+  expect(doc.permissions["pull-requests"]).toBe("write");
+
+  // 脚本自己不联网：取数只在 workflow 里
+  const script = readFileSync(join(ROOT, "scripts/build-intent.mjs"), "utf8");
+  expect(script).not.toMatch(/\bfetch\(/);
+  expect(script).not.toMatch(/node:https?/);
+  expect(script).not.toMatch(/child_process/);
 });

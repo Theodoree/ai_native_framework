@@ -251,9 +251,12 @@ function main(argv) {
   const intentPath = flag("--intent", null);
   let intentRaw;
   try {
-    intentRaw = intentPath
-      ? readFileSync(intentPath, "utf8")
-      : readFileSync(0, "utf8");
+    // 契约：--intent -（或省略）表示 stdin。不要用 /dev/stdin 当路径：
+    // Linux 上它是 /proc/self/fd/0，读管道会失败，CI 里表现为「读不到意图输入」。
+    intentRaw =
+      intentPath && intentPath !== "-"
+        ? readFileSync(intentPath, "utf8")
+        : readFileSync(0, "utf8");
   } catch {
     emit(
       "infra",

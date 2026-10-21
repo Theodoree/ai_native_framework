@@ -154,8 +154,9 @@ test("CLI：非法意图退出 1", () => {
       "scripts/state-validate.mjs",
       "--config",
       CONFIG,
+      // "-" = stdin。不用 /dev/stdin：Linux（CI）上读管道会失败。
       "--intent",
-      "/dev/stdin",
+      "-",
     ],
     {
       encoding: "utf8",

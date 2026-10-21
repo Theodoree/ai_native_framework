@@ -388,7 +388,7 @@ test("(e) 汇入失败 = INFRA：退出 3、清单照样落盘、失败路径留
     { "docs/architecture.md": "arch\n" },
     { message: "b" },
   );
-  const tip = commit(
+  commit(
     dir,
     { "docs/permissions.md": "perm\n" },
     { message: "m" },

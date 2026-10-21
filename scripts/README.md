@@ -9,6 +9,7 @@
 | `writer-record.mjs` | 判定之后怎么留痕：评论正文 + job 红绿（rejected→0 / infra→1） | 不判定，不写状态 |
 | `ledger.mjs` | append-only 账本：追加事件、折叠成投影 | 不判定，不决定状态 |
 | `server.mjs` | 本机 HTTP：静态页 + JSON API，把写请求交给判定器 | 不含任何状态判断逻辑 |
+| `merge-gate.mjs` | 合并资格的四条独立守卫（0 可合 / 1 拒绝 / 3 INFRA），每条判 flush 一行到 stdout | 不合并 PR、不改 issue 状态、不写门牌；不联网（输入全部注入） |
 
 ## 状态
 
