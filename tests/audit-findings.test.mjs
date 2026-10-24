@@ -1268,6 +1268,13 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // shell 也是执行面：custom shell 形如 `command [options] {0}`，命令由这个字段携带。
     // 它零扫描时，读者挂在它上面既不出违规、也不进 unfollowable —— 那是静默放行。
     if (typeof step.shell === "string") payloads.push({ carrier: "shell", text: step.shell });
+    // working-directory 不是说明文字：它把这一步里**所有相对路径**重新钉到另一个目录上。
+    // 它零扫描时，裸载体名（check-run.json）不写 `.audit/` 也算引用 —— 判据没看这个字段，
+    // 红绿只差一个键（实测：插一步 working-directory: .audit + run: jq -r '.conclusion' check-run.json
+    // 110 条全绿；同一行改写成 .audit/check-run.json 就红 2 条）。
+    if (typeof step["working-directory"] === "string") {
+      payloads.push({ carrier: "working-directory", text: step["working-directory"] });
+    }
     for (const field of ["with", "env"]) {
       for (const leaf of payloadLeaves(step[field], [field])) payloads.push({ carrier: leaf.path, text: leaf.text });
     }
@@ -1299,11 +1306,36 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     ]) {
       if (typeof shell === "string") payloads.push({ carrier, text: shell });
     }
+    // defaults.run.working-directory 与 step 级同机制：位置换了、执行面没换
+    // （它同样把全部 step 的相对路径钉到另一个目录）。doc 级的对全部 job 生效，一并收。
+    for (const [carrier, dir] of [
+      ["defaults.run.working-directory", job?.defaults?.run?.["working-directory"]],
+      ["defaults.run.working-directory", doc?.defaults?.run?.["working-directory"]],
+    ]) {
+      if (typeof dir === "string") payloads.push({ carrier, text: dir });
+    }
     return payloads;
+  }
+
+  // 工作目录是**路径**不是命令：它决定相对路径落在哪，本身不执行任何东西。
+  const WORK_DIR_CARRIERS = new Set(["working-directory", "defaults.run.working-directory"]);
+
+  // 工作目录的等价类：`.audit` / `./.audit` / `.audit/` / `.audit/.` 钉的是同一个目录，
+  // `.` / `./` 是仓库根（归一成空串）。写法不能改变判定，否则换一个斜杠就换一个结论。
+  function normalizeWorkingDirectory(value) {
+    if (typeof value !== "string") return null;
+    const raw = value.trim().replace(/\\/g, "/");
+    if (!raw) return null;
+    const normalized = posix.normalize(raw).replace(/\/+$/, "");
+    return normalized === "." ? "" : normalized;
   }
 
   // 一份载荷被执行到的脚本引用：shell 字段按 custom shell 命令解，其余按 shell 词法 + loader 取值。
   function payloadScriptRefs(payload, options = {}) {
+    // 工作目录进引用判定（`.audit` 就是 `.audit`），但不进脚本跟随：
+    // 它是路径不是命令，写着 `./scripts` 也不代表执行了里面的东西 ——
+    // 跟着解只会把普通目录记成「跟不下去的脚本」，用噪音盖住真相。
+    if (WORK_DIR_CARRIERS.has(payload.carrier)) return { refs: [], unfollowable: [] };
     const scanned =
       payload.carrier === "shell" || payload.carrier === "defaults.run.shell"
         ? scanShellField(payload.text, options)
@@ -1357,7 +1389,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 「非写者步引用了载体」，由引用判据负责，不由「跟不下去」兜。
     for (const match of String(text).matchAll(LOADER_FLAG_SHORT)) {
       const rel = resolveScriptRef(root, match[1]);
-      if (rel && !refs.includes(rel)) refs.push(rel);
+      // 门槛就是上面注释说的判据：解出来的路径**真实存在**才算模块取值。
+      // resolveScriptRef 对不存在的路径也返回 rel（它只做归一），于是 jq -r .verdict 的
+      // `.verdict` 被当成模块名落进 missing —— 红得莫名其妙，用噪音盖住真相。
+      if (rel && existsSync(scriptPath(root, rel)) && !refs.includes(rel)) refs.push(rel);
     }
     return { refs, unfollowable };
   }
@@ -1994,7 +2029,12 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 直拼，或把 payload 先写到 .audit/second.json 再 --input 它），判据就不知道那是结论。
   // 只读查询（--jq '.["executors"] | length' 之类）在本 workflow 里不存在；这个端点在这里
   // 是「回写」通道，允许读它等于允许任何一步拿到结论的产出面，所以读也一并违规。
-  const CHECK_RUNS_ENDPOINT = /\bcheck-runs\b/;
+  // 结论的写面是一条**面**，不是一个端点拼写：REST 的 check-runs 与 GraphQL 的
+  // mutation{createCheckRun(...)} 写的是同一条结论。只钉 \bcheck-runs\b 时，
+  // GraphQL 那一半零命中（实测：插一条 curl -X POST https://api.github.com/graphql
+  // -d '{"query":"mutation{createCheckRun(...conclusion:SUCCESS)}"}' 110 条全绿）。
+  // 判据按面判：命中任一面就套同一套 sanctioned 规则。
+  const CHECK_RUNS_ENDPOINT = /\bcheck-runs\b|\bcreateCheckRun\b|\/graphql\b/;
   const CHECK_RUNS_POST = /(?:--method[=\s]+POST\b|-X\s*POST\b)/;
   const CHECK_RUNS_INPUT = /--input[=\s]+["']?\.audit\/check-run\.json["']?/;
   const CHECK_RUNS_POST_STEPS = ["回写 Check Run", "判不了：回写 INFRA"];
@@ -2005,6 +2045,120 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const tokens = [...raw.matchAll(AUDIT_DIR_TOKEN)].map((match) => match[0].replace(/[/\\]+$/, ""));
     if (tokens.length > 0) return tokens;
     return AUDIT_DIR_REF.test(raw) ? [".audit"] : [];
+  }
+
+  // 载体的**裸文件名**：只在「这一步的 cwd 就是 .audit」时等价于 .audit/<name>。
+  const CARRIER_BARE_NAMES = ["check-run.json", "result.json", "review-a.json", "review-b.json"];
+
+  // 一个 step 实际的工作目录：step 级覆盖 job 级 defaults（job 级覆盖 workflow 级）。
+  // 取值从 job 载体里读，与引用判定同一个家，不另开一条通道。
+  function stepWorkingDir(step, options = {}) {
+    const own = normalizeWorkingDirectory(step?.["working-directory"]);
+    if (own !== null) return own;
+    return jobWorkingDir(options.jobPayloads ?? []);
+  }
+
+  function jobWorkingDir(jobPayloadList) {
+    for (const payload of jobPayloadList ?? []) {
+      if (payload.carrier !== "defaults.run.working-directory") continue;
+      const dir = normalizeWorkingDirectory(payload.text);
+      if (dir !== null) return dir;
+    }
+    return "";
+  }
+
+  // cwd 是 .audit 时，run 里的裸载体名就是 .audit/<name>：路径换个写法不该换判定。
+  // 前面不能紧邻路径分隔符或词字符 —— `.audit/check-run.json` 已由目录判据认领，
+  // 不能因为它同时含裸名而多记一条。
+  function bareCarrierPaths(line, cwd) {
+    if (cwd !== ".audit") return [];
+    const paths = [];
+    for (const name of CARRIER_BARE_NAMES) {
+      const bare = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp("(?<![\\w./\\\\-])" + bare).test(line)) paths.push(".audit/" + name);
+    }
+    return paths;
+  }
+
+  // 复制/替换类命令的目标操作数：**另一种写出通道**，不是产出。
+  // cp /tmp/pwn.json .audit/check-run.json 与 --out .audit/check-run.json 写的是同一份载体；
+  // 只认后者时，写者步里加一行条件分叉 cp（[ "$GITHUB_ACTOR" = attacker ] && cp ...; true）
+  // 就绕过了全部载荷断言（实测 110 条全绿）。
+  const COPY_WRITE_COMMANDS = new Set(["cp", "mv", "install", "ln", "rsync", "tee"]);
+
+  function copyWriteTargets(line) {
+    const targets = [];
+    for (const words of shellCommands(line)) {
+      const head = (words[0] ?? "").replace(/^.*\//, "");
+      if (head === "dd") {
+        for (const word of words.slice(1)) if (word.startsWith("of=")) targets.push(unquote(word.slice(3)));
+        continue;
+      }
+      if (!COPY_WRITE_COMMANDS.has(head)) continue;
+      const operands = [];
+      let dirTarget = null;
+      for (let i = 1; i < words.length; i += 1) {
+        const word = words[i];
+        if (word === "-t" || word === "--target-directory") {
+          dirTarget = words[i + 1];
+          i += 1;
+          continue;
+        }
+        if (word.startsWith("--target-directory=")) {
+          dirTarget = word.slice("--target-directory=".length);
+          continue;
+        }
+        // 旗标与旗标取值不算操作数：cp/mv/install/ln 的目标都是最后一个操作数。
+        if (word.startsWith("-") && word !== "-") continue;
+        operands.push(unquote(word));
+      }
+      if (dirTarget) targets.push(unquote(dirTarget));
+      else if (operands.length > 0) targets.push(operands[operands.length - 1]);
+    }
+    return targets;
+  }
+
+  // 一个写目标是不是落进 .audit 面（含 cwd=.audit 时的裸载体名）。
+  function unclaimedAuditTarget(target, cwd) {
+    const value = String(target ?? "").replace(/\/+$/, "");
+    if (!value || value.startsWith("/")) return null;
+    if (value === ".audit" || value.startsWith(".audit/")) return value;
+    if (cwd === ".audit" && CARRIER_BARE_NAMES.includes(value)) return ".audit/" + value;
+    return null;
+  }
+
+  const WILDCARD_CHAR = /[*?[]/;
+
+  function globSegmentMatches(segment, value) {
+    const pattern = segment
+      .replace(/[.+^${}()|\\[\]]/g, "\\$&")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".");
+    return new RegExp("^" + pattern + "$").test(value);
+  }
+
+  // 通配操作数：把「认不出」判到**响**的那一侧，而不是放过的那一侧。
+  // .aud*/res*.json / .aud*/check-run*.json 目录段与文件名同时通配，两层判据都认不出，
+  // 而它在 shell 里一字不差地展开成那两份载体（实测全绿；只通配一处 .audit/result.jso?
+  // 或 .aud?t/result.json 反而都红）。所以判据不看它「像不像 .audit」：
+  // 只要一个通配操作数**可能**命中载体面（以 .json 结尾，或某一段通配后仍能命中 .audit），
+  // 就是未认领的 .audit 引用。
+  function wildcardAuditRefs(line) {
+    const hits = [];
+    for (const word of shellWords(line)) {
+      if (!WILDCARD_CHAR.test(word)) continue;
+      const value = unquote(word);
+      if (value.endsWith(".json")) {
+        hits.push(value);
+        continue;
+      }
+      const couldHitAudit = value.split("/").some((segment) => {
+        if (!WILDCARD_CHAR.test(segment)) return false;
+        return globSegmentMatches(segment, ".audit") || segment.includes("audit");
+      });
+      if (couldHitAudit) hits.push(value);
+    }
+    return hits;
   }
 
   // 写意图必须绑到**这条路径上**：口径层那一行同时提到 review-a / review-b / result.json，
@@ -2023,6 +2177,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         targets.push(match[1].replace(/^["']|["']$/g, "").replace(/[/\\]+$/, ""));
       }
     }
+    // 载体归属不看写法的方言：cp/tee/install/mv/ln/dd of=/rsync 的目标同样是这条路径的写目标。
+    // 不合并的话，cp 写进去的那个 step 在写者集合里根本不存在（写者集合是 toEqual 钉住的），
+    // 覆盖改动会被「写者集合没变」这条断言反着保住。
+    for (const target of copyWriteTargets(line)) targets.push(target.replace(/[/\\]+$/, ""));
     return targets;
   }
 
@@ -2063,16 +2221,19 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const texts = [];
     for (const step of stepList) {
       const name = step.name ?? step.id;
-      for (const { where, text } of stepTexts(step, { root })) texts.push({ name, where, text });
+      // cwd 随行携带：同一行文本在 cwd=.audit 与在仓库根下指的是两份不同的路径。
+      const cwd = stepWorkingDir(step, options);
+      for (const { where, text } of stepTexts(step, { root })) texts.push({ name, where, text, cwd });
     }
+    const jobCwd = jobWorkingDir(options.jobPayloads ?? []);
     for (const { source, where, text } of jobPayloadTexts(options.jobPayloads ?? [], { root })) {
-      texts.push({ name: source, where, text });
+      texts.push({ name: source, where, text, cwd: jobCwd });
     }
-    for (const { name, where, text } of texts) {
+    for (const { name, where, text, cwd } of texts) {
       for (const rawLine of String(text).split("\n")) {
         const line = stripShellComment(rawLine);
         if (!line.trim() || COMMENT_ONLY_LINE.test(line)) continue;
-        // POST 面先判：端点出现就必须是「那两步 + --input check-run.json」。
+        // 结论写面先判：命中任一面就必须是「那两步 + --input check-run.json」。
         if (CHECK_RUNS_ENDPOINT.test(line)) {
           const sanctioned =
             CHECK_RUNS_POST_STEPS.includes(name) && CHECK_RUNS_POST.test(line) && CHECK_RUNS_INPUT.test(line);
@@ -2080,7 +2241,23 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
             violations.push({ step: name, where, excerpt: line.trim(), reason: "check-runs 只能是那两步的 --input POST" });
           }
         }
+        // 复制/替换写载体：写通道只能是产出那一行 —— 写者可以产出，但不能**替换**。
+        for (const target of copyWriteTargets(line)) {
+          if (!unclaimedAuditTarget(target, cwd)) continue;
+          violations.push({
+            step: name,
+            where,
+            excerpt: line.trim(),
+            reason: "载体的写通道只能是产出那一行（cp/tee/install 不是产出）",
+          });
+        }
+        // 通配操作数：认不出就必须响。
+        if (wildcardAuditRefs(line).length > 0) {
+          violations.push({ step: name, where, excerpt: line.trim(), reason: "未认领的 .audit 引用" });
+        }
         const paths = auditDirPaths(line);
+        // cwd 指到 .audit 时，裸载体名按 cwd 解析回 .audit/<name> 参与判定。
+        for (const bare of bareCarrierPaths(line, cwd)) if (!paths.includes(bare)) paths.push(bare);
         if (paths.length === 0) continue;
         // 建目录（shell mkdir / node mkdirSync）只创建目录，不读写任何载体，也不因此算写者。
         if (AUDIT_DIR_CREATE.test(line) || AUDIT_DIR_CREATE_NODE.test(line)) continue;
@@ -3730,6 +3907,165 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
         "未认领的 .audit 引用",
       ]);
     }
+  });
+
+  it("轮十四-1：working-directory 在扫描面 —— cwd 指到 .audit 时裸载体名同样算引用", () => {
+    // 字段换了、执行面没换：cwd 决定这一步里**所有相对路径**落在哪。
+    expect(stepPayloads({ id: "x", "working-directory": ".audit", run: "true\n" }).map((p) => p.carrier)).toEqual([
+      "run",
+      "working-directory",
+    ]);
+    expect(
+      jobPayloads({ defaults: { run: { "working-directory": ".audit" } }, steps: [] }, {}).map((p) => p.carrier),
+    ).toEqual(["defaults.run.working-directory"]);
+    // 等价写法归一：换一个斜杠不该换一个结论。
+    expect([".audit", "./.audit", ".audit/", ".audit/.", "./.audit/"].map(normalizeWorkingDirectory)).toEqual([
+      ".audit",
+      ".audit",
+      ".audit",
+      ".audit",
+      ".audit",
+    ]);
+    expect([".", "./", ""].map(normalizeWorkingDirectory)).toEqual(["", "", null]);
+    // 工作目录不跟脚本：它是路径不是命令（`./scripts` 不该被记成跟不下去的脚本）。
+    expect(payloadScriptRefs({ carrier: "working-directory", text: "./scripts" }, { root: ROOT })).toEqual({
+      refs: [],
+      unfollowable: [],
+    });
+
+    const dir = mkdtempSync(join(tmpdir(), "audit-cwd-"));
+    const bare = "jq -r '.conclusion' check-run.json\n";
+    // 在仓库根下（无 working-directory），裸名不是 .audit 引用。
+    expect(auditDirReferenceViolations([{ name: "旁路", run: bare }], { root: dir })).toEqual([]);
+    // 同一个 run、只多一个键，裸名就按 cwd 解析回 .audit/check-run.json。
+    const withCwd = auditDirReferenceViolations([{ name: "旁路", "working-directory": ".audit", run: bare }], {
+      root: dir,
+    });
+    expect(withCwd.map((v) => v.reason)).toEqual(["未认领的 .audit 引用", "未认领的 .audit 引用"]);
+    expect(withCwd.some((v) => v.where === "run")).toBe(true);
+    // job 级 defaults.run.working-directory 是同一个机制（同一行 run，靠 job 载体钉 cwd）。
+    const jobCwd = auditDirReferenceViolations([{ name: "旁路", run: bare }], {
+      root: dir,
+      jobPayloads: [{ carrier: "defaults.run.working-directory", text: "./.audit/" }],
+    });
+    expect(jobCwd.some((v) => v.where === "run")).toBe(true);
+    // 真 workflow 两个字段都没有 —— 这条同时是「加了字段也零违规」的正向对照。
+    expect(steps.filter((step) => step["working-directory"] !== undefined)).toEqual([]);
+    expect(job.defaults?.run?.["working-directory"]).toBeUndefined();
+    expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
+  });
+
+  it("轮十四-2：复制/替换不是产出 —— cp/tee/install/ln/dd of= 的目标不得落进载体面", () => {
+    for (const [label, line, expected] of [
+      ["cp", "cp /tmp/pwn.json .audit/check-run.json", ".audit/check-run.json"],
+      ["cp -a", "cp -a /tmp/pwn.json .audit/result.json", ".audit/result.json"],
+      ["tee", "printf '%s' \"$x\" | tee -a .audit/result.json", ".audit/result.json"],
+      ["install", "install -m 644 /tmp/x .audit/review-a.json", ".audit/review-a.json"],
+      ["mv", "mv /tmp/x .audit/review-b.json", ".audit/review-b.json"],
+      ["ln", "ln -sf /tmp/x .audit/check-run.json", ".audit/check-run.json"],
+      ["dd of=", "dd if=/tmp/x of=.audit/check-run.json", ".audit/check-run.json"],
+      ["rsync", "rsync -a /tmp/x .audit/check-run.json", ".audit/check-run.json"],
+      ["--target-directory", "cp /tmp/x --target-directory=.audit", ".audit"],
+    ]) {
+      expect(auditDirWriteTargets(line), label).toContain(expected);
+      expect(copyWriteTargets(line), label).toContain(expected);
+    }
+    // 写者步里塞一条条件分叉的 cp，同样违规：写者可以产出，但不能**替换**。
+    const fallback = steps.find((step) => step.name === "结论兜底");
+    expect(fallback).toBeTruthy();
+    const planted = {
+      ...fallback,
+      run: `[ "$GITHUB_ACTOR" = "attacker" ] && cp /tmp/pwn.json .audit/check-run.json; true\n${fallback.run}`,
+    };
+    expect(auditDirReferenceViolations([planted], { root: ROOT, jobPayloads: carrierPayloads }).map((v) => v.reason)).toEqual([
+      "载体的写通道只能是产出那一行（cp/tee/install 不是产出）",
+    ]);
+    // 正向对照：真 workflow 一条复制/替换写入都没有（判据不会空转，也不会误报）。
+    for (const step of steps) {
+      for (const { where, text } of stepTexts(step, { root: ROOT })) {
+        for (const line of String(text).split("\n")) {
+          expect(copyWriteTargets(stripShellComment(line)), step.name + "/" + where).toEqual([]);
+        }
+      }
+    }
+  });
+
+  it("轮十四-3：结论写面是一条面 —— GraphQL createCheckRun 与 REST check-runs 同一收口", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-graphql-"));
+    const gql = `curl -sS -X POST https://api.github.com/graphql -d '{"query":"mutation{createCheckRun(input:{conclusion:SUCCESS})}"}'\n`;
+    expect(auditDirReferenceViolations([{ name: "插一步", run: gql }], { root: dir }).map((v) => v.reason)).toEqual([
+      "check-runs 只能是那两步的 --input POST",
+    ]);
+    // gh api graphql 的等价写法同样命中：判据不认拼写，认面。
+    expect(
+      auditDirReferenceViolations([{ name: "插一步", run: "gh api graphql -f query='mutation{createCheckRun}'\n" }], {
+        root: dir,
+      }).map((v) => v.reason),
+    ).toEqual(["check-runs 只能是那两步的 --input POST"]);
+    // 面收了，sanctioned 规则没变：那两步的 --input POST 仍然放行。
+    const sanctioned = steps.find((step) => step.name === "回写 Check Run");
+    expect(sanctioned).toBeTruthy();
+    expect(
+      auditDirReferenceViolations([{ name: "回写 Check Run", run: sanctioned.run }], {
+        root: ROOT,
+        jobPayloads: carrierPayloads,
+      }),
+    ).toEqual([]);
+    // 全面在真 workflow 里只出现在那两步。
+    expect(steps.filter((step) => CHECK_RUNS_ENDPOINT.test(String(step.run ?? ""))).map((step) => step.name)).toEqual([
+      "回写 Check Run",
+      "判不了：回写 INFRA",
+    ]);
+  });
+
+  it("轮十四-4：双层通配认不出也必须响 —— .aud*/res*.json 不是放行", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-glob-"));
+    // 认不出的通配一律判「未认领的 .audit 引用」：目录段与文件名同时通配时，
+    // 两层判据都认不出，而它在 shell 里一字不差地展开成那两份载体。
+    for (const [label, run, count] of [
+      ["目录段+文件名", "jq -r .conclusion .aud*/res*.json\n", 1],
+      ["目录段+载体名", "cat .aud*/check-run*.json\n", 1],
+      ["只通配目录段", "cat .aud*/result.json\n", 1],
+      ["目录名整段通配", "cat *audit*/result.json\n", 1],
+      ["只通配文件名", "cat .audit/result*.json\n", 2],
+    ]) {
+      expect(auditDirReferenceViolations([{ name: "插一步", run }], { root: dir }).map((v) => v.reason), label).toEqual(
+        Array(count).fill("未认领的 .audit 引用"),
+      );
+    }
+    // 正向对照：字面路径照旧按白名单判（不是「见 .json 就红」），非载体通配不误报。
+    expect(auditDirReferenceViolations([{ name: "口径层判定", run: "cat .audit/result.json\n" }], { root: dir })).toEqual(
+      [],
+    );
+    expect(auditDirReferenceViolations([{ name: "插一步", run: "ls /tmp/*.log\n" }], { root: dir })).toEqual([]);
+    // 真 workflow 无载体通配（含 followed 脚本）：新规则不是靠误报兜住的。
+    expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
+  });
+
+  it("轮十四-5：短旗标不吃下一个词 —— jq -r .verdict 不产生模块 ref 与噪音", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-shortflag-"));
+    // 旧判据把 -r 的下一个词一律当模块取值，于是 jq -r .verdict 落 scripts.missing=['.verdict']。
+    for (const [label, run] of [
+      ["jq -r 裸取值", "jq -r .verdict .audit/result.json\n"],
+      ["jq -r 裸取值（结论面）", "jq -r .conclusion .audit/check-run.json\n"],
+      ["grep -rq", "grep -rq needs_revision .audit\n"],
+      ["sed -r", "sed -r s/a/b/ .audit/result.json\n"],
+    ]) {
+      const scripts = referencedScripts([{ name: "read", run }], { root: dir });
+      expect(scripts.missing, label).toEqual([]);
+      expect(scripts.unfollowable, label).toEqual([]);
+      expect(scripts.files, label).toEqual([]);
+    }
+    // 反面对照：真模块取值仍然认得出（否则上面全绿只是把整条通道关掉了）。
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(join(dir, "scripts", "probe.cjs"), "module.exports = 1;\n");
+    const real = referencedScripts([{ name: "load", run: "NODE_OPTIONS='-r ./scripts/probe.cjs' jq . x.json\n" }], {
+      root: dir,
+    });
+    expect(real.files).toEqual(["scripts/probe.cjs"]);
+    expect(real.missing).toEqual([]);
+    // 真 workflow 的 -r 噪音已清零（轮十三-7 的判据在这条规则收紧后仍然成立）。
+    expect(referencedScripts(steps, { root: ROOT, jobPayloads: carrierPayloads }).missing).toEqual([]);
   });
 });
 

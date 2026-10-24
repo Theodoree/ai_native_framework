@@ -302,3 +302,32 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **第一次复核我自己的探针又坏了**：`lines[:i]+new+lines[i+1:]` 把 `- name: INFRA 留痕` 那行**删掉**了，于是那个 step 变成无名步 → `requireStepName` 在用例计数前就抛 → vitest 报 `Tests no tests`。**这恰好演示了 fail-closed 生效**，但红/绿判断失效。教训与之前同一族：插入必须 `lines[:i]+new+lines[i:]`，看到 `Tests no tests` 一律先怀疑探针。
 
 **仍未覆盖（执行器登记，我认可）**：变量拼出的路径（`dir=.audit; grep -rq x "$dir"`）静态不可解；`join(".audit","check-run.json")` 这类拼接会被判成「未认领引用」而不是「该载体写者」（误红方向安全，不漏）；`EP=check-runs` 经变量拼端点可绕字面判据；`uses:` composite action 内部行为不进扫描面（沿用 `ALLOWED_USES`）；POST 面只读查询被故意一律判红。
+### 轮十四：判据要覆盖「执行坐标」（cwd、写通道、结论写面、认不出的通配）
+
+两家共 4 条 + 我复核时补 1 条，7 条里 5 条独立成项。全部「未登记且能真执行」。
+
+**A. `working-directory` 不在扫描面（high）**：`stepPayloads` 只收 run/shell/with/env（:1265），`jobPayloads` 只收 env/container/defaults.run.shell（:1288）。插一步 `working-directory: .audit` + `run: jq -r '.conclusion' check-run.json` → **110 全绿**；同一行写全 `.audit/check-run.json`、去掉那个键 → 2 红。**红绿只差一个 YAML 键**。cwd 搬进 `.audit` 后 run 里连一次 `.audit` 都不出现，目录级闸门整层失明。
+
+**B. 覆盖载体的写命令不算写意图（medium，后果 high）**：写意图只认 `--out`/`>`/`>>`/`writeFile*`。我的两版实测（这是本轮最有价值的一次校准）：
+- 无条件 `cp /tmp/pwn.json .audit/check-run.json` 塞进写者步 → **9 红**（行为层 payload 断言咬住）；
+- 改成 `[ "$GITHUB_ACTOR" = "attacker" ] && cp …; true` → **110 全绿**。
+即行为层只在夹具**真**被写坏时才咬，加一个条件分叉就绕过；静态写面必须自己认 `cp/tee/install/mv/ln/dd of=/rsync`。
+
+**C. 结论写面还有第二条（high）**：POST 收口 token 只是 `/\bcheck-runs\b/`，GraphQL `createCheckRun` 不含这个词 → 插 `curl -X POST https://api.github.com/graphql -d '{"query":"mutation{createCheckRun(…conclusion:SUCCESS)}"}'` → 110 全绿；token 权限本就含 `checks:write`，能再造一条同名 Check Run 覆盖门读到的结论。
+
+**D. 目录段+文件名双通配（high）**：`.aud*/res*.json`、`.aud*/check-run*.json` 全部 0 红（`paths.length === 0` 直接 continue，等价于「认领不到就放过」）；而只通配一处（`.audit/result.jso?`、`.aud?t/result.json`）都红——任一段保真就能命中。
+
+**E. 短旗标的值被当模块名（low，噪音）**：`jq -r .verdict …` 落 `scripts.missing=['.verdict']`，红得莫名其妙（去掉 `-r` 就 0 红）。又一次「红在拼写上」。
+
+**修复（`tests/audit-findings.test.mjs` 110→115 例，342+/6-，0 条 expect/it 删除）**：
+- `working-directory` 进载荷面（step 级 + `defaults.run.working-directory` 两级），`normalizeWorkingDirectory`:1325 把 `.audit`/`./.audit`/`.audit/`/`.audit/.` 归一；cwd 是 `.audit` 时 `bareCarrierPaths`:2073 把裸载体名解析回 `.audit/<name>` 参与判定。
+- `COPY_WRITE_COMMANDS`:2087 + `copyWriteTargets`:2089（含 `dd of=`、`-t/--target-directory`）并入写目标 → 写者集合归属；写面违例 reason「载体的写通道只能是产出那一行（cp/tee/install 不是产出）」。
+- `CHECK_RUNS_ENDPOINT`:2037 扩为 `/\bcheck-runs\b|\bcreateCheckRun\b|\/graphql\b/`，sanctioned 规则不变（仍只有那两步 `--input .audit/check-run.json`）。
+- `wildcardAuditRefs`:2146：通配操作数认不出也必须响——落在「未认领的 .audit 引用」类别，不是新类别。
+- 短旗标加 `existsSync` 门槛：`-r` 不跟值。
+
+**我的独立复核（五种变异，`/tmp` 副本）**：`working-directory: .audit` + 裸 `check-run.json` 读 → 4 红；`.aud*/res*.json` → 4 红；`cat .aud*/check-run*.json` → 4 红；GraphQL mutation → 5 红；`jq -r .verdict .audit/result.json` → 7 红。还原 115 绿；整仓 281 tests。
+
+**仍未覆盖（登记，我认可）**：变量中转后再落盘、python/perl 一行写文件、`curl -o`；通配判据偏保守（任何 `*.json` 通配都红，`/tmp/*.json` 会误报）；GraphQL 只钉字面端点（自建代理中转不可见）；job 级 `defaults.run.working-directory` 的 cwd 只影响引用判定、不影响写者归属。
+
+**到这一轮的判断**：判据已从「文本像不像」走到「执行发生在哪个坐标」，剩下的洞开始集中在**进程边界之后**（解释器一行写文件、变量中转）。那是静态分析追不到的地方，再往下修等于写半个解释器——这是我的止损线，下一轮若仍在本层出新洞，我会带止损判断请人定。
