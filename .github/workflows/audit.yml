@@ -11,13 +11,25 @@ name: audit
 # 路由（哪家模型）不在 CI 里：本文件只出现逻辑名 review-a / review-b，真源在
 # .agents/platform/routing.yml（docs/audit-contract.md 四）。
 
-# 触发面刻意只有手动：在 AUDIT_FINDINGS_A/B 有真注入源之前，本 workflow 只能产出
-# action_required（「审计还没真跑」）。而 merge-gate 的 G3 要求每个非自身 check 都是
-# success，于是一个只会 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
-# 那是结构性死锁，而且会训练人忽略红灯。所以等 P-14 接上真执行器之后再打开
-# pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
+# 触发面刻意只有手动：手动 dispatch 时由 inputs 注入两个执行器的 findings（真跑用），
+# 不注入就落 INFRA。不挂 pull_request 的理由是 merge-gate 的 G3 要求每个非自身 check 都是
+# success，于是一个可能产出 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
+# 那是结构性死锁，而且会训练人忽略红灯。等上游真执行器能保证「PR 事件一律有结论」之后再
+# 打开 pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
 on:
   workflow_dispatch:
+    inputs:
+      pr:
+        description: "要审计的 PR 号"
+        required: true
+      findings_a:
+        description: "review-a 的 findings（JSON；留空则该执行器记 INFRA）"
+        required: false
+        default: ""
+      findings_b:
+        description: "review-b 的 findings（JSON；留空则该执行器记 INFRA）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -25,7 +37,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: audit-${{ github.event.pull_request.number }}
+  group: audit-${{ inputs.pr || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -43,12 +55,35 @@ jobs:
         with:
           node-version: 20
 
+      # 只有一条取数路径：PR 号从事件或手改输入来，head sha 一律问 PR 本身。
+      # 不读 github.event.pull_request.head.sha —— 手动触发时它是空串，
+      # 而空 head_sha 的 Check Run 会被 GitHub 拒，或更糟：落到一个没人看的 sha 上。
+      - name: 解析 PR 上下文
+        id: ctx
+        env:
+          PR_INPUT: ${{ inputs.pr }}
+          PR_EVENT: ${{ github.event.pull_request.number }}
+        run: |
+          pr="${PR_INPUT:-${PR_EVENT:-}}"
+          if [ -z "$pr" ]; then echo "::error::没有 PR 号（事件里没有，输入也没给）"; exit 1; fi
+          sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid')
+          if [ -z "$sha" ]; then echo "::error::取不到 PR #$pr 的 head sha"; exit 1; fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "PR=#$pr head=$sha"
+
       - name: 变更路径
+        env:
+          PR: ${{ steps.ctx.outputs.pr }}
         run: |
           mkdir -p .audit
-          gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > .audit/changed-paths.txt
+          gh pr view "$PR" --json files --jq '.files[].path' > .audit/changed-paths.txt
 
+      # 值只经 env 进入脚本：JSON 里的引号/换行由 env 原样传递，
+      # 绝不在 run 里内联输入（那是一次 shell 拼接）。
       - name: 落盘 review-a
+        env:
+          AUDIT_FINDINGS_A: ${{ inputs.findings_a }}
         run: |
           mkdir -p .audit
           AUDIT_SLOT=review-a AUDIT_EXECUTOR=sandbox AUDIT_INPUT="$AUDIT_FINDINGS_A" node -e '
@@ -64,6 +99,8 @@ jobs:
           '
 
       - name: 落盘 review-b
+        env:
+          AUDIT_FINDINGS_B: ${{ inputs.findings_b }}
         run: |
           mkdir -p .audit
           AUDIT_SLOT=review-b AUDIT_EXECUTOR=github AUDIT_INPUT="$AUDIT_FINDINGS_B" node -e '
@@ -104,7 +141,7 @@ jobs:
           echo "exit=$code" >> "$GITHUB_OUTPUT"
           exit 0
         env:
-          AUDIT_SHA: ${{ github.event.pull_request.head.sha }}
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
 
       - name: Check Run
         run: |

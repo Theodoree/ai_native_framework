@@ -299,6 +299,12 @@ describe("wiring: .github/workflows/audit.yml", () => {
     expect(decide.run).toContain("check-run.json");
     const gate = steps.find((s) => s.name === "判定");
     expect(gate.run).toContain("steps.decide.outputs.exit");
+
+    // findings 只经 env 进入脚本：内联进 run 就是一次 shell 拼接，
+    // 上游 JSON 里一个引号或 $( ) 就能改写这条命令。
+    const write = steps.find((s) => s.name === "落盘 review-a");
+    expect(write.env.AUDIT_FINDINGS_A).toContain("inputs.findings_a");
+    expect(write.run).not.toContain("inputs.findings_a");
   });
 });
 
@@ -318,6 +324,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const gh = [
       "#!/usr/bin/env bash",
       "echo \"$*\" >> \"$PWD/calls.log\"",
+      "if [[ \"$*\" == *\"pr view\"* && \"$*\" == *\"headRefOid\"* ]]; then",
+      "  printf 'cafebabe\\n'",
+      "  exit 0",
+      "fi",
       "if [[ \"$*\" == *\"pr view\"* ]]; then",
       "  printf 'scripts/merge-gate.mjs\\nscripts/audit-findings.mjs\\n'",
       "  exit 0",
@@ -359,6 +369,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       "github.event.pull_request.number": "2",
       "github.event.pull_request.head.sha": "cafebabe",
       "secrets.GITHUB_TOKEN": "fake-token",
+      // 手动触发走这条：PR 号与 findings 都从 inputs 来，事件里没有 PR 上下文。
+      inputs: "",
+      "inputs.pr": "2",
+      "inputs.findings_a": findings.AUDIT_FINDINGS_A ?? "",
+      "inputs.findings_b": findings.AUDIT_FINDINGS_B ?? "",
     };
     const env = {
       PATH: bin + ":" + process.env.PATH,
@@ -426,6 +441,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(out.calls.filter((c) => c.includes("check-runs"))).toHaveLength(1);
     expect(out.calls.filter((c) => c.includes("--method POST"))).toHaveLength(1);
     expect(out.payload).toMatchObject({ name: "audit", status: "completed", conclusion: "success" });
+    expect(out.payload.head_sha).toBe("cafebabe");
+    expect(out.calls.filter((c) => c.includes("headRefOid"))).toHaveLength(1);
     expect(out.outputs.decide.exit).toBe("0");
     expect(out.ran.at(-1).status).toBe(0);
     expect(out.summary).toBe("");
