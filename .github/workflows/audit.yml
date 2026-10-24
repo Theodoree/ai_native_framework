@@ -4,8 +4,8 @@ name: audit
 # 「校验 schema -> 合并多个执行器 -> 逐条比对 -> 回写 Check Run」。
 # 评论不算门：合并判据是名为 audit 的 Check Run，而不是 PR 里的一条评论。
 # 取数与判定之间只有一个接口：findings 文件。两个「落盘」步骤把上游执行器的
-# 结论写到 .audit/review-a.json / .audit/review-b.json（AUDIT_FINDINGS_A/B 由上游 job
-# 或仓库变量注入，本 workflow 不自己跑模型）。上游什么都没给时写的是 INFRA 记录，
+# 结论写到 .audit/review-a.json / .audit/review-b.json（dispatch inputs 注入，
+# 本 workflow 不自己跑模型）。上游什么都没给时写的是 INFRA 记录，
 # 不是「空 findings 的 pass」—— 没跑到不能写成跑到并通过。
 #
 # 路由（哪家模型）不在 CI 里：本文件只出现逻辑名 review-a / review-b，真源在
@@ -37,12 +37,15 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: audit-${{ inputs.pr || github.event.pull_request.number }}
+  group: audit-${{ inputs.pr }}
   cancel-in-progress: true
 
 jobs:
-  audit:
-    name: audit
+  # job 自己的 Check Run 叫 audit-runner：判定结论由下面 POST 的那条 audit 承载。
+  # 两者若同名，同一事实就有两个写者，而 GitHub 按 name 只留最新一条——
+  # INFRA 的 action_required 会被 job 的 failure 盖掉，读的人就分不清「判不了」和「真没过」。
+  audit-runner:
+    name: audit-runner
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,68 +58,53 @@ jobs:
         with:
           node-version: 20
 
-      # 只有一条取数路径：PR 号从事件或手改输入来，head sha 一律问 PR 本身。
-      # 不读 github.event.pull_request.head.sha —— 手动触发时它是空串，
-      # 而空 head_sha 的 Check Run 会被 GitHub 拒，或更糟：落到一个没人看的 sha 上。
+      # 这一步永不失败：解不出 PR 上下文本身就是一种结论（判不了），
+      # 而失败的 step 会让后面所有 step 被跳过、连 Check Run 都写不出去——
+      # 于是同一个 sha 上上一轮的 success 原样留着，「这次判不了」退化成「上次判过了」。
+      # 所以失败只体现在 ok=0，由后面两步按 ok 分流：要么正常判定，要么回写 INFRA。
       - name: 解析 PR 上下文
         id: ctx
         env:
           PR_INPUT: ${{ inputs.pr }}
-          PR_EVENT: ${{ github.event.pull_request.number }}
         run: |
-          pr="${PR_INPUT:-${PR_EVENT:-}}"
-          if [ -z "$pr" ]; then echo "::error::没有 PR 号（事件里没有，输入也没给）"; exit 1; fi
-          sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid')
-          if [ -z "$sha" ]; then echo "::error::取不到 PR #$pr 的 head sha"; exit 1; fi
+          pr="$PR_INPUT"
+          sha=""
+          if [ -n "$pr" ]; then
+            sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+          fi
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "PR=#$pr head=$sha"
-
-      - name: 变更路径
-        env:
-          PR: ${{ steps.ctx.outputs.pr }}
-        run: |
-          mkdir -p .audit
-          gh pr view "$PR" --json files --jq '.files[].path' > .audit/changed-paths.txt
+          if [ -n "$sha" ]; then
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "PR=#$pr head=$sha"
+          else
+            # 落到本次运行的提交上：宁可落在一个明确的位置，也不留在「以为写过」上。
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::取不到 PR #${pr:-?} 的 head sha：本次判不了，按 INFRA 回写"
+          fi
 
       # 值只经 env 进入脚本：JSON 里的引号/换行由 env 原样传递，
       # 绝不在 run 里内联输入（那是一次 shell 拼接）。
+      # 「输入自称的执行器」与「它所在的槽」是否一致，由 scripts/audit-slot.mjs 判，
+      # 规则不在这两份 run 块里各写一遍。
       - name: 落盘 review-a
+        if: steps.ctx.outputs.ok == '1'
         env:
           AUDIT_FINDINGS_A: ${{ inputs.findings_a }}
         run: |
-          mkdir -p .audit
-          AUDIT_SLOT=review-a AUDIT_EXECUTOR=sandbox AUDIT_INPUT="$AUDIT_FINDINGS_A" node -e '
-            const fs = require("node:fs");
-            const input = process.env.AUDIT_INPUT;
-            const body = input && input.trim() !== "" ? input : JSON.stringify({
-              verdict: "INFRA",
-              findings: [],
-              evidence: { executor: process.env.AUDIT_EXECUTOR, agent: process.env.AUDIT_SLOT },
-              reason: "上游未注入 findings（AUDIT_FINDINGS_A 为空）：判不了，不是通过",
-            });
-            fs.writeFileSync(".audit/" + process.env.AUDIT_SLOT + ".json", body);
-          '
+          AUDIT_INPUT="$AUDIT_FINDINGS_A" node scripts/audit-slot.mjs --slot review-a --executor sandbox --out .audit/review-a.json
 
       - name: 落盘 review-b
+        if: steps.ctx.outputs.ok == '1'
         env:
           AUDIT_FINDINGS_B: ${{ inputs.findings_b }}
         run: |
-          mkdir -p .audit
-          AUDIT_SLOT=review-b AUDIT_EXECUTOR=github AUDIT_INPUT="$AUDIT_FINDINGS_B" node -e '
-            const fs = require("node:fs");
-            const input = process.env.AUDIT_INPUT;
-            const body = input && input.trim() !== "" ? input : JSON.stringify({
-              verdict: "INFRA",
-              findings: [],
-              evidence: { executor: process.env.AUDIT_EXECUTOR, agent: process.env.AUDIT_SLOT },
-              reason: "上游未注入 findings（AUDIT_FINDINGS_B 为空）：判不了，不是通过",
-            });
-            fs.writeFileSync(".audit/" + process.env.AUDIT_SLOT + ".json", body);
-          '
+          AUDIT_INPUT="$AUDIT_FINDINGS_B" node scripts/audit-slot.mjs --slot review-b --executor github --out .audit/review-b.json
 
       - name: verdict
         id: decide
+        if: steps.ctx.outputs.ok == '1'
         run: |
           set +e
           node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json
@@ -144,6 +132,7 @@ jobs:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
 
       - name: Check Run
+        if: steps.ctx.outputs.ok == '1'
         run: |
           gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
 
@@ -156,11 +145,41 @@ jobs:
             echo '上游执行器没有给出可用结论（超时 / 额度耗尽 / 模型不可达，或 schema 不合格）。'
             echo 'INFRA 不计入合并判据，但必须落在这里，不许静默当通过。'
             echo ''
-            echo '```'
+            echo '\`\`\`'
             cat .audit/result.json
-            echo '```'
+            echo '\`\`\`'
           } >> "$GITHUB_STEP_SUMMARY"
           echo '::warning title=audit INFRA::判不了，不是通过；详情见本次运行摘要'
 
+      # 判不了也要在 sha 上留下 action_required：不写等于让对方继续沿用上一轮的绿。
+      - name: 判不了：回写 INFRA
+        if: steps.ctx.outputs.ok != '1'
+        env:
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
+        run: |
+          mkdir -p .audit
+          node -e '
+            const fs = require("node:fs");
+            const sha = process.env.AUDIT_SHA;
+            fs.writeFileSync(".audit/check-run.json", JSON.stringify({
+              name: "audit",
+              head_sha: sha,
+              status: "completed",
+              conclusion: "action_required",
+              output: { title: "audit INFRA", summary: "解析 PR 上下文失败：不知道审哪个 sha，判不了。落点 " + sha },
+            }));
+          '
+          gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
+          {
+            echo '## audit: INFRA（解析不了 PR 上下文）'
+            echo ''
+            echo 'PR 号给了，但取不到它的 head sha。审计没有对象，判不了，按 INFRA 回写。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 判定
+        if: steps.ctx.outputs.ok == '1'
         run: exit ${{ steps.decide.outputs.exit }}
+
+      - name: 判定（判不了）
+        if: steps.ctx.outputs.ok != '1'
+        run: exit 3

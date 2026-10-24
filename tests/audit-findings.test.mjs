@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -247,12 +248,18 @@ describe("wiring: .github/workflows/audit.yml", () => {
   // 而「两边结论不一致」这个信号也就没了。这里把这条钉死。
   const VENDOR = /\b(gpt|o1|o3|claude|sonnet|opus|haiku|gemini|deepseek|qwen|llama|mistral|grok|kimi|glm)\b/i;
   const doc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
-  const job = doc.jobs.audit;
+  const job = doc.jobs["audit-runner"];
   const steps = job.steps;
 
-  it("job 名就是 Check 名 audit", () => {
-    expect(Object.keys(doc.jobs)).toEqual(["audit"]);
-    expect(job.name).toBe("audit");
+  it("判定结论只有一条 Check Run 承载：job 不叫 audit", () => {
+    // 同名会让同一事实有两个写者：job 的 failure 与 POST 的 action_required 抢同一个名字，
+    // 按 name 取 latest 时 INFRA 会被读成 FAIL，读者就分不清「判不了」和「真没过」。
+    expect(Object.keys(doc.jobs)).toEqual(["audit-runner"]);
+    expect(job.name).toBe("audit-runner");
+    const posted = steps.filter((s) => s.run?.includes("--input .audit/check-run.json"));
+    expect(posted).toHaveLength(2);
+    const writers = steps.filter((s) => s.run?.includes("check-run.json") && s.run.includes('name: "audit"'));
+    expect(writers).toHaveLength(2);
   });
 
   it("权限最小：只开错误里用到的那几项，且 checks: write 是硬的", () => {
@@ -272,8 +279,8 @@ describe("wiring: .github/workflows/audit.yml", () => {
   it("真的回写 Check Run（不是只发评论）", () => {
     const calls = steps.filter((s) => typeof s.run === "string");
     const checkRun = calls.filter((s) => s.run.includes("repos/$GITHUB_REPOSITORY/check-runs"));
-    expect(checkRun).toHaveLength(1);
-    expect(checkRun[0].run).toContain("--method POST");
+    expect(checkRun).toHaveLength(2);
+    for (const step of checkRun) expect(step.run).toContain("--method POST");
     expect(checkRun[0].run).toContain("--input .audit/check-run.json");
     // 评论不算门：本文件不该出现 PR 评论调用。
     expect(calls.filter((s) => s.run.includes("pulls/") && s.run.includes("comments"))).toHaveLength(0);
@@ -288,7 +295,7 @@ describe("wiring: .github/workflows/audit.yml", () => {
 
   it("INFRA 显式留痕落在 workflow 摘要里", () => {
     const trace = steps.filter((s) => s.id === "infra" || String(s.name).includes("INFRA"));
-    expect(trace).toHaveLength(1);
+    expect(trace).toHaveLength(2);
     expect(trace[0].run).toContain("$GITHUB_STEP_SUMMARY");
     expect(trace[0].if).toContain("action_required");
   });
@@ -302,9 +309,14 @@ describe("wiring: .github/workflows/audit.yml", () => {
 
     // findings 只经 env 进入脚本：内联进 run 就是一次 shell 拼接，
     // 上游 JSON 里一个引号或 $( ) 就能改写这条命令。
-    const write = steps.find((s) => s.name === "落盘 review-a");
-    expect(write.env.AUDIT_FINDINGS_A).toContain("inputs.findings_a");
-    expect(write.run).not.toContain("inputs.findings_a");
+    for (const [name, key] of [
+      ["落盘 review-a", "AUDIT_FINDINGS_A"],
+      ["落盘 review-b", "AUDIT_FINDINGS_B"],
+    ]) {
+      const step = steps.find((s) => s.name === name);
+      expect(step.env[key]).toContain("inputs.findings_" + (name.endsWith("a") ? "a" : "b"));
+      expect(step.run).not.toContain("inputs.findings_");
+    }
   });
 });
 
@@ -312,7 +324,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 照 tests/state-writer-wiring.test.mjs 的办法：假 gh 记账到 calls.log，
   // 于是「到底调了哪个 API、payload 里 conclusion 是什么」是实测而不是读字面。
   const doc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
-  const steps = doc.jobs.audit.steps;
+  const steps = doc.jobs["audit-runner"].steps;
 
   function sandbox() {
     const dir = mkdtempSync(join(tmpdir(), "audit-wf-"));
@@ -363,17 +375,37 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     return m[3] === "==" ? actual === m[4] : actual !== m[4];
   };
 
-  function runWorkflow(findings) {
+  // 槽位身份是真判据（一个执行器不许占两个槽），所以夹具必须像真执行器那样
+  // 各自自报所在槽；要测「冒充」的用例用 raw:true 显式绕过这层改写。
+  const patchEvidence = (json, executor, agent) => {
+    if (typeof json !== "string" || json.trim() === "") return "";
+    try {
+      const parsed = JSON.parse(json);
+      parsed.evidence = { ...(parsed.evidence ?? {}), executor, agent };
+      return JSON.stringify(parsed);
+    } catch {
+      return json;
+    }
+  };
+
+  function runWorkflow(findings, ctxOverride = {}) {
     const { dir, bin } = sandbox();
     const ctx = {
       "github.event.pull_request.number": "2",
-      "github.event.pull_request.head.sha": "cafebabe",
+      // 事件 sha 故意与假 gh 返回的 headRefOid 不同：两个值相同的话，
+      // 「head_sha 来自 gh 而不是事件」这条断言就证明了任何东西。
+      "github.event.pull_request.head.sha": "deadbeef",
       "secrets.GITHUB_TOKEN": "fake-token",
       // 手动触发走这条：PR 号与 findings 都从 inputs 来，事件里没有 PR 上下文。
       inputs: "",
       "inputs.pr": "2",
-      "inputs.findings_a": findings.AUDIT_FINDINGS_A ?? "",
-      "inputs.findings_b": findings.AUDIT_FINDINGS_B ?? "",
+      "inputs.findings_a": findings.raw
+        ? (findings.AUDIT_FINDINGS_A ?? "")
+        : patchEvidence(findings.AUDIT_FINDINGS_A, "sandbox", "review-a"),
+      "inputs.findings_b": findings.raw
+        ? (findings.AUDIT_FINDINGS_B ?? "")
+        : patchEvidence(findings.AUDIT_FINDINGS_B, "github", "review-b"),
+      ...ctxOverride,
     };
     const env = {
       PATH: bin + ":" + process.env.PATH,
@@ -396,7 +428,9 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       for (const [key, value] of Object.entries(step.env ?? {}))
         stepEnv[key] = interpolate(String(value), ctx, outputs);
       const body = interpolate(step.run, ctx, outputs);
-      const spawned = spawnSync("bash", ["-c", body], {
+      // Actions 用的是 bash -e：不带 -e 的沙箱会把「中间命令失败、步骤照样继续」
+      // 当成常态，于是真 CI 会红的分支在这里被记成 status 0。
+      const spawned = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", body], {
         cwd: dir,
         env: stepEnv,
         encoding: "utf8",
@@ -466,6 +500,46 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(out.ran.at(-1).status).toBe(3);
     expect(out.summary).toContain("INFRA");
     expect(out.summary).toContain("不许静默当通过");
+  });
+
+  it("注入不被求值：findings 里的 $( ) 原样进 payload，不在 CI 里执行", () => {
+    // 输入走 env 而不是内联进 run 块，所以它只能作为字符串到达脚本。
+    // 这条用例真喂一个命令替换进去，看它在沙箱里有没有被执行。
+    const angry = JSON.stringify({
+      ...result({ verdict: "needs_revision" }),
+      findings: [
+        {
+          path: "scripts/audit-findings.mjs",
+          line: 1,
+          severity: "low",
+          criterion: "注入面",
+          suggestion: "$(touch pwned-by-audit-input)",
+        },
+      ],
+    });
+    const out = runWorkflow({ AUDIT_FINDINGS_A: angry, AUDIT_FINDINGS_B: angry });
+    expect(existsSync(join(out.dir, "pwned-by-audit-input"))).toBe(false);
+    expect(out.payload.conclusion).toBe("failure");
+  });
+
+  it("一个执行器不能占两个槽：同一份证据填进两个 input 只算一份，另一槽记 INFRA", () => {
+    const forged = JSON.stringify(result({ evidence: { ...result().evidence, executor: "github", agent: "review-b" } }));
+    const out = runWorkflow({ AUDIT_FINDINGS_A: forged, AUDIT_FINDINGS_B: forged, raw: true });
+    expect(out.outputs.decide.verdict).toBe("INFRA");
+    expect(out.payload.conclusion).toBe("action_required");
+    const a = readFileSync(join(out.dir, ".audit/review-a.json"), "utf8");
+    expect(a).toContain("一个执行器不能占两个槽");
+  });
+
+  it("判不了也要回写：取不到 PR head sha 时落 action_required，不是沿用上一轮的绿", () => {
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      { "inputs.pr": "" },
+    );
+    expect(out.outputs.ctx.ok).toBe("0");
+    expect(out.payload).toMatchObject({ name: "audit", conclusion: "action_required" });
+    expect(out.summary).toContain("判不了");
+    expect(out.ran.at(-1).status).toBe(3);
   });
 
   it("上游没注入 findings：不写 pass，落成 INFRA", () => {

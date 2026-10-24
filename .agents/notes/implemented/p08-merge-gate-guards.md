@@ -89,3 +89,4 @@ merge-gate PASS 4/4
 - **已知残余（刻意留）**：生产者彻底不出现时，门在 600s 后判未就绪，不代它宣称已就绪；修好上游后靠后续 PR 事件或人工重跑重算。
 - **「本地绿、CI 红」的根因（已定位并钉死）**：三个用例先在测试里 `const head = repo().head`（另开一个临时仓库），再用这个 head 去造 check runs，而 `gate()` 内部**又**开一个仓库——两个仓库内容相同、提交在同一秒时哈希相同、跨秒就不同，于是同一份用例时绿时红（CI 上红在 `E_CHECK_STALE 这些检查项不是 11d879f 的`）。
 - **修法不是加重试**：`gate()` 本就支持 `checks: (head) => ...` 的函数形式，让夹具长在「本次判定真正用的那个 head」上；同时给 `gate()` 加一道夹具守卫——check runs 的 `head_sha` 与本次 head 不一致就直接抛错（`allowStrayHeads: true` 留给那条故意造 `E_CHECK_STALE` 的用例）。这样夹具写错会在本地立刻炸，而不是等 CI 用偶发红来提示。
+- **`infra` 标签是留痕载体，不是分类标签**：G3 的「无未结 INFRA」判的是开放 issue 上有没有 `infra` 标签，所以它只该由「INFRA 留痕」这条路径贴上，由人核对后摘掉。我在 PR #8 期间自己拿它当普通分类标签用（`gh issue create --label infra`），门立刻如实报 `G3 checks FAIL E_INFRA_OPEN 还有 1 条未结 INFRA: issue #7`——门是对的，标签是错的。教训：一个标签一旦被某条判据当作信号读取，它就不再是自由文本。
