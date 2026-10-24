@@ -28,6 +28,14 @@ name: audit
 # 「结论兜底」补一条 action_required —— 缺结论绝不等于通过（P-13 的 schema 不合格、
 # 脚本崩溃都落在这条路径上）。
 #
+# 上面那句的前提是 payload 的 head_sha 非空：空 sha 会被 GitHub 拒收，于是**一条
+# Check Run 都没有**，「一定有一条」当场不成立。三条写 payload 的路径各自兜住这一点：
+# 判定 / 兜底只在 ctx 解析成功（ok=1）时跑，落点由 ctx 给出；「判不了」用 ctx 给出的 sha，
+# 为空时退到 github.sha（本次运行的提交）。所以 checkout / node 先挂了、ctx 整步被跳过时，
+# 仍然是一条落在 github.sha 上的 action_required。
+# 那种「判不了」的成因是管线自己坏了（不是这个 PR 的问题），与「PR 上下文解不出」必须
+# 分开说：后者去改 PR / 重试，前者去修管线。
+#
 # 触发面刻意只有手动：手动 dispatch 时由 inputs 注入两个执行器的 findings（真跑用），
 # 不注入就落 INFRA。不挂 pull_request 的理由是 merge-gate 的 G3 要求每个非自身 check 都
 # success，于是一个可能产出 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
@@ -171,6 +179,10 @@ jobs:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
 
       # 口径层崩了 / 没跑 / 写到一半，都不能让「没有结论」变成「看起来没有坏消息」。
+      # 这里补写的 result.json 只有 verdict/conclusion/exit/reason 四个字段，是**给人看的**
+      # （谁 cat 谁读整段文本），刻意不做成第二份口径层数据：读字段的唯一读者是上面
+      # 「口径层判定」里的内联 JS，而那一步在本步之前、且只跑一次 —— 本步补出来的文件
+      # 不会再被任何脚本解引 executors / comparison。要加读者，先把字段补齐。
       # 这里补的是**同一条结论**（action_required），不是第二套判据：
       # 服务器上必须存在一条 audit Check Run，缺结论绝不等价于通过。
       # 也正因为如此，job 级 check 不为这条补的记录染红（exit=0）——
@@ -254,49 +266,86 @@ jobs:
             echo '上游执行器没有给出可用结论（超时 / 额度耗尽 / 模型不可达，或 schema 不合格）。'
             echo 'INFRA 计入「未判过」，因此不放行合并；但也不许把它读成「代码不合格」。'
             echo ''
-            echo '```'
-            cat .audit/result.json
-            echo '```'
+            # 围栏长度按内容算，固定 3 个是错的：result.json 里的 findings[].path 是外部输入，
+            # 一个 ``` 就能提前闭合围栏，把「## audit: pass（伪造）」和外部图片
+            # ![](http://…) 放到围栏外，被 CI 摘要页当 Markdown 渲染。
+            # 内容一字不改（证据不许改写），改的是围栏：内容里最长的连续反引号串是 N，
+            # 围栏就用 N+1 个 —— Markdown 里更长的围栏无法被内容闭合。
+            fence='```'
+            body=$(cat .audit/result.json 2>/dev/null || true)
+            while [[ "$body" == *"$fence"* ]]; do fence="$fence"'`'; done
+            echo "$fence"
+            printf '%s\n' "$body"
+            echo "$fence"
           } >> "$GITHUB_STEP_SUMMARY"
           echo '::warning title=audit INFRA::判不了，不是通过；详情见本次运行摘要'
 
       # 判不了也要在 sha 上留下 action_required：不写等于让对方继续沿用上一轮的绿。
-      # 但落点是**猜的**（GITHUB_SHA = dispatch ref 的提交），所以标题与摘要都写明这一点，
+      # 落点有两个来源，但**一定非空**：ctx 解出的 sha（ctx 自己已经退到 GITHUB_SHA），
+      # ctx 整步没跑起来时再退到 github.sha。空 head_sha 会被 GitHub 拒收，那时
+      # 服务器上一条 Check Run 都没有 —— 正是这条要防的形态。
+      # 落点仍然是**猜的**（不是 PR head），所以标题与摘要都写明这一点，
       # 别写成「已经在正确的位置留过痕」。
+      # 「判不了」有两种来历，责任方向相反：ctx 跑过但解不出 PR head 是 PR 侧的事；
+      # ctx 根本没跑起来（checkout / node 先挂了）是管线自己坏了，与这个 PR 无关。
       - name: 判不了：回写 INFRA
         if: always() && steps.ctx.outputs.ok != '1'
         env:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
+          RUN_SHA: ${{ github.sha }}
+          CTX_OK: ${{ steps.ctx.outputs.ok }}
         run: |
           mkdir -p .audit
           node -e '
             const fs = require("node:fs");
-            const sha = process.env.AUDIT_SHA;
+            // 落点非空是不变式：空 head_sha 会被 GitHub 拒收，一条 Check Run 都写不出去。
+            const fromCtx = process.env.AUDIT_SHA;
+            const sha = fromCtx || process.env.RUN_SHA;
+            if (!sha) throw new Error("判不了也要有个落点：ctx 与 github.sha 都是空的");
+            // ctx 有没有跑起来，看它有没有写出 ok：空串 = 这一步被跳过（前置步骤先红了）。
+            const pipeline = !process.env.CTX_OK;
+            const why = pipeline
+              ? "解析 PR 上下文的步骤没有跑起来（checkout / node 之类的前置步骤先失败了）：这是管线自己的故障，不是这个 PR 的问题。"
+              : "解析 PR 上下文跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。";
+            const traced = fromCtx
+              ? "落点 " + sha + " 来自 ctx 步（它已退到本次运行的提交）"
+              : "落点 " + sha + " 退到了 github.sha（本次 workflow 运行的提交）";
             fs.writeFileSync(".audit/check-run.json", JSON.stringify({
               name: "audit",
               head_sha: sha,
               status: "completed",
               conclusion: "action_required",
               output: {
-                title: "audit INFRA（落点 " + sha + "：不是 PR head）",
-                summary:
-                  "解析 PR 上下文失败：不知道这个 PR 的 head sha，判不了。落点是本次 dispatch 的提交 " +
+                title:
+                  "audit INFRA（" +
+                  (pipeline ? "管线没跑起来" : "PR 上下文解不出") +
+                  "；落点 " +
                   sha +
-                  "，不保证等于 PR head —— dispatch 的 ref 不是 head 分支时，PR head 上的旧结论仍然保留。",
+                  "：不是 PR head）",
+                summary:
+                  why + " " + traced + "，不保证等于 PR head —— dispatch 的 ref 不是 head 分支时，PR head 上的旧结论仍然保留。",
               },
             }));
           '
           gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
+          case "${CTX_OK:-}" in
+            '')
+              cause='ctx 步没有跑起来（checkout / node 之类的前置步骤先失败了）：这是管线自己的故障，不是这个 PR 的问题。'
+              ;;
+            *)
+              cause='ctx 步跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。'
+              ;;
+          esac
           {
-            echo '## audit: INFRA（解析不了 PR 上下文）'
+            echo '## audit: INFRA（判不了 → 按「未判过」留痕）'
             echo ''
-            echo 'PR 号给了，但取不到它的 head sha。审计没有对象，判不了，按 INFRA 回写。'
+            echo "$cause"
             echo ''
-            echo '**落点不一定是 PR head**：写到的 sha 是本次 dispatch 的提交。'
+            echo '**落点不一定是 PR head**：写到的 sha 是本次 workflow 运行的提交。'
             echo 'dispatch 的 ref 不是这个 PR 的 head 分支时，这条留痕落在别的提交上，'
             echo 'PR head 上的旧结论原样保留——别把「看见过 audit 的红」当成「这个 PR 判过」。'
           } >> "$GITHUB_STEP_SUMMARY"
-          echo '::error title=audit INFRA::判不了：取不到 PR head sha，落点是 dispatch 提交而不是 PR head'
+          echo '::error title=audit INFRA::判不了：落点是本次运行的提交，不是 PR head'
 
       # job 级 check 只回答「这个 job 有没有出逻辑故障」：
       # 0 = 跑完了（不论结论是 success 还是 action_required；结论的红由 Check Run 承载）

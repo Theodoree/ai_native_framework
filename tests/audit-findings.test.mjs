@@ -587,14 +587,19 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
 
   // mutate：让用例在「YAML 已经跑起来之前」动一下沙箱，用来喂真故障
   // （比如把口径层脚本换成一个什么都不写的空壳，模拟崩溃）。
-  function runWorkflow(findings, ctxOverride = {}, mutate) {
+  // options.skip：按 step 名字模拟「这一步被跳过」（前置步骤红了时 Actions 的行为），
+  // 于是依赖它 outputs 的后续步骤真的读到空串 —— 这正是 checkout / node 挂掉后的形状。
+  function runWorkflow(findings, ctxOverride = {}, mutate, options = {}) {
     const { dir, bin } = sandbox();
     if (mutate) mutate(dir);
+    const skip = new Set(options.skip ?? []);
     const ctx = {
       "github.event.pull_request.number": "2",
       // 事件 sha 故意与假 gh 返回的 headRefOid 不同：两个值相同的话，
       // 「head_sha 来自 gh 而不是事件」这条断言就证明了任何东西。
       "github.event.pull_request.head.sha": "deadbeef",
+      // 本次 workflow 运行的提交（= env GITHUB_SHA）：ctx 被跳过时「判不了」的兜底落点。
+      "github.sha": "f00dfeed",
       "secrets.GITHUB_TOKEN": "fake-token",
       // 手动触发走这条：PR 号与 findings 都从 inputs 来，事件里没有 PR 上下文。
       inputs: "",
@@ -623,9 +628,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     writeFileSync(env.GITHUB_OUTPUT, "");
     writeFileSync(env.GITHUB_STEP_SUMMARY, "");
     const outputs = {};
+    const raw = {};
     const ran = [];
     for (const step of steps) {
       if (!step.run || !step.name) continue;
+      if (skip.has(step.name)) continue;
       if (step.if && !ifMatches(step.if, outputs)) continue;
       writeFileSync(env.GITHUB_OUTPUT, "");
       const stepEnv = { ...env };
@@ -640,8 +647,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         encoding: "utf8",
       });
       if (step.id) {
+        const written = readFileSync(env.GITHUB_OUTPUT, "utf8");
+        raw[step.id] = written;
         const captured = {};
-        for (const line of readFileSync(env.GITHUB_OUTPUT, "utf8").split("\n")) {
+        for (const line of written.split("\n")) {
           const at = line.indexOf("=");
           if (at > 0) captured[line.slice(0, at)] = line.slice(at + 1);
         }
@@ -659,6 +668,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       dir,
       ran,
       outputs,
+      // 每个带 id 的步骤写进 $GITHUB_OUTPUT 的原文：注解注入面看的是这些行本身。
+      raw,
       calls: readFileSync(join(dir, "calls.log"), "utf8").split("\n").filter(Boolean),
       summary: readFileSync(join(dir, "summary.md"), "utf8"),
       payload: (() => {
@@ -711,6 +722,98 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(out.summary).toContain("不许把它读成「代码不合格」");
   });
 
+  // 摘要围栏宽度本身是判据：固定 3 个反引号时，一个 findings[].path 就能提前闭合围栏，
+  // 后面的「## audit: pass（伪造）」与 ![](http://evil/x.png) 落到围栏外被当 Markdown 渲染。
+  // 这里按 Markdown 的规则读摘要：开围栏 = 第一条 ≥3 个纯反引号的行，它有 W 个；
+  // 之后出现 ≥W 个反引号的行才算闭合。
+  function parseSummaryFences(markdown) {
+    const lines = markdown.split("\n");
+    const openAt = lines.findIndex((line) => /^`{3,}$/.test(line));
+    if (openAt < 0) return { width: 0, closed: false, inside: [], outside: lines };
+    const width = lines[openAt].length;
+    const closeAt = lines.findIndex((line, i) => i > openAt && /^`{3,}$/.test(line) && line.length >= width);
+    return {
+      width,
+      closed: closeAt >= 0,
+      inside: lines.slice(openAt + 1, closeAt < 0 ? undefined : closeAt),
+      outside: [...lines.slice(0, openAt), ...(closeAt < 0 ? [] : lines.slice(closeAt + 1))],
+    };
+  }
+
+  it("摘要围栏按内容算：path 里的三反引号关不掉围栏，伪造结论与外部图片出不来", () => {
+    const forged = "```\n## audit: pass（伪造）\n![](http://evil/beacon.png)";
+    const poisoned = JSON.stringify(result({ verdict: "INFRA", findings: [finding({ path: forged })] }));
+    const out = runWorkflow({ AUDIT_FINDINGS_A: poisoned, AUDIT_FINDINGS_B: pass });
+    // 证据确实落进了 result.json —— 否则下面只是「内容里没有反引号」的空转。
+    expect(readFileSync(join(out.dir, ".audit/result.json"), "utf8")).toContain("## audit: pass");
+    const fenced = parseSummaryFences(out.summary);
+    expect(fenced.closed).toBe(true);
+    // 不变式：围栏必须**严格长于**内容里最长的连续反引号串。
+    // 相等（固定 3 个 = 内容里的 ```）就是可闭合；Markdown 允许更长的围栏，
+    // 所以「按内容算」既不改写证据，也不需要转义。
+    const longestInside = Math.max(
+      0,
+      ...fenced.inside.flatMap((line) => (line.match(/`+/g) ?? []).map((run) => run.length)),
+    );
+    expect(longestInside).toBeGreaterThanOrEqual(3);
+    expect(fenced.width).toBeGreaterThan(longestInside);
+    const outside = fenced.outside.join("\n");
+    expect(outside).not.toContain("## audit: pass");
+    expect(outside).not.toContain("evil");
+    // 内容一字不改：伪造串原样留在围栏里，中和靠围栏、不靠改写证据。
+    expect(fenced.inside.join("\n")).toContain("## audit: pass（伪造）");
+  });
+
+  it("摘要围栏挡得住「行首就是三反引号」的内容：Markdown 只看行首，固定 3 个会被闭合", () => {
+    // 上一条走的是真写者：JSON.stringify 把 path 里的 \n 转义成 \\n，行首反引号进不了摘要。
+    // 但「围栏能不能被内容闭合」是摘要这一步自己的不变式，与写者怎么序列化无关 ——
+    // 这里直接喂一份行首就是 ``` 的 result.json，把这条不变式钉死。
+    const { dir } = sandbox();
+    writeFileSync(
+      join(dir, ".audit/result.json"),
+      ['{', '  "note": [', "```", "## audit: pass（伪造）", "![](http://evil/beacon.png)", "  ]", "}", ""].join("\n"),
+    );
+    const infraStep = steps.find((s) => s.name === "INFRA 留痕");
+    const summaryPath = join(dir, "summary.md");
+    writeFileSync(summaryPath, "");
+    const spawned = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", infraStep.run], {
+      cwd: dir,
+      env: {
+        PATH: join(dir, "bin") + ":" + process.env.PATH,
+        HOME: dir,
+        GITHUB_STEP_SUMMARY: summaryPath,
+        GITHUB_REPOSITORY: "o/r",
+      },
+      encoding: "utf8",
+    });
+    expect(spawned.status).toBe(0);
+    const fenced = parseSummaryFences(readFileSync(summaryPath, "utf8"));
+    // 先看后果：伪造结论与外部图片一个字都不许落到围栏外（渲染面）。
+    const outside = fenced.outside.join("\n");
+    expect(outside).not.toContain("## audit: pass");
+    expect(outside).not.toContain("evil");
+    // 再看成因：围栏严格长于内容里最长的连续反引号串，所以内容闭合不了它。
+    expect(fenced.closed).toBe(true);
+    const longestInside = Math.max(
+      0,
+      ...fenced.inside.flatMap((line) => (line.match(/`+/g) ?? []).map((run) => run.length)),
+    );
+    expect(longestInside).toBeGreaterThanOrEqual(3);
+    expect(fenced.width).toBeGreaterThan(longestInside);
+  });
+
+  it("兜底补的结果不是第二份口径层：解引用 result.json 字段的读者只有口径层，且排在兜底之前", () => {
+    const decideIndex = steps.findIndex((s) => s.id === "decide");
+    const fallbackIndex = steps.findIndex((s) => s.id === "fallback");
+    expect(decideIndex).toBeGreaterThan(-1);
+    expect(fallbackIndex).toBeGreaterThan(decideIndex);
+    // 兜底补出来的 {verdict,conclusion,exit,reason} 缺 executors / comparison；
+    // 只要解引用这两个字段的读者只有口径层（在本步之前、只跑一次），它就不是活路径。
+    const readers = steps.filter((s) => typeof s.run === "string" && /r\.executors|comparison\.counts/.test(s.run));
+    expect(readers.map((s) => s.id)).toEqual(["decide"]);
+  });
+
+
   it("注入不被求值：findings 里的 $( ) 原样进 payload，不在 CI 里执行", () => {
     // 输入走 env 而不是内联进 run 块，所以它只能作为字符串到达脚本。
     // 这条用例真喂一个命令替换进去，看它在沙箱里有没有被执行。
@@ -757,6 +860,88 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(out.summary).toContain("落点不一定是 PR head");
     // 结论的红由 POST 出去的 Check Run 承载，job 级 check 不重复染红。
     expect(out.ran.at(-1).status).toBe(0);
+  });
+
+  it("PR_INPUT 里的换行不许注进 $GITHUB_OUTPUT：恶意串被收窄成「没给 PR 号」", () => {
+    // pr 既要进 $GITHUB_OUTPUT 也要进注解文本，所以它本身就是注解注入面：
+    // 一个换行就能让 GITHUB_OUTPUT 多出一行 "::error title=forged::pwned"。
+    // 守卫是「整串必须全是数字」，不是「截到第一行」。
+    const forged = "2\n::error title=forged::pwned";
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      { "inputs.pr": forged },
+    );
+    expect(out.outputs.ctx.pr).toBe("");
+    expect(out.outputs.ctx.ok).toBe("0");
+    // 值面：$GITHUB_OUTPUT 的原文件里任何一行都不许以 :: 开头 —— 那就是一条注解。
+    expect(out.raw.ctx.split("\n").filter((line) => line.startsWith("::"))).toEqual([]);
+    expect(out.raw.ctx).not.toContain("pwned");
+    // 恶意串没有被当成 PR 号去查：一次 headRefOid 都没调。
+    expect(out.calls.filter((c) => c.includes("headRefOid"))).toHaveLength(0);
+    // ctx 自己那条 warning 也不许被注入拆成第二行注解。
+    const ctxStdout = out.ran.find((s) => s.name === "解析 PR 上下文").stdout;
+    expect(ctxStdout.split("\n").filter((line) => line.startsWith("::"))).toEqual([
+      "::warning::取不到 PR #? 的 head sha：本次判不了，按 INFRA 回写",
+    ]);
+    // 退化路径必须与「没给 PR 号」逐字段一致：ctx 的 outputs 与 POST 出去的 payload 都一样。
+    const blank = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      { "inputs.pr": "" },
+    );
+    expect(out.outputs.ctx).toEqual(blank.outputs.ctx);
+    expect(out.payload).toEqual(blank.payload);
+  });
+
+  it("正例：PR_INPUT=2 收窄后仍是 2，head sha 来自 gh 的 headRefOid", () => {
+    // 没有这条，上一条可以被「把 ctx 写死成 ok=0」满足 —— 守卫等于被删掉也不见红。
+    const out = runWorkflow({ AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass });
+    expect(out.outputs.ctx).toMatchObject({ pr: "2", sha: "cafebabe", ok: "1" });
+    expect(out.payload.head_sha).toBe("cafebabe");
+  });
+
+  it("ctx 步从未运行（checkout 先挂了）：判不了 仍然 POST，落点退到 github.sha 且非空", () => {
+    // 真形状：ctx 被跳过，于是它的 outputs 一个都没有（ok 是空串，不是 "0"）。
+    // 沙箱不模拟「前一步红了就跳过后续步骤」，这里用 skip 把 ctx 整个拿掉，
+    // 效果等价（后续步骤读到的就是「这一步从没写过 outputs」）。
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      {},
+      undefined,
+      { skip: ["解析 PR 上下文"] },
+    );
+    expect(out.outputs.ctx).toBeUndefined();
+    expect(out.ran.some((s) => s.name === "解析 PR 上下文")).toBe(false);
+    // 只 POST 一次，且 head_sha 非空：空 sha 会被 GitHub 拒收，那时服务器上
+    // 一条 Check Run 都没有 —— 「一定有一条 audit Check Run」当场不成立。
+    expect(out.calls.filter((c) => c.includes("check-runs"))).toHaveLength(1);
+    expect(out.calls.filter((c) => c.includes("--method POST"))).toHaveLength(1);
+    expect(out.payload).toMatchObject({ name: "audit", conclusion: "action_required" });
+    expect(out.payload.head_sha).toBe("f00dfeed");
+    // 这一种「判不了」是管线自己坏了，不是 PR 的问题：标题与摘要都要这么写。
+    expect(String(out.payload.output.title)).toContain("管线没跑起来");
+    expect(String(out.payload.output.title)).toContain("不是 PR head");
+    expect(String(out.payload.output.summary)).toContain("管线");
+    expect(out.summary).toContain("管线");
+    expect(out.summary).toContain("不是这个 PR 的问题");
+    // 另外两条写 payload 的路径只在 ok=1 时才跑，这一路径上不该抢写。
+    expect(out.ran.some((s) => s.name === "结论兜底")).toBe(false);
+    expect(out.ran.some((s) => s.name === "回写 Check Run")).toBe(false);
+    // 结论的红由 POST 出去的 Check Run 承载，job 级 check 不重复染红。
+    expect(out.ran.at(-1).status).toBe(0);
+  });
+
+  it("两种「判不了」分得开：ctx 跑过解不出 ≠ ctx 没跑（后者是管线故障）", () => {
+    const pass2 = { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass };
+    const noSha = runWorkflow(pass2, { "inputs.pr": "" });
+    const noCtx = runWorkflow(pass2, {}, undefined, { skip: ["解析 PR 上下文"] });
+    expect(String(noSha.payload.output.title)).toContain("PR 上下文解不出");
+    expect(String(noSha.payload.output.title)).not.toContain("管线");
+    expect(String(noCtx.payload.output.title)).toContain("管线没跑起来");
+    expect(noSha.summary).not.toContain("管线");
+    expect(noCtx.summary).toContain("管线");
+    // 两种都落在同一个非空 sha 上：这条不变式不分来历。
+    expect(noSha.payload.head_sha).toBe("f00dfeed");
+    expect(noCtx.payload.head_sha).toBe("f00dfeed");
   });
 
   it("-e 作用：留痕回写失败必须让步骤红，不许被后面的 echo 盖成绿", () => {
