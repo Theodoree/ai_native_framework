@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import YAML from "yaml";
 import {
   assess,
@@ -520,16 +520,21 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     mkdirSync(join(dir, ".audit"), { recursive: true });
     const bin = join(dir, "bin");
     mkdirSync(bin, { recursive: true });
+    // 账本与 payload 的路径在**生成时**就写死成绝对路径，不看 $PWD：
+    // 某个 step 先 `cd sub` 再调 gh 时，`$PWD/calls.log` 会把条目写进子目录，
+    // 根账本于是「存在但 0 行」—— 「账本在、0 行 = 零调用」这条担保被空过。
+    const LEDGER = join(dir, "calls.log");
+    const PAYLOAD = join(dir, "payload.json");
     const gh = [
       "#!/usr/bin/env bash",
       // 账本**无条件创建**：这样「账本不存在」就只有一个来历 —— 假 gh 压根没跑起来
       // （PATH / shebang / 权限 / 记账被改坏），而不是「零次调用」的正常形态。
       // 否则读不到账本返回的 [] 与真的零调用是同一个值，一批 toHaveLength(0) 的断言
       // 会因为 harness 断开而空过。
-      "touch \"$PWD/calls.log\"",
+      `touch "${LEDGER}"`,
       // harness 自检探针：跑得起来就说明账本路径与 PATH 是通的，但它自己不进账本。
       "if [[ \"$1\" == \"--audit-harness-canary\" ]]; then exit 0; fi",
-      "echo \"$*\" >> \"$PWD/calls.log\"",
+      `echo "$*" >> "${LEDGER}"`,
       "if [[ \"$*\" == *\"pr view\"* && \"$*\" == *\"headRefOid\"* ]]; then",
       "  printf 'cafebabe\\n'",
       "  exit 0",
@@ -541,7 +546,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       "if [[ \"$*\" == *\"check-runs\"* ]]; then",
       "  if [[ -n \"$FAKE_GH_POST_FAILS\" ]]; then echo 'gh: 422' >&2; exit 1; fi",
       "  while [[ $# -gt 0 ]]; do",
-      "    if [[ \"$1\" == \"--input\" ]]; then cp \"$2\" \"$PWD/payload.json\"; fi",
+      `    if [[ "$1" == "--input" ]]; then cp "$2" "${PAYLOAD}"; fi`,
       "    shift",
       "  done",
       "  echo 4242",
@@ -731,6 +736,24 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(out.summary).toBe("");
   });
 
+  it("行为兜底：全 pass 时 check-run.json 的 summary 同时含「申报=」与「agreed=」", () => {
+    // 形状判据只能证明「文本里有一处解引用形态」；把真解引用换成
+    // lines.push("r.executors .comparison .counts") 之后解引用没了，这两行就从 summary 里
+    // 永久消失，而全仓没有任何断言在看 summary。这条补的是后果：读者可以丢，丢了的后果必须可见。
+    const out = runWorkflow({ AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass });
+    expect(out.payload).toMatchObject({ name: "audit", conclusion: "success" });
+    const written = JSON.parse(readFileSync(join(out.dir, ".audit/check-run.json"), "utf8"));
+    const summary = String(written.output.summary);
+    // 两个槽都自报「申报」：只含一处的话，「申报=」可能来自一条无关行。
+    expect(summary).toContain("a: 申报=");
+    expect(summary).toContain("b: 申报=");
+    // 对照一轮的四个计数必须在 summary 里：这是 comparison.counts 这条路唯一的可观测后果。
+    expect(summary).toContain("agreed=");
+    expect(summary).toContain("onlyA=");
+    expect(summary).toContain("severityMismatch=");
+  });
+
+
   it("needs_revision：conclusion=failure，判定步骤退出 1", () => {
     const out = runWorkflow({
       AUDIT_FINDINGS_A: pass,
@@ -859,17 +882,36 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     re: new RegExp(`(?<![A-Za-z0-9_])${field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_])`),
   }));
 
-  // run 块里 `node` 启动的脚本：node 后面允许跟 flag，第一个非 flag 词才算脚本路径。
+  // 续行：shell 把「反斜杠 + 换行」原样删除，**不换成空格**。
+  // `node scripts/\` + 换行 + `probe-read.mjs` 必须折成 `scripts/probe-read.mjs`；
+  // 换成空格会把路径切成两个词，那正是这个写法该红的写法逃掉的方式。
+  function foldContinuations(runText) {
+    return String(runText).replace(/\\\r?\n/g, "");
+  }
+
+  // 两侧引号都剥。审查实测：只剥前引号时 `node "scripts/x.mjs"` 与 `node 'scripts/x.mjs'`
+  // 既不出 violation、也不进 missing —— 于是「引用解析不到就红」那条断言照样绿。
+  function unquote(token) {
+    return String(token).replace(/^["']/, "").replace(/["']$/, "");
+  }
+
+  const SCRIPT_EXT = /\.(?:mjs|cjs|js)$/;
+
+  // run 块里被执行到的脚本，两种形态都算：
+  //   1) `node [--flag ...] <path>`：node 后面允许跟 flag，第一个非 flag 词才算脚本路径。
+  //   2) shebang 直执行 `./scripts/x.mjs`：此前只是观察项，同样是「run 块里被执行到的脚本」。
   // 不以 .mjs/.cjs/.js 结尾的词不算（`node -e '...'` 的内联块就是这种）。
   function scriptRefs(runText) {
     const refs = [];
-    for (const line of String(runText).split("\n").map(stripShellComment)) {
-      for (const match of line.matchAll(/(?:^|[\s;&|(])node\s+((?:-{1,2}\S+\s+)*)(\S+)/g)) {
-        const target = match[2].replace(/^['"]/, "");
-        if (!/\.(?:mjs|cjs|js)$/.test(target)) continue;
-        const rel = target.replace(/^\.\//, "");
-        if (!refs.includes(rel)) refs.push(rel);
-      }
+    const add = (raw) => {
+      const target = unquote(raw);
+      if (!SCRIPT_EXT.test(target)) return;
+      const rel = target.replace(/^\.\//, "");
+      if (!refs.includes(rel)) refs.push(rel);
+    };
+    for (const line of foldContinuations(runText).split("\n").map(stripShellComment)) {
+      for (const match of line.matchAll(/(?:^|[\s;&|(])node\s+((?:-{1,2}\S+\s+)*)(\S+)/g)) add(match[2]);
+      for (const match of line.matchAll(/(?:^|[\s;&|(])(\.\/[^\s;&|)]+)/g)) add(match[1]);
     }
     return refs;
   }
@@ -894,8 +936,58 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     return writers;
   }
 
-  // 扫描面覆盖到的脚本文件（含解析不到的）：解析不到就是扫描面漏了一格，
-  // 这件事由形状用例显式断言，不在这里静默吞掉。
+  // 静态、相对路径的 import / require：`import ... from "./x"` / `import "./x"` / `require("./x")`。
+  // 口径层一被拆成两个文件，读者就坐在下一跳 —— 不跟这一跳，形状用例会静默失效。
+  // 只认「静态 + 相对路径」这一格：裸模块名与动态拼出来的路径不在扫描面上（已知漏判，另记）。
+  const IMPORT_SPEC = /(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(?\s*)["'](\.{1,2}\/[^"']+)["']/g;
+  const MAX_IMPORT_DEPTH = 3;
+  const SCRIPT_EXTS = [".mjs", ".cjs", ".js"];
+
+  function resolveImport(root, fromRel, spec) {
+    // 用 posix 拼接再归一化：`../x` 与 `./a/../b` 要落到同一个 rel。
+    const base = posix.normalize(posix.join(posix.dirname(fromRel), spec));
+    const candidates = [
+      base,
+      ...SCRIPT_EXTS.map((ext) => base + ext),
+      ...SCRIPT_EXTS.map((ext) => posix.join(base, "index" + ext)),
+    ];
+    for (const rel of candidates) {
+      const abs = scriptPath(root, rel);
+      if (abs && existsSync(abs)) return rel;
+    }
+    return null;
+  }
+
+  // 从 run 引用的脚本出发递归跟随 import/require：深度上限 3、防环（seen）。
+  // 解析不到的进 missing —— 扫描面漏一格必须显式喊出来，不许在这里静默吞掉。
+  function scriptTree(root, entry) {
+    const files = [];
+    const missing = [];
+    const seen = new Set();
+    const queue = [{ rel: entry, depth: 0 }];
+    while (queue.length) {
+      const { rel, depth } = queue.shift();
+      if (seen.has(rel)) continue;
+      seen.add(rel);
+      const abs = scriptPath(root, rel);
+      if (!abs || !existsSync(abs)) {
+        missing.push(rel);
+        continue;
+      }
+      files.push(rel);
+      if (depth >= MAX_IMPORT_DEPTH) continue;
+      const text = readFileSync(abs, "utf8");
+      for (const match of text.matchAll(IMPORT_SPEC)) {
+        const next = resolveImport(root, rel, match[1]);
+        if (next) queue.push({ rel: next, depth: depth + 1 });
+        else missing.push(match[1]);
+      }
+    }
+    return { files, missing };
+  }
+
+  // 扫描面覆盖到的脚本文件（含 import 跟随后的下一跳，含解析不到的）：
+  // 解析不到就是扫描面漏了一格，这件事由形状用例显式断言，不在这里静默吞掉。
   function referencedScripts(stepList, options = {}) {
     const root = options.root ?? ROOT;
     const files = [];
@@ -903,11 +995,12 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     for (const step of stepList) {
       if (typeof step.run !== "string") continue;
       for (const rel of scriptRefs(step.run)) {
-        const abs = scriptPath(root, rel);
-        (abs && existsSync(abs) ? files : missing).push(rel);
+        const tree = scriptTree(root, rel);
+        for (const file of tree.files) if (!files.includes(file)) files.push(file);
+        for (const gone of tree.missing) if (!missing.includes(gone)) missing.push(gone);
       }
     }
-    return { files: [...new Set(files)], missing: [...new Set(missing)] };
+    return { files, missing };
   }
 
   // JS 注释刻意**不剥离**（取舍）：要分清 `"http://x"` 里的 // 与注释起点，得上真的 JS 词法器；
@@ -925,31 +1018,88 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         const hit = lines.find((line) => re.test(line));
         if (hit) violations.push({ step: source, field, excerpt: hit.trim() });
       }
-      for (const rel of scriptRefs(step.run)) {
-        if (writers.includes(rel)) continue;
-        const abs = scriptPath(root, rel);
-        if (!abs || !existsSync(abs)) continue;
-        const text = readFileSync(abs, "utf8");
-        for (const { field, re } of FIELD_READERS) {
-          const hit = text.split("\n").find((line) => re.test(line));
-          if (hit) violations.push({ file: rel, field, excerpt: hit.trim() });
+      // 跟随 import：读者可能坐在 run 引用的脚本的下一跳（契约层拆文件就靠这条）。
+      for (const entry of scriptRefs(step.run)) {
+        if (writers.includes(entry)) continue;
+        for (const rel of scriptTree(root, entry).files) {
+          const text = readFileSync(scriptPath(root, rel), "utf8");
+          for (const { field, re } of FIELD_READERS) {
+            const hit = text.split("\n").find((line) => re.test(line));
+            if (hit) violations.push({ file: rel, field, excerpt: hit.trim() });
+          }
         }
       }
     }
     return violations;
   }
 
-  // 「解引用形态」：.field 或 ["field"]（含 [ 'field' ]）。正向对照必须落在这一层，
-  // 不能落在「这行出现过这串字」：把真解引用换成 `lines.push("executors comparison counts")`
-  // 之后字段名还在、读没了，按字面看的对照照样绿 —— 那正是这份担保失效的方式。
+  // 「解引用形态」：.field 或 ["field"]（含 [ 'field' ]），都只在剥掉字符串字面量之后判。
+  // 不剥字符串时，把真解引用换成 lines.push("r.executors .comparison .counts") 就能冒充：
+  // 字段名还在、读没了，按字面看的对照照样绿（实测那种写法 71 条全绿）。而这时口径层
+  // 已经不再读这三个字段 —— summary 里的「申报=」「agreed=」永久消失，全仓没有断言在看它。
+  //
+  // 方括号取字段必须带引号，剥完就看不见了，所以扫描时顺手记下来（bracketKeys）。
+  // 逐行扫而不是整段：decide 的 JS 写在 shell 单引号里（node -e ' 那一行引号不配对），
+  // 整段扫会把 shell 的开引号当成 JS 串首、把后面整段代码一起吃掉。
+  // 一行内引号不配对时该行原样保留：宁可漏判形态，也不许把真解引用当文本删掉。
+  const QUOTE_CHARS = ['"', "'", String.fromCharCode(96)];
+
+  function maskStringLiterals(text) {
+    let masked = "";
+    const bracketKeys = [];
+    for (const line of String(text).split("\n")) {
+      let out = "";
+      const keys = [];
+      let i = 0;
+      let closed = true;
+      while (i < line.length) {
+        const quote = line[i];
+        if (!QUOTE_CHARS.includes(quote)) {
+          out += quote;
+          i += 1;
+          continue;
+        }
+        let j = i + 1;
+        let value = "";
+        while (j < line.length && line[j] !== quote) {
+          if (line[j] === "\\") {
+            value += line[j + 1] ?? "";
+            j += 2;
+            continue;
+          }
+          value += line[j];
+          j += 1;
+        }
+        if (j >= line.length) {
+          closed = false;
+          break;
+        }
+        // 回看「[ + 引号串 + ]」—— 这是 obj["field"] 的形态。
+        if (out.trimEnd().endsWith("[") && line.slice(j + 1).trimStart().startsWith("]")) keys.push(value);
+        out += " ".repeat(j - i + 1);
+        i = j + 1;
+      }
+      masked += closed ? out : line;
+      if (closed) bracketKeys.push(...keys);
+      masked += "\n";
+    }
+    return { masked, bracketKeys };
+  }
+
   const FIELD_DEREFERENCES = RESULT_FIELDS.map((field) => ({
     field,
-    re: new RegExp(`\\.${field}(?![A-Za-z0-9_])|\\[\\s*["']${field}["']\\s*\\]`),
+    re: new RegExp("\\." + field + "(?![A-Za-z0-9_])"),
   }));
 
   function fieldDereferences(runText) {
-    const lines = String(runText).split("\n").map(stripShellComment);
-    return FIELD_DEREFERENCES.filter(({ re }) => lines.some((line) => re.test(line))).map(({ field }) => field);
+    const text = String(runText)
+      .split("\n")
+      .map(stripShellComment)
+      .join("\n");
+    const { masked, bracketKeys } = maskStringLiterals(text);
+    return FIELD_DEREFERENCES.filter(({ field, re }) => re.test(masked) || bracketKeys.includes(field)).map(
+      ({ field }) => field,
+    );
   }
 
   it("兜底补的结果不是第二份口径层：解引用 result.json 字段的读者只有口径层，且排在兜底之前", () => {
@@ -1067,6 +1217,100 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(readers).not.toEqual(["decide"]);
   });
 
+  it("引号与续行不是绕道：双引号 / 单引号 / 反斜杠续行 / --flag / shebang 直执行都算被执行到的脚本", () => {
+    // 缺陷形态：只剥前引号时，下面这几种写法既不出 violation、也不进 missing，
+    // 于是「引用解析不到就红」那条断言在它们上面照样绿。
+    const dir = mkdtempSync(join(tmpdir(), "audit-quote-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length);\n',
+    );
+    const forms = [
+      'node "scripts/probe-read.mjs"',
+      "node 'scripts/probe-read.mjs'",
+      // 续行：shell 删除「反斜杠 + 换行」（不换成空格），所以这仍是同一个路径。
+      "node scripts/\\\nprobe-read.mjs",
+      "node --experimental-vm-modules scripts/probe-read.mjs",
+      "./scripts/probe-read.mjs --dry-run",
+    ];
+    for (const run of forms) {
+      // 先证明形态真的落地：run 文本里一个字段名都没有，红只能来自被执行的脚本文件。
+      expect(run, run).not.toMatch(/executors|comparison|counts/);
+      // 解析得到的引用必须是同一个文件 —— 这是每条红证据的同一根。
+      expect(scriptRefs(run), run).toEqual(["scripts/probe-read.mjs"]);
+      expect(fieldReadViolations([{ id: "probe", run }], { root: dir }), run).toEqual([
+        { file: "scripts/probe-read.mjs", field: "executors", excerpt: "console.log(r.executors.length);" },
+      ]);
+      // 引用解析得到：不许掉进 missing（掉进去就是扫描面又漏了一格）。
+      expect(referencedScripts([{ id: "probe", run }], { root: dir }).missing, run).toEqual([]);
+    }
+  });
+
+  it("扫描面跟随 import：wrapper 只写 import、读者在下一跳文件里，必须红", () => {
+    // 缺陷形态：只扫 run 引用的那个文件本身。口径层一被拆成两个文件，
+    // wrapper 里只有 `import "./probe-read.mjs"`，读者坐在下一跳 —— 形状用例静默失效。
+    const dir = mkdtempSync(join(tmpdir(), "audit-import-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(join(dir, "scripts/wrapper.mjs"), 'import "./probe-read.mjs";\n');
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length);\n',
+    );
+    const probeStep = { id: "probe", name: "探针", run: "node scripts/wrapper.mjs\n" };
+    // 先证明「只扫 run / 只扫 wrapper」都会空过：两处文本里都没有字段名。
+    expect(probeStep.run).not.toMatch(/executors|comparison|counts/);
+    expect(readFileSync(join(dir, "scripts/wrapper.mjs"), "utf8")).not.toMatch(/executors/);
+    expect(referencedScripts([probeStep], { root: dir })).toEqual({
+      files: ["scripts/wrapper.mjs", "scripts/probe-read.mjs"],
+      missing: [],
+    });
+    const violations = fieldReadViolations([probeStep], { root: dir });
+    expect(violations).toEqual([
+      { file: "scripts/probe-read.mjs", field: "executors", excerpt: "console.log(r.executors.length);" },
+    ]);
+    // 形状判据整体红：读者集合不再只有口径层。
+    expect([...new Set(violations.map((v) => v.step ?? v.file))]).toEqual(["scripts/probe-read.mjs"]);
+  });
+
+  it("import 跟随：三种静态写法都跟得到，裸模块名不跟，深度上限 3，环不炸，解析不到进 missing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-import-shapes-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    const put = (rel, text) => writeFileSync(join(dir, rel), text);
+    put("scripts/from.mjs", 'import { a } from "./hop-from.mjs";\n');
+    put("scripts/hop-from.mjs", "export const a = 1;\n");
+    put("scripts/bare.mjs", 'import "./hop-bare.mjs";\n');
+    put("scripts/hop-bare.mjs", "export const b = 1;\n");
+    put("scripts/req.mjs", 'const c = require("./hop-req.cjs");\n');
+    put("scripts/hop-req.cjs", "module.exports = {};\n");
+    // 链 d0 -> d1 -> d2 -> d3 -> d4：走到深度 3 为止，第 4 跳不跟。
+    put("scripts/d0.mjs", 'import "./d1.mjs";\n');
+    put("scripts/d1.mjs", 'import "./d2.mjs";\n');
+    put("scripts/d2.mjs", 'import "./d3.mjs";\n');
+    put("scripts/d3.mjs", 'import "./d4.mjs";\n');
+    put("scripts/d4.mjs", "export const d = 1;\n");
+    // 环：x <-> y 必须终止，且各自只出现一次。
+    put("scripts/x.mjs", 'import "./y.mjs";\n');
+    put("scripts/y.mjs", 'import "./x.mjs";\n');
+    // 解析不到进 missing；裸模块名不在扫描面上、也不进 missing。
+    put("scripts/gone.mjs", 'import "./nope.mjs";\nimport "yaml";\n');
+
+    expect(scriptTree(dir, "scripts/from.mjs").files).toEqual(["scripts/from.mjs", "scripts/hop-from.mjs"]);
+    expect(scriptTree(dir, "scripts/bare.mjs").files).toEqual(["scripts/bare.mjs", "scripts/hop-bare.mjs"]);
+    expect(scriptTree(dir, "scripts/req.mjs").files).toEqual(["scripts/req.mjs", "scripts/hop-req.cjs"]);
+    expect(scriptTree(dir, "scripts/d0.mjs").files).toEqual([
+      "scripts/d0.mjs",
+      "scripts/d1.mjs",
+      "scripts/d2.mjs",
+      "scripts/d3.mjs",
+    ]);
+    expect(scriptTree(dir, "scripts/x.mjs").files).toEqual(["scripts/x.mjs", "scripts/y.mjs"]);
+    expect(scriptTree(dir, "scripts/gone.mjs")).toEqual({
+      files: ["scripts/gone.mjs"],
+      missing: ["./nope.mjs"],
+    });
+  });
+
   it("正向对照必须是解引用：把口径层真读那两行换成纯字面量拼接，对照必须红", () => {
     // 审查实测的蒙法：字段名还在，读没了。按字面看的对照照样绿。
     const decide = steps.find((s) => s.id === "decide");
@@ -1086,6 +1330,19 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 但它不是解引用形态，正向对照必须红。
     expect(fieldDereferences(mutated)).toEqual([]);
   });
+
+  it("正向对照不认引号里的文本：lines.push(\"r.executors .comparison .counts\") 不是解引用", () => {
+    // 审查实测：把 decide 的两行真解引用换成下面这一行，71 条全绿 —— 字段名还在、读没了，
+    // 而按字面看的正向对照照样通过。剥掉字符串字面量之后这行不再算解引用。
+    const forged = 'lines.push("r.executors .comparison .counts");\n';
+    // 先证明这行确实含三个字段名：旧对照就是被这一串字母骗过的。
+    expect(RESULT_FIELDS.every((field) => forged.includes(field))).toBe(true);
+    expect(fieldDereferences(forged)).toEqual([]);
+    // 真解引用两种写法仍然认得（剥字符串不许把 `.field` 与 obj["field"] 一起删掉）。
+    expect(fieldDereferences('for (const e of r.executors) keep(e);\n')).toEqual(["executors"]);
+    expect(fieldDereferences('const c = r["comparison"].counts;\n')).toEqual(["comparison", "counts"]);
+  });
+
 
   it("注入不被求值：findings 里的 $( ) 原样进 payload，不在 CI 里执行", () => {
     // 输入走 env 而不是内联进 run 块，所以它只能作为字符串到达脚本。
@@ -1316,6 +1573,25 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(existsSync(join(one.dir, "calls.log"))).toBe(true);
     expect(one.calls).toHaveLength(1);
     expect(one.calls[0]).toContain("check-runs");
+  });
+
+  it("先 cd 到子目录再调 gh：条目照样落在根账本（账本路径在生成时写死，不看 $PWD）", () => {
+    // 缺陷形态：记账写 "$PWD/calls.log"。某个 step 先 cd sub 再调 gh 时，条目进子目录，
+    // 根账本**存在但 0 行** —— 「账本在、0 行 = 零调用」这条担保被空过。
+    const { dir, bin } = sandbox();
+    mkdirSync(join(dir, "sub"), { recursive: true });
+    expect(readGhLedger(dir)).toEqual([]);
+    const spawned = spawnSync(
+      "bash",
+      ["--noprofile", "--norc", "-eo", "pipefail", "-c", "cd sub && gh api repos/o/r/check-runs --method POST"],
+      { cwd: dir, env: { PATH: bin + ":" + process.env.PATH, HOME: dir }, encoding: "utf8" },
+    );
+    expect(spawned.status, String(spawned.stderr)).toBe(0);
+    // 根账本必须至少 1 行：0 行就是「零调用」，也正是 cd 记账被空过时的样子。
+    const calls = readGhLedger(dir);
+    expect(calls.filter((call) => call.includes("check-runs"))).toHaveLength(1);
+    // 子目录里不许有第二本账：那本账的 0 行正是「根账本 0 行」的来历。
+    expect(existsSync(join(dir, "sub/calls.log"))).toBe(false);
   });
 
   it("上游没注入 findings：不写 pass，落成 INFRA", () => {
