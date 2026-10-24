@@ -11,6 +11,7 @@
 | `server.mjs` | 本机 HTTP：静态页 + JSON API，把写请求交给判定器 | 不含任何状态判断逻辑 |
 | `merge-gate.mjs` | 合并资格的四条独立守卫（0 可合 / 1 拒绝 / 3 INFRA），每条判 flush 一行到 stdout | 不合并 PR、不改 issue 状态、不写门牌；不联网（输入全部注入） |
 | `audit-findings.mjs` | findings 的执行层：校验固定 schema、合并多个执行器的 verdict、按 path+line+criterion 逐条比对并给出 Check conclusion（0 pass / 1 needs_revision\|reject / 3 INFRA） | 不跑模型、不联网；不判代码好坏，只判「这次结论能不能算数」 |
+| `audit-slot.mjs` | 把上游 findings 落到 review-a / review-b 槽，并校验自报身份与槽位一致（不符即 INFRA） | 不改写 verdict、不补造 evidence；坏 JSON 原样交给口径层点名 |
 | `routing.mjs` | 读路由真源 `.agents/platform/routing.yml`：校验声明自洽 + 扫 workflow 里的硬编码模型名（0 通过 / 1 有问题） | 不联网、不调网关、不判定审计结论；模型名只认真源，不猜命名规范 |
 
 ## 状态
