@@ -275,3 +275,30 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **仍未覆盖（诚实登记）**：拆分/变量拼路径（`"res"+"ult.json"`）、Base64 后倒出、`cat $(echo .audit/result.json)` 这类动态取值（不跟踪，也不落 `unfollowable`）；白名单允许 `echo`/`printf` 把原文本重定向到别处（只禁管道与加工）；别名仅在同一段文本内有效，跨 step 借变量不跟踪。
 
 **白名单是新的绕过面，不是安全区**：每一条放行都必须在报告里带理由，且「把 `cat` 换成 `sed`/`tee`/`dd`/`while read`」必须落 violation 而不是静默放行——这一点已用 8 条反例钉住。
+### 轮十三：判据的坐标从「文本像不像」抬到「执行会发生在哪」
+
+两家都判 needs_revision，7 条，但根因是一句话（review-b 自己写的）：**引用是按「字符串/文件名」认的，而执行是按「文件」发生的**。
+
+**A 组（review-a）——载体与执行层各有一个盲区**：
+| # | 缺口 | 实测 |
+| --- | --- | --- |
+| 1 | 我们守了十二轮的 `.audit/result.json` 不是真正的结论载体；`.audit/check-run.json` 零写者白名单，最强断言只是 `writers.length >= 2`（只有下限、无上限） | 一个**无 name 的步**把它改写成 `conclusion=success` → 103 全绿；另一个无 name 步直接 `gh api .../check-runs --method POST -f conclusion=success`（绕开 `--input` 与 `$GITHUB_REPOSITORY`）→ 也全绿 |
+| 2 | 行为 runner `if (!step.run || !step.name) continue;`：GitHub 上 step name 可选、照常执行，唯一真跑 bash 看 payload 的那层对匿名步失明 | 对照：无 name 步 `jq -r .verdict .audit/result.json` → 3 红，说明匿名步静态扫描照抓，缺口只在「载体零判据 + 行为层漏跑」 |
+
+**B 组（review-b）——引用判据绑在文件名上，五种等价写法全绿**：`grep -rq needs_revision .audit`（父目录不带 `*`，递归读走）、`tar -cf /tmp/x.tar .audit`、`.audit/result.jso?`（`?` glob 同样命中）、`cp -a .audit /tmp/leakdir` 后按别名读（实测打出 `"needs_revision"`）、非写者步 `[[ "$body" == *needs_revision* ]]`（白名单第 3 条只做比较、不限内容）。
+
+**还有一条 low，但它说的是最要紧的事**：那时「`missing`/`unfollowable` 必须为空」实际等于「不许出现 `-r` 这个字」——`jq -r`、`grep -r` 靠**误报**落红，`-rq`/`-rc` 立刻变绿。**红是因为拼写，不是因为引用**，这就是「覆盖真相被噪音掩盖」。
+
+**新结构（`tests/audit-findings.test.mjs`，103→110 例，441 expect，0 条 `expect/it` 删除）**：
+- **引用抬到目录级**：整行注释之外的原始文本（**不掩字符串**——路径通常就在引号里）出现 `.audit` 即算引用（`AUDIT_DIR_REF`:1975）。父目录、`?` glob、`tar`/`cp` 搬运因此在**同一条规则**下落红，不需要再枚举拼写。
+- **载体参数化**：`carrierSpec(file)`:1583 + `CARRIERS`:1603（`result.json` / `check-run.json`），`resultJsonWriterSteps`:1822 与 `resultJsonReaderViolations`:1903 接 `options.carrier`。每个载体的写者集合用 `toEqual` 精确断言：`result.json → ["口径层判定","结论兜底"]`、`check-run.json → ["口径层判定","结论兜底","判不了：回写 INFRA"]`、`review-a.json → ["落盘 review-a"]`、`review-b.json → ["落盘 review-b"]`；`mkdir -p .audit` 单独放行且**不算写者**；其余任何 `.audit` 路径一律「未认领的 .audit 引用」violation。
+- **POST 面收口**：任何一步出现 `check-runs` 且不是那两步 `--input .audit/check-run.json` 的 POST → violation（`CHECK_RUNS_*`:1997-2000）。只读查询一律判红，将来要放行需显式白名单。
+- **白名单第三条收死**：`[[ ]]` 只留存在性（`-s`/`-f`）与变量对变量比较（`RESULT_DUMP_EXISTENCE`:1726、`RESULT_DUMP_VAR_COMPARE`:1728），按内容分支（`==`/`!=`/`=~`/通配/grep）一律 violation。
+- **行为层 fail-closed**：`requireStepName`:640 在 `runWorkflow` 入口:696 就抛，循环只剩 `if (!step.run) continue`。另加静态用例「每步必须有 name」（失败打印下标与 run 前 60 字）。
+- **噪音归位**：`LOADER_FLAG_SHORT`:1334 只在真解出脚本时才算 ref（`-r` 是 jq/grep/sed 的旗标，不是 loader），`jq -r`/`grep -rq` 现在红在**引用**类别上，并断言它们的 `loader-no-value`/`missing` 为空——证明不是靠误报兜住。
+
+**我的独立复核（六种变异，`/tmp` 副本，插入步带 name）**：`grep -rq … .audit` 2 红；`tar -cf … .audit` 2 红；`[[ "$body" == *needs_revision* ]]` 5 红；`cp -a .audit` 后别名读 5 红；旁路 `gh api …/check-runs --method POST -f …` 6 红；无 name 步写 `check-run.json` 5 红。还原 110 绿。
+
+**第一次复核我自己的探针又坏了**：`lines[:i]+new+lines[i+1:]` 把 `- name: INFRA 留痕` 那行**删掉**了，于是那个 step 变成无名步 → `requireStepName` 在用例计数前就抛 → vitest 报 `Tests no tests`。**这恰好演示了 fail-closed 生效**，但红/绿判断失效。教训与之前同一族：插入必须 `lines[:i]+new+lines[i:]`，看到 `Tests no tests` 一律先怀疑探针。
+
+**仍未覆盖（执行器登记，我认可）**：变量拼出的路径（`dir=.audit; grep -rq x "$dir"`）静态不可解；`join(".audit","check-run.json")` 这类拼接会被判成「未认领引用」而不是「该载体写者」（误红方向安全，不漏）；`EP=check-runs` 经变量拼端点可绕字面判据；`uses:` composite action 内部行为不进扫描面（沿用 `ALLOWED_USES`）；POST 面只读查询被故意一律判红。

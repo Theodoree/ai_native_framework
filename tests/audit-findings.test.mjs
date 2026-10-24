@@ -414,10 +414,13 @@ describe("wiring: .github/workflows/audit.yml", () => {
     expect(posted).toHaveLength(2);
     // payload 的写者可以多于一处（判定 / 兜底 / 判不了），但每一处写的名字都必须是 audit：
     // 名字一旦换成 job 名（audit-runner），job 的红与结论的红就抢同一个名字。
-    const writers = steps.filter(
-      (s) => s.run?.includes("check-run.json") && s.run.includes('name: "audit"'),
-    );
-    expect(writers.length).toBeGreaterThanOrEqual(2);
+    // 名单是**精确相等**，不是下限：这是真正的结论载体，多一个写者就多一条产出结论的通道
+    // （旧断言只写下限，于是加一个无 name 的步把 check-run.json 改写成 conclusion=success
+    // 仍然 103 条全绿 —— 下限断言对「多出来的那个写者」完全无感）。
+    const writers = steps
+      .filter((s) => String(s.run ?? "").includes("check-run.json") && String(s.run).includes('name: "audit"'))
+      .map((s) => s.name);
+    expect(writers).toEqual(["口径层判定", "结论兜底", "判不了：回写 INFRA"]);
     for (const step of steps) {
       expect(String(step.run ?? ""), step.name).not.toContain('name: "audit-runner"');
     }
@@ -630,6 +633,25 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // （比如把口径层脚本换成一个什么都不写的空壳，模拟崩溃）。
   // options.skip：按 step 名字模拟「这一步被跳过」（前置步骤红了时 Actions 的行为），
   // 于是依赖它 outputs 的后续步骤真的读到空串 —— 这正是 checkout / node 挂掉后的形状。
+  // Actions 里 step 的 name 是**可选**的：无 name 的步照常执行。旧 runner 在循环里
+  // `if (!step.run || !step.name) continue;`，于是它对无 name 步整层全盲
+  // （实测：一个无 name 的步把 check-run.json 改写成 conclusion=success，照样 103 条全绿）。
+  // 行为层一律 fail-closed，并且说清楚是第几个 step —— 「跳过」会把一次管线故障读成绿。
+  function requireStepName(stepList) {
+    for (const [index, step] of stepList.entries()) {
+      if (!step.run) continue;
+      if (!step.name) {
+        throw new Error(
+          "audit.yml 第 " +
+            (index + 1) +
+            " 个 step 没有 name，行为 runner 拒绝静默跳过：" +
+            String(step.run).slice(0, 60),
+        );
+      }
+    }
+    return stepList;
+  }
+
   function runWorkflow(findings, ctxOverride = {}, mutate, options = {}) {
     const { dir, bin } = sandbox();
     if (mutate) mutate(dir);
@@ -671,8 +693,9 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const outputs = {};
     const raw = {};
     const ran = [];
+    requireStepName(steps);
     for (const step of steps) {
-      if (!step.run || !step.name) continue;
+      if (!step.run) continue;
       if (skip.has(step.name)) continue;
       if (step.if && !ifMatches(step.if, outputs)) continue;
       writeFileSync(env.GITHUB_OUTPUT, "");
@@ -1303,7 +1326,12 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 旧写法要求 flag 前面是行首/空白/引号，于是 NODE_OPTIONS=--require=./x.cjs 整个不在扫描面 ——
   // 红绿只差一个等号，而它在 node 里一字不差地先跑模块（本机 node 实测：先跑 REQUIRED 再跑 main）。
   const LOADER_FLAG_VALUE =
-    /(?<![\w-])(?:--require|--import|-r|--loader|--experimental-loader)(?:=|\s+|$)([^\s"';|&]*)/g;
+    /(?<![\w-])(?:--require|--import|--loader|--experimental-loader)(?:=|\s+|$)([^\s"';|&]*)/g;
+  // 短旗标 -r 与 -rq / -rc 这类**别的工具的旗标**同形（grep -r、jq -r、sed -r 都是它）：
+  // 只要把它一律当 loader，红的原因就变成「-r 后面取不到值」这种噪音（jq -r 红、grep -rq 绿，
+  // 覆盖真相被误报盖住）。正名判据是：-r 的取值**解得出一份真实脚本**才算模块取值；
+  // 解不出就说明它不是 loader 旗标（jq / grep / sed 的 -r 后面跟的是模式或目录，不是模块名）。
+  const LOADER_FLAG_SHORT = /(?<![\w-])-r(?:=|\s+)([^\s"';|&]*)/g;
   // 变量/通配拼出来的取值静态不可解：落 unfollowable（不许猜它拼出了什么）。
   const LOADER_DYNAMIC_VALUE = /[$*?{\u0060]/;
 
@@ -1323,6 +1351,12 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         continue;
       }
       const rel = resolveScriptRef(root, value);
+      if (rel && !refs.includes(rel)) refs.push(rel);
+    }
+    // 短旗标不产生 unfollowable：解不出的 -r 不是 loader（见上），它该红的理由是
+    // 「非写者步引用了载体」，由引用判据负责，不由「跟不下去」兜。
+    for (const match of String(text).matchAll(LOADER_FLAG_SHORT)) {
+      const rel = resolveScriptRef(root, match[1]);
       if (rel && !refs.includes(rel)) refs.push(rel);
     }
     return { refs, unfollowable };
@@ -1541,12 +1575,33 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   //   **非写者步里只要引用了 result.json，默认就是违规**；
   // 放行只剩两条显式白名单 —— 写意图（resultJsonWriteIntent）与纯文本倒出（RESULT_DUMP_*），
   // 而且倒出只放行「原样输出、不带数据加工」的形态。
-  const RESULT_JSON = /result\.json/;
-  // 目录通配也是引用：.audit/*.json 把 result.json 一起读走，路径里却没有 result.json 这串字。
-  const RESULT_JSON_GLOB = /\.audit\/[^\s"';|&)]*\*/;
-  // 字符串字面量**本身就是这个路径**才算引用；字面量里顺嘴提到（人话消息、注释）不算 ——
-  // 一句 echo 里的说明文字把整步染红，判据就会被人当噪音关掉。
-  const RESULT_PATH_LITERAL = /^[^\s"'\x60]*result\.json$/;
+  // ---- 载体集合：这套判据不是 result.json 专用的 ----
+  // 一个可选 JSON 载体（result.json / check-run.json）的规则是同一套：
+  // 「非写者步里任何引用都是违规；放行只留给显式白名单」。
+  // 规格集中在这里生成、函数一律带 carrier 参数，缺省是 result.json —— 历史调用点一字不改。
+  // 新载体不复制一份判据：复制一份就是两套判据，迟早只维护一套，另一套静默退化。
+  function carrierSpec(file) {
+    const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return {
+      file,
+      ref: new RegExp(escaped),
+      // 目录通配也是引用：.audit/*.json 把两个载体一起读走，路径里却没有文件名这串字。
+      glob: /\.audit\/[^\s"';|&)]*\*/,
+      // 字符串字面量**本身就是这个路径**才算引用；字面量里顺嘴提到（人话消息、注释）不算 ——
+      // 一句 echo 里的说明文字把整步染红，判据就会被人当噪音关掉。
+      pathLiteral: new RegExp("^[^\\s\"'\\x60]*" + escaped + "$"),
+      // 把载体路径当参数交给一个函数，也是在把它当数据取用（隐藏的解析包装器）。
+      pathCall: new RegExp("([A-Za-z_$][\\w$]*)\\s*\\(\\s*[\"'][^\"']*" + escaped + "[\"']", "g"),
+      // 「解析这份载体的那个变量」：整体枚举判据要按载体绑定。
+      varDecl: new RegExp("(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=[^\\n]*" + escaped, "g"),
+      // shell 重定向写同一份文件。
+      redirect: new RegExp(">>?\\s*[^\\s;&|)]*" + escaped),
+      // 纯文本倒出的合法操作数：目录层可以是任意前缀，文件名必须就是这份载体。
+      dumpPath: new RegExp("^(?:\\.{0,2}/)*(?:[^\\s\"'\\x60]+/)?" + escaped + "$"),
+    };
+  }
+  const CARRIERS = { result: carrierSpec("result.json"), checkRun: carrierSpec("check-run.json") };
+  const DEFAULT_CARRIER = CARRIERS.result;
   // 整行注释不参与判定（JS 的 // 注释里写着 result.json 是给人看的说明，不是引用）。
   // 只剔整行注释，行尾注释仍留在判据里：尾注释可以藏一句话，不能藏一次读。
   const COMMENT_ONLY_LINE = /^\s*(?:\/\/|\/\*|\*)/;
@@ -1558,9 +1613,9 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 既不进 reads、也不占「一次读」的额度（实测：--out 行尾追加一次整体打印，92 条全绿）。
   const RESULT_JSON_READ_FILE_CALLS = [/\breadFileSync\s*\(/g, /\breadFile\s*\(/g, /\bcreateReadStream\s*\(/g];
   const RESULT_JSON_JQ = /\bjq\b/g;
-  // 把 result.json 路径当参数交给一个函数，也是在把它当数据取用 —— 哪怕解析动作藏在
-  // 包装函数里（兜底步的 read(p) 就是这种形状：那一行只有 JSON.parse 在函数定义处）。
-  const RESULT_JSON_PATH_CALL = /([A-Za-z_$][\w$]*)\s*\(\s*["'][^"']*result\.json["']/g;
+  // 把载体路径当参数交给一个函数，也是在把它当数据取用 —— 哪怕解析动作藏在包装函数里
+  // （兜底步的 read(p) 就是这种形状：那一行只有 JSON.parse 在函数定义处）。
+  // 这份拼写随载体走（carrier.pathCall），所以 check-run.json 不会漏在同一格上。
   // 已在别处计过的名字（读函数本身、写函数）：同一次调用不许算两遍，写调用更不是读。
   const RESULT_JSON_COUNTED_NAMES = [
     "readFileSync",
@@ -1585,11 +1640,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   ];
   const RESULT_JSON_READ_KEYS = ["readFileSync", "readFile", "createReadStream"];
 
-  function resultJsonReadCalls(line) {
+  function resultJsonReadCalls(line, carrier = DEFAULT_CARRIER) {
     let count = 0;
     for (const re of RESULT_JSON_READ_FILE_CALLS) count += [...line.matchAll(re)].length;
     count += [...line.matchAll(RESULT_JSON_JQ)].length;
-    for (const match of line.matchAll(RESULT_JSON_PATH_CALL)) {
+    for (const match of line.matchAll(carrier.pathCall)) {
       if (!RESULT_JSON_COUNTED_NAMES.includes(match[1])) count += 1;
     }
     if (count === 0 && RESULT_JSON_PARSE_SHAPES.some((re) => re.test(line))) return 1;
@@ -1614,14 +1669,14 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   const RESULT_READ_COMPUTED = /\[\s*["'](?:readFileSync|readFile|createReadStream)["']\s*\]/;
   const RESULT_WRITE_COMPUTED = /\[\s*["'](?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)["']\s*\]/;
 
-  function resultJsonLineInfo(rawLine) {
+  function resultJsonLineInfo(rawLine, carrier = DEFAULT_CARRIER) {
     const info = maskStringLiterals(rawLine);
     // 引号里是程序时，代码区就是这段程序本身 —— 只掩「数据」，不掩「被执行到的代码」。
     const code = INLINE_PROGRAM.test(rawLine) ? rawLine : info.masked;
     const literals = info.literals.map((value) => value.trim());
-    const literalPaths = literals.filter((value) => RESULT_PATH_LITERAL.test(value));
-    const globbed = RESULT_JSON_GLOB.test(code) || literals.some((value) => RESULT_JSON_GLOB.test(value));
-    const referenced = RESULT_JSON.test(code) || literalPaths.length > 0 || globbed;
+    const literalPaths = literals.filter((value) => carrier.pathLiteral.test(value));
+    const globbed = carrier.glob.test(code) || literals.some((value) => carrier.glob.test(value));
+    const referenced = carrier.ref.test(code) || literalPaths.length > 0 || globbed;
     return {
       raw: rawLine,
       masked: code,
@@ -1633,14 +1688,14 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     };
   }
 
-  function resultJsonWriteIntent(info) {
+  function resultJsonWriteIntent(info, carrier = DEFAULT_CARRIER) {
     if (RESULT_WRITE_NAMES.test(info.masked)) return true;
     if (info.bracketKeys.some((key) => RESULT_WRITE_KEYS.includes(key))) return true;
     if (RESULT_WRITE_COMPUTED.test(info.raw)) return true;
     // 口径层的落盘形态：--out 必须是代码区里真的有一个参数。
     if (/--out(?:\s+|=)/.test(info.masked)) return true;
     // shell 重定向写同一份文件：node x.mjs > .audit/result.json / ... > ".audit/result.json"
-    if (/>>?\s*[^\s;&|)]*result\.json/.test(info.masked)) return true;
+    if (carrier.redirect.test(info.masked)) return true;
     if (info.literalPaths.length > 0 && />>?\s*$/.test(info.masked.trimEnd())) return true;
     return false;
   }
@@ -1652,14 +1707,26 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 放行单位是**行**，形态只有三种，且都不带数据加工：
   //   1) cat 直接把这一份文件倒出（可带 2>/dev/null、|| true、或赋值给一个文本变量）；
   //   2) echo / printf 只输出**上面倒出来的那个文本变量**（原样，不加管道）；
-  //   3) [[ ]] / test 只做比较（围栏那一步要判断内容里有没有更长的反引号串）。
+  //   3) 存在性检查 / 变量对变量比较（见下面 RESULT_DUMP_EXISTENCE 与 RESULT_DUMP_VAR_COMPARE：
+  //      只回答「文件在不在」「我放的那段串在不在」，不问内容取值）—— 所以这里不列 [[ ]] / test。
   // 出现 jq / JSON.parse / .字段 / Object.keys|entries|values / 写文件 / node|python|perl
   // / sed|awk|cut|grep|tee|dd|base64 / 管道到别的命令 -> 不是倒出而是取数据，立刻违规。
-  const RESULT_DUMP_CAT_PATH = /^(?:\.{0,2}\/)*(?:[^\s"'\x60]+\/)?result\.json$/;
   const RESULT_DUMP_CAT =
     /^\s*(?:([A-Za-z_]\w*)\s*=\s*\$\(\s*)?cat\s+(?:-{1,2}[A-Za-z]+\s+)*(?:"([^"]*)"|'([^']*)'|([^\s;&|)]+))((?:\s+2?>\s*\/dev\/null)*)(?:\s*\|\|\s*true)?\s*\)?\s*$/;
   const RESULT_DUMP_OUT = /^\s*(?:echo|printf)\b/;
-  const RESULT_DUMP_TEST = /^\s*(?:(?:while|if|elif|until|for)\s+)*(?:\[\[|\[|test)\s/;
+  // 「只做比较」这条放行曾经写成 [[ ]] / test 的**前缀**匹配：于是
+  //   [[ "$body" == *needs_revision* ]] && echo hot=1
+  // 在非写者步里 103 条全绿 —— 它不是比较，是**按结论内容分支**。
+  // 现在只留两种，且都不问「内容是什么」：
+  //   1) 存在性检查：[[ -s <path> ]] / [[ -f <path> ]] / test -s|-f <path>；
+  //   2) 围栏增长循环：[[ "$body" == *"$fence"* ]] —— 比较对象是**变量**（这一步自己拼的
+  //      引号串），它只能回答「倒出来的文本里有没有这段串」，而这段串本来就是它自己放的，
+  //      所以分辨不出任何 verdict / conclusion 取值。字面量模式（== *needs_revision*、
+  //      =~、通配、grep）一律违规。
+  const RESULT_DUMP_EXISTENCE =
+    /^\s*(?:(?:while|if|elif|until|for)\s+)*(?:\[\[|\[|test)\s+-[sf]\s+(?:"[^"]*"|'[^']*'|[^\s;&|)\]]+)\s*(?:\]\]|\])?\s*;?\s*$/;
+  const RESULT_DUMP_VAR_COMPARE =
+    /^\s*(?:(?:while|if|elif|until)\s+)*(?:\[\[|\[)\s*"?\$\{?[A-Za-z_]\w*\}?"?\s*==\s*\*?"\$\{?[A-Za-z_]\w*\}?"\*\s*(?:\]\]|\])\s*(?:;\s*do\b.*)?$/;
   const RESULT_DUMP_FORBIDDEN =
     /(?:\bjq\b|JSON\.parse|Object\.(?:entries|keys|values)|\bnode\b|\bpython3?\b|\bperl\b|\bruby\b|\bsed\b|\bawk\b|\bcut\b|\btee\b|\bdd\b|\bgrep\b|\bhead\b|\btail\b|\bxargs\b|\bexec\b|\beval\b|\bsource\b|base64|openssl|\bcurl\b|\bwget\b|\bnc\b)/;
   const RESULT_DUMP_ALIAS_USE = /\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/g;
@@ -1667,26 +1734,41 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   const PIPE_TO_OTHER = /(?<!\|)\|(?!\|)/;
 
   // 一段被执行到的文本 -> 逐行的引用分类。默认拒绝就在这个循环里：
-  // 只要这一行引用了 result.json，除非它命中「写意图」或「纯文本倒出」，其余一律是违规。
+  // 只要这一行引用了载体，除非它命中白名单（写意图 / 纯文本倒出 / 载体自己的显式放行），其余一律是违规。
   // 别名（body=$(cat ...) 之后原样输出）按**文本内**作用域跟踪：
   // 跨文本继承别名等于让另一个 step 借前一步的变量，那不是同一条命令。
-  function scanResultJsonText(text) {
+  // options.allowLine：载体自己的白名单（check-run.json 只放行「用 --input POST 它」那一行）。
+  // 放行也是一条**行级**判定，并且被跳过的那一行不再算读、不占写者步的额度 ——
+  // 否则「放行」会顺手送出一份额度，额度又从另一头漏出去。
+  function scanResultJsonText(text, options = {}) {
+    const carrier = options.carrier ?? DEFAULT_CARRIER;
     const aliases = new Set();
     const entries = [];
     for (const rawLine of String(text).split("\n")) {
       const line = stripShellComment(rawLine);
       if (!line.trim() || COMMENT_ONLY_LINE.test(line)) continue;
-      const info = resultJsonLineInfo(line);
+      const info = resultJsonLineInfo(line, carrier);
       const aliasUse = [...line.matchAll(RESULT_DUMP_ALIAS_USE)]
         .map((match) => match[1] ?? match[2])
         .filter((name) => aliases.has(name));
       if (!info.referenced && aliasUse.length === 0) continue;
+      if (options.allowLine && options.allowLine(line, info)) {
+        entries.push({ excerpt: line.trim(), dump: false, write: false, calls: 0, allowed: true });
+        continue;
+      }
+      // 0) 存在性检查：只回答「文件在不在」，没有被倒出、也没有被解析。
+      //    它唯一的用途是「判不了」分支（result.json 没落地 -> 走 INFRA 留痕），
+      //    所以放行它对内容没有任何可观测后果；内容匹配不在这一格里（见 RESULT_DUMP_VAR_COMPARE）。
+      if (info.referenced && RESULT_DUMP_EXISTENCE.test(line) && !RESULT_DUMP_FORBIDDEN.test(line)) {
+        entries.push({ excerpt: line.trim(), dump: true, write: false, calls: 0 });
+        continue;
+      }
       // 1) 纯文本倒出：cat 整份文件倒出来，可赋值给变量供后面原样输出。
       if (info.referenced) {
         const dump = RESULT_DUMP_CAT.exec(line);
         if (dump) {
           const operand = (dump[2] ?? dump[3] ?? dump[4] ?? "").trim();
-          if (RESULT_DUMP_CAT_PATH.test(operand) && !RESULT_DUMP_FORBIDDEN.test(line) && !PIPE_TO_OTHER.test(line)) {
+          if (carrier.dumpPath.test(operand) && !RESULT_DUMP_FORBIDDEN.test(line) && !PIPE_TO_OTHER.test(line)) {
             if (dump[1]) aliases.add(dump[1]);
             entries.push({ excerpt: line.trim(), dump: true, write: false, calls: 0 });
             continue;
@@ -1696,7 +1778,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       // 2) 倒出来的文本变量：只许原样输出 / 比较，一经加工就是取数据。
       if (aliasUse.length > 0) {
         const allowed =
-          (RESULT_DUMP_OUT.test(line) || RESULT_DUMP_TEST.test(line)) &&
+          (RESULT_DUMP_OUT.test(line) || RESULT_DUMP_EXISTENCE.test(line) || RESULT_DUMP_VAR_COMPARE.test(line)) &&
           !RESULT_DUMP_FORBIDDEN.test(line) &&
           !PIPE_TO_OTHER.test(line);
         entries.push({ excerpt: line.trim(), dump: allowed, write: false, calls: 0 });
@@ -1704,8 +1786,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       }
       // 3) 其余引用：写意图 -> 写者步；读形态 -> 一次读（写者步有一次额度）；
       //    两者都不是 -> 就是默认拒绝要抓的那一类（换什么拼写都不影响）。
-      const write = resultJsonWriteIntent(info);
-      const calls = resultJsonReadCalls(line);
+      const write = resultJsonWriteIntent(info, carrier);
+      const calls = resultJsonReadCalls(line, carrier);
       const readShape =
         calls > 0 ||
         RESULT_JSON_READ_SHAPES.some((re) => re.test(info.masked)) ||
@@ -1720,8 +1802,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 这条识别被断言钉住（真 workflow 的写者集合是 ["decide","fallback"]）：写侧认不出，
   // 写者步就退化成读者步，「一次读」的额度与「谁在产出」两件事同时失真。
   // 注释不提供写意图：判定前先剥 shell 注释（尾注里写一句 --out 曾经能把整步洗成写者）。
-  function hasResultJsonWrite(text) {
-    return scanResultJsonText(text).some((entry) => entry.write);
+  function hasResultJsonWrite(text, options = {}) {
+    return scanResultJsonText(text, options).some((entry) => entry.write);
   }
   function stepTexts(step, options = {}) {
     const root = options.root ?? ROOT;
@@ -1739,18 +1821,20 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 不是手写名单 —— 补一个写者、删一个写者，这里立刻跟着变。
   function resultJsonWriterSteps(stepList, options = {}) {
     const root = options.root ?? ROOT;
+    const scan = { carrier: options.carrier ?? DEFAULT_CARRIER, allowLine: options.allowLine };
+    const key = options.key ?? ((step) => step.id ?? step.name);
     return stepList
-      .filter((step) => stepTexts(step, { root }).some(({ text }) => hasResultJsonWrite(text)))
-      .map((step) => step.id ?? step.name);
+      .filter((step) => stepTexts(step, { root }).some(({ text }) => hasResultJsonWrite(text, scan)))
+      .map((step, index) => key(step, index));
   }
 
   // 一次「数据读」= 引用 result.json 且这一行有读形态。
   // 判读/判写都在**剥掉 shell 注释之后**的行上做：注释里写一句 --out 不能让整行读洗白。
   // onWriteLine 只影响豁免资格（写者步只有**一次**纯读行的额度），不改变计数。
-  function resultJsonReads(text) {
+  function resultJsonReads(text, options = {}) {
     const reads = [];
-    for (const entry of scanResultJsonText(text)) {
-      if (entry.dump) continue;
+    for (const entry of scanResultJsonText(text, options)) {
+      if (entry.dump || entry.allowed) continue;
       for (let i = 0; i < entry.calls; i += 1) reads.push({ excerpt: entry.excerpt, onWriteLine: entry.write });
     }
     return reads;
@@ -1759,24 +1843,23 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 默认拒绝的正身：引用了 result.json、既不是白名单倒出、也没有写意图、也不是一次读形态 ——
   // 一律违规。旧判据要「先认出一次读调用」才计数，于是计算属性 / .call / 别名 /
   // 把读者整个搬进被引用的 .cjs 全都 0 红。这条不看拼写，所以没有「还差哪几种」可以补。
-  function resultJsonReferenceViolations(text) {
-    return scanResultJsonText(text)
-      .filter((entry) => !entry.dump && !entry.write && entry.calls === 0)
+  function resultJsonReferenceViolations(text, options = {}) {
+    return scanResultJsonText(text, options)
+      .filter((entry) => !entry.allowed && !entry.dump && !entry.write && entry.calls === 0)
       .map((entry) => ({ excerpt: entry.excerpt }));
   }
   // 「整体枚举整份 result」：把 result.json 解析成对象之后整份过一遍。
   // 识别对象必须与「解析 result.json 的那个变量」绑定 —— 写者也会 JSON.stringify 自己拼的
   // payload，那不是这条的形状。口径层只按字段取用，出现一次就说明它在搬数据而不是产出数据。
-  const RESULT_VAR_DECL = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^\n]*result\.json/g;
   const WHOLE_ENUM_CALL = /(?:Object\.(?:entries|keys|values)|JSON\.stringify)\s*\(\s*([A-Za-z_$][\w$]*)/g;
   // 整体 dump 同一性质：console.log(整份对象) 一次就把 verdict / conclusion / executors /
   // comparison 全写进公开 run log。只认「整个变量」——console.log(r.verdict) 是按字段取用。
   const WHOLE_DUMP_CALL =
     /(?:console\.(?:log|info|debug|warn|dir|table)|process\.stdout\.write)\s*\(\s*([A-Za-z_$][\w$]*)(?![.\w$?[\]])/g;
 
-  function wholeResultEnumerations(text) {
+  function wholeResultEnumerations(text, carrier = DEFAULT_CARRIER) {
     const source = String(text);
-    const resultVars = [...source.matchAll(RESULT_VAR_DECL)].map((match) => match[1]);
+    const resultVars = [...source.matchAll(carrier.varDecl)].map((match) => match[1]);
     if (resultVars.length === 0) return [];
     const found = [];
     for (const line of source.split("\n").map(stripShellComment)) {
@@ -1819,31 +1902,36 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // step 只写 node x.cjs，曾经是一条永久免费通道。
   function resultJsonReaderViolations(stepList, options = {}) {
     const root = options.root ?? ROOT;
+    const carrier = options.carrier ?? DEFAULT_CARRIER;
+    const scan = { carrier, allowLine: options.allowLine };
     const producers = resultWriters(stepList, { root });
     const violations = [];
     for (const { source, where, text } of jobPayloadTexts(options.jobPayloads ?? [], { root })) {
-      for (const read of resultJsonReads(text)) violations.push({ step: source, where, excerpt: read.excerpt });
-      for (const bad of resultJsonReferenceViolations(text)) {
+      for (const read of resultJsonReads(text, scan)) violations.push({ step: source, where, excerpt: read.excerpt });
+      for (const bad of resultJsonReferenceViolations(text, scan)) {
         violations.push({ step: source, where, excerpt: bad.excerpt });
       }
-      for (const excerpt of wholeResultEnumerations(text)) violations.push({ step: source, where, excerpt });
+      for (const excerpt of wholeResultEnumerations(text, carrier)) violations.push({ step: source, where, excerpt });
     }
     for (const step of stepList) {
       const source = step.id ?? step.name;
       const texts = stepTexts(step, { root });
-      const writes = texts.some(({ text }) => hasResultJsonWrite(text));
-      const reads = texts.flatMap(({ where, text }) => resultJsonReads(text).map((read) => ({ where, ...read })));
+      const writes = texts.some(({ text }) => hasResultJsonWrite(text, scan));
+      const reads = texts.flatMap(({ where, text }) =>
+        resultJsonReads(text, scan).map((read) => ({ where, ...read })),
+      );
       if (!writes) {
         for (const read of reads) violations.push({ step: source, where: read.where, excerpt: read.excerpt });
         // 默认拒绝在这里生效：非写者步里**任何**对 result.json 的引用都是违规，
         // 不要求先认出一次读调用 —— 白名单以外的写法一律落在这条上。
         for (const { where, text } of texts) {
-          for (const bad of resultJsonReferenceViolations(text)) {
+          for (const bad of resultJsonReferenceViolations(text, scan)) {
             violations.push({ step: source, where, excerpt: bad.excerpt });
           }
           // 整体枚举对**所有**步生效：不写 result.json 的步同样能把整份数据 dump 进日志，
           // 把它放在写者分支里，这道第二防线在非写者步上就是死代码。
-          for (const excerpt of wholeResultEnumerations(text)) violations.push({ step: source, where, excerpt });
+          for (const excerpt of wholeResultEnumerations(text, carrier))
+            violations.push({ step: source, where, excerpt });
         }
         continue;
       }
@@ -1856,13 +1944,164 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       });
       for (const { where, text } of texts) {
         // 写者步里白名单以外的引用同样是违规：写一次 + grep/jq 取字段不是「顺带读一次」。
-        for (const bad of resultJsonReferenceViolations(text)) {
+        for (const bad of resultJsonReferenceViolations(text, scan)) {
           violations.push({ step: source, where, excerpt: bad.excerpt });
         }
         // 整体枚举一条也不放行。写者自己的脚本文件（texts 里 where 就是生产者本身）除外：
         // 那份文件就是「与写同源」的那一份，它的按字段取用不该被当成搬运。
         if (producers.includes(where)) continue;
-        for (const excerpt of wholeResultEnumerations(text)) violations.push({ step: source, where, excerpt });
+        for (const excerpt of wholeResultEnumerations(text, carrier))
+          violations.push({ step: source, where, excerpt });
+      }
+    }
+    return violations;
+  }
+
+  // ---- 轮十三：引用定义抬到 .audit 目录级 ----
+  // 上面那层把引用认成「相对文件名」：于是按**文件**发生的执行面被按**拼写**认。
+  // 实测四种等价写法全绿（review-b 在 /tmp 副本上复现）：
+  //   grep -rq needs_revision .audit       父目录：文件名一个字都不写
+  //   tar -cf /tmp/x.tar .audit            目录搬运：同上
+  //   cat .audit/result.jso?               ? 通配：不是星号，逃过 glob 判据
+  //   cp -a .audit /tmp/leakdir            改个名再读：cp 这一步就已经引用
+  // 继续补拼写没有意义（每补一种，等于把「还差哪几种」的清单交给对手）。这一层只认一件事：
+  // **原始文本里出现 .audit 就算引用**，且刻意**不掩字符串字面量** —— 路径通常就写在引号里。
+  // 放行只剩四条显式白名单，全部是行级：
+  //   1) mkdir -p .audit 建目录（不读写载体，也不因此把这一步算成写者）；
+  //   2) 该路径的写者/消费者精确名单（AUDIT_PATH_ALLOWED_STEPS，断言用 toEqual）；
+  //   3) cat 原样倒出 result.json（沿用下层倒出判据，只服务 INFRA 留痕那一步）；
+  //   4) 用 --input .audit/check-run.json 的 POST（只有那两步，见 CHECK_RUNS_*）。
+  // 其余任何 .audit 路径一律违规 —— 不给「认领不到就放过」。
+  const AUDIT_DIR_REF = /\.audit(?![\w.-])/;
+  const AUDIT_DIR_TOKEN = /\.audit(?:[/\\][^\s"';|&()<>]*)?/g;
+  const AUDIT_DIR_CREATE = /^\s*mkdir\s+(?:-\S+\s+)*(?:"\.audit\/?"|'\.audit\/?'|\.audit\/?)\s*$/;
+  const AUDIT_DIR_CREATE_NODE = /\bmkdir(?:Sync)?\s*\(\s*["']\.audit\/?["']/;
+  // 允许**引用**该路径的步 = 写者 + 唯一消费者（左半是写者，同样精确，用 toEqual 钉住）。
+  // 写者多一个，结论的产出通道就多一条：check-run.json 是真正被 POST 出去的载体，
+  // 它的写者只许「口径层判定」「结论兜底」「判不了：回写 INFRA」三步。
+  //   review-*.json 只被口径层读来产 result.json；
+  //   result.json 被兜底读（缺字段时补写）与 INFRA 留痕原样倒出；
+  //   check-run.json 被兜底读，并被那两步用 --input POST。
+  const AUDIT_PATH_ALLOWED_STEPS = {
+    ".audit/review-a.json": ["落盘 review-a", "口径层判定"],
+    ".audit/review-b.json": ["落盘 review-b", "口径层判定"],
+    ".audit/result.json": ["口径层判定", "结论兜底", "INFRA 留痕"],
+    ".audit/check-run.json": ["口径层判定", "结论兜底", "判不了：回写 INFRA", "回写 Check Run"],
+  };
+  // POST 面收口。check-runs 这个端点在真 workflow 里只有一种合法写法：
+  //   gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq .id
+  // 关键在于**绑文件**：只要 POST 的 payload 来自别处（-f name=audit -f conclusion=success
+  // 直拼，或把 payload 先写到 .audit/second.json 再 --input 它），判据就不知道那是结论。
+  // 只读查询（--jq '.["executors"] | length' 之类）在本 workflow 里不存在；这个端点在这里
+  // 是「回写」通道，允许读它等于允许任何一步拿到结论的产出面，所以读也一并违规。
+  const CHECK_RUNS_ENDPOINT = /\bcheck-runs\b/;
+  const CHECK_RUNS_POST = /(?:--method[=\s]+POST\b|-X\s*POST\b)/;
+  const CHECK_RUNS_INPUT = /--input[=\s]+["']?\.audit\/check-run\.json["']?/;
+  const CHECK_RUNS_POST_STEPS = ["回写 Check Run", "判不了：回写 INFRA"];
+
+  // 一行文本里出现的 .audit 路径（含父目录、通配、别的文件名）。
+  function auditDirPaths(line) {
+    const raw = String(line);
+    const tokens = [...raw.matchAll(AUDIT_DIR_TOKEN)].map((match) => match[0].replace(/[/\\]+$/, ""));
+    if (tokens.length > 0) return tokens;
+    return AUDIT_DIR_REF.test(raw) ? [".audit"] : [];
+  }
+
+  // 写意图必须绑到**这条路径上**：口径层那一行同时提到 review-a / review-b / result.json，
+  // 只按「这一行有写意图」认，会把三个文件都记到它名下（写者集合因此虚胖）。
+  // 写目标是这三种形态里的路径本身：--out <p> / 重定向 > <p> / write*("<p>"。
+  const AUDIT_WRITE_TARGET_PATTERNS = [
+    /--out(?:=|\s+)("[^"]*"|'[^']*'|[^\s;&|)]+)/g,
+    />>?\s*("[^"]*"|'[^']*'|[^\s;&|)]+)/g,
+    /\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream)\s*\(\s*("[^"]*"|'[^']*'|[^\s,;)]+)/g,
+  ];
+
+  function auditDirWriteTargets(line) {
+    const targets = [];
+    for (const pattern of AUDIT_WRITE_TARGET_PATTERNS) {
+      for (const match of String(line).matchAll(pattern)) {
+        targets.push(match[1].replace(/^["']|["']$/g, "").replace(/[/\\]+$/, ""));
+      }
+    }
+    return targets;
+  }
+
+  // 某个 .audit 路径的写者集合：从文本推出（不手写名单），断言用 toEqual 钉住。
+  function auditDirWriterSteps(stepList, path, options = {}) {
+    const root = options.root ?? ROOT;
+    return stepList
+      .filter((step) =>
+        stepTexts(step, { root }).some(({ text }) =>
+          String(text)
+            .split("\n")
+            .map(stripShellComment)
+            .some((line) => auditDirWriteTargets(line).includes(path)),
+        ),
+      )
+      .map((step) => step.name ?? step.id);
+  }
+
+  // 引用某个 .audit 路径的步集合（写者 + 消费者），按名字精确断言。
+  function auditDirReferenceSteps(stepList, path, options = {}) {
+    const root = options.root ?? ROOT;
+    return stepList
+      .filter((step) =>
+        stepTexts(step, { root }).some(({ text }) =>
+          String(text)
+            .split("\n")
+            .map(stripShellComment)
+            .some((line) => auditDirPaths(line).includes(path)),
+        ),
+      )
+      .map((step) => step.name ?? step.id);
+  }
+
+  // 目录级的默认拒绝：非白名单步引用 .audit 的任何形态都是违规。
+  function auditDirReferenceViolations(stepList, options = {}) {
+    const root = options.root ?? ROOT;
+    const violations = [];
+    const texts = [];
+    for (const step of stepList) {
+      const name = step.name ?? step.id;
+      for (const { where, text } of stepTexts(step, { root })) texts.push({ name, where, text });
+    }
+    for (const { source, where, text } of jobPayloadTexts(options.jobPayloads ?? [], { root })) {
+      texts.push({ name: source, where, text });
+    }
+    for (const { name, where, text } of texts) {
+      for (const rawLine of String(text).split("\n")) {
+        const line = stripShellComment(rawLine);
+        if (!line.trim() || COMMENT_ONLY_LINE.test(line)) continue;
+        // POST 面先判：端点出现就必须是「那两步 + --input check-run.json」。
+        if (CHECK_RUNS_ENDPOINT.test(line)) {
+          const sanctioned =
+            CHECK_RUNS_POST_STEPS.includes(name) && CHECK_RUNS_POST.test(line) && CHECK_RUNS_INPUT.test(line);
+          if (!sanctioned) {
+            violations.push({ step: name, where, excerpt: line.trim(), reason: "check-runs 只能是那两步的 --input POST" });
+          }
+        }
+        const paths = auditDirPaths(line);
+        if (paths.length === 0) continue;
+        // 建目录（shell mkdir / node mkdirSync）只创建目录，不读写任何载体，也不因此算写者。
+        if (AUDIT_DIR_CREATE.test(line) || AUDIT_DIR_CREATE_NODE.test(line)) continue;
+        // 存在性检查同样不取内容（已被下层同样放行）：只回答「文件在不在」。
+        if (RESULT_DUMP_EXISTENCE.test(line) && !RESULT_DUMP_FORBIDDEN.test(line)) continue;
+        // 原样倒出（只对 result.json）：沿用下层「cat 整份、不带加工」的判据。
+        const dump = RESULT_DUMP_CAT.exec(line);
+        if (dump) {
+          const operand = (dump[2] ?? dump[3] ?? dump[4] ?? "").trim();
+          if (
+            CARRIERS.result.dumpPath.test(operand) &&
+            !RESULT_DUMP_FORBIDDEN.test(line) &&
+            !PIPE_TO_OTHER.test(line)
+          )
+            continue;
+        }
+        for (const token of paths) {
+          const allowed = AUDIT_PATH_ALLOWED_STEPS[token];
+          if (allowed && allowed.includes(name)) continue;
+          violations.push({ step: name, where, excerpt: line.trim(), reason: "未认领的 .audit 引用" });
+        }
       }
     }
     return violations;
@@ -3324,6 +3563,173 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       });
     });
     expect(resultJsonWriterSteps(mutated.jobs["audit-runner"].steps)).toEqual(["decide", "fallback", "改写结论"]);
+  });
+
+  it("轮十三-1：audit.yml 每个 step 都有 name（无 name 的步照常执行，行为层不许全盲）", () => {
+    // Actions 里 name 是可选的：没有 name 的 step 照常被执行。所以「无 name」不是判据的豁免，
+    // 而是一个必须被静态层看见、被行为层明说的形状（失败时打印下标与 run 前 60 字）。
+    const nameless = steps
+      .map((step, index) => ({ index, step }))
+      .filter(({ step }) => !step.name)
+      .map(({ index, step }) => index + " / " + String(step.run ?? "").slice(0, 60).replace(/\n/g, " "));
+    expect(nameless).toEqual([]);
+    expect(requireStepName(steps)).toBe(steps);
+  });
+
+  it("轮十三-2：无 name 不影响该步被扫描（判据看内容不看名字），行为层则 fail-closed 并指出第几个", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-noname-scan-"));
+    // 同一段 run，加不加 name 都要同样红：名字不是扫描面的开关。
+    const run = 'body=$(cat .audit/result.json)\n[[ "$body" == *needs_revision* ]] && echo hot=1\n';
+    expect(resultJsonReaderViolations([{ run }], { root: dir }).map((v) => v.excerpt)).toEqual(
+      resultJsonReaderViolations([{ name: "有名字", run }], { root: dir }).map((v) => v.excerpt),
+    );
+    expect(resultJsonReaderViolations([{ run }], { root: dir }).length).toBeGreaterThan(0);
+    // 行为层：不是「跳过」，是明说第几个 step 没有 name。
+    expect(() => requireStepName([{ run: "echo 1\n" }])).toThrow(/第 1 个 step 没有 name/);
+    expect(() => requireStepName([{ name: "ok", run: "echo 1\n" }, { run: "echo 2\n" }])).toThrow(/第 2 个/);
+  });
+
+  it("轮十三-3：check-run.json 是结论载体 —— 写者精确等于三步，非写者引用一律违规", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-checkrun-carrier-"));
+    // 写者精确相等（不是下限）：多一个写者就多一条产出结论的通道。
+    expect(resultJsonWriterSteps(steps, { carrier: CARRIERS.checkRun, key: (step) => step.name })).toEqual([
+      "口径层判定",
+      "结论兜底",
+      "判不了：回写 INFRA",
+    ]);
+    // 每一处写出的 payload 都必须叫 audit：换成 job 名，job 的红就与结论的红抢同一个名字。
+    for (const name of ["口径层判定", "结论兜底", "判不了：回写 INFRA"]) {
+      const step = steps.find((candidate) => candidate.name === name);
+      const text = stepTexts(step, { root: ROOT })
+        .map(({ text: value }) => value)
+        .join("\n");
+      expect(String(step.run), name).toContain('name: "audit"');
+      expect(text, name).toContain('name: "audit"');
+    }
+    // 无 name 的步把结论改写成 success：静态层必须红（旧判据下 103 条全绿）。
+    const rewrite = {
+      name: "改写结论",
+      run: 'node -e \'require("node:fs").writeFileSync(".audit/check-run.json", JSON.stringify({ conclusion: "success" }))\'\n',
+    };
+    expect(resultJsonWriterSteps([rewrite], { carrier: CARRIERS.checkRun })).toEqual(["改写结论"]);
+    expect(auditDirReferenceViolations([rewrite], { root: dir }).map((v) => v.reason)).toEqual(["未认领的 .audit 引用"]);
+    // 非写者步只读一个字段同样是违规（载体判据不分读多少）。
+    const peek = { name: "旁读", run: "jq -r .conclusion .audit/check-run.json\n" };
+    expect(resultJsonReaderViolations([peek], { root: dir, carrier: CARRIERS.checkRun }).length).toBeGreaterThan(0);
+    // 载体的判读落在「引用 + 读形态」上；引用计数本身也必须认得 check-run.json。
+    expect(resultJsonReads(peek.run, { carrier: CARRIERS.checkRun }).length).toBeGreaterThan(0);
+  });
+
+  it("轮十三-4：POST 面收口 —— check-runs 只能是那两步的 --input POST（绑文件，不绑拼写）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-post-face-"));
+    const endpoints = steps.filter((step) => String(step.run ?? "").includes("check-runs"));
+    expect(endpoints.map((step) => step.name)).toEqual(["回写 Check Run", "判不了：回写 INFRA"]);
+    for (const step of endpoints) {
+      expect(String(step.run), step.name).toContain("--method POST");
+      expect(String(step.run), step.name).toContain("--input .audit/check-run.json");
+    }
+    // 缺口 1 的第二种写法：绕开 $GITHUB_REPOSITORY 字面与 --input，用 -f 直拼 payload。
+    const direct = {
+      name: "旁路",
+      run: "gh api repos/o/r/check-runs --method POST -f name=audit -f conclusion=success -f head_sha=deadbeef\n",
+    };
+    expect(auditDirReferenceViolations([direct], { root: dir }).map((v) => v.reason)).toEqual([
+      "check-runs 只能是那两步的 --input POST",
+    ]);
+    // payload 先落到别的文件名再 --input 它：既碰未认领的 .audit 路径，也没绑 check-run.json。
+    const aliased = {
+      name: "旁路2",
+      run: "gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/second.json\n",
+    };
+    expect(auditDirReferenceViolations([aliased], { root: dir }).map((v) => v.reason)).toEqual([
+      "check-runs 只能是那两步的 --input POST",
+      "未认领的 .audit 引用",
+    ]);
+    // 只读查询没有放行条件：这个端点在真 workflow 里只有回写一种用途，读它等于拿到产出面。
+    const query = { name: "旁路3", run: 'gh api repos/o/r/check-runs --jq \'.["executors"] | length\'\n' };
+    expect(auditDirReferenceViolations([query], { root: dir })).toHaveLength(1);
+    // 真 workflow 零违规（POST 面 + 目录引用两面一起过）。
+    expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
+  });
+
+  it("轮十三-5：引用定义抬到 .audit 目录级 —— 父目录 / 搬运 / ? 通配 / 改名 都算引用", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-dir-ref-"));
+    const cases = [
+      ["父目录 grep", "grep -rq needs_revision .audit\n"],
+      ["目录搬运", "tar -cf /tmp/x.tar .audit\n"],
+      ["? 通配", "cat .audit/result.jso?\n"],
+      ["改名后再读", "cp -a .audit /tmp/leakdir\n"],
+      ["父目录枚举", "ls -R .audit\n"],
+    ];
+    for (const [label, run] of cases) {
+      expect(auditDirReferenceViolations([{ name: "leak", run }], { root: dir }).length, label).toBeGreaterThan(0);
+    }
+    // mkdir -p .audit 只是建目录：不违规，也不因此算写者。
+    const mkdir = { name: "mkdir", run: "mkdir -p .audit\n" };
+    expect(auditDirReferenceViolations([mkdir], { root: dir })).toEqual([]);
+    expect(auditDirWriterSteps([mkdir], ".audit/result.json")).toEqual([]);
+    const nodeMkdir = {
+      name: "node-mkdir",
+      run: 'node -e \'require("node:fs").mkdirSync(".audit", { recursive: true })\'\n',
+    };
+    expect(auditDirReferenceViolations([nodeMkdir], { root: dir })).toEqual([]);
+    // 真 workflow：写者与引用者精确等于名单，整体零违规。
+    expect(auditDirWriterSteps(steps, ".audit/review-a.json", { root: ROOT })).toEqual(["落盘 review-a"]);
+    expect(auditDirWriterSteps(steps, ".audit/review-b.json", { root: ROOT })).toEqual(["落盘 review-b"]);
+    expect(auditDirWriterSteps(steps, ".audit/result.json", { root: ROOT })).toEqual(["口径层判定", "结论兜底"]);
+    expect(auditDirWriterSteps(steps, ".audit/check-run.json", { root: ROOT })).toEqual([
+      "口径层判定",
+      "结论兜底",
+      "判不了：回写 INFRA",
+    ]);
+    expect(auditDirReferenceSteps(steps, ".audit/check-run.json", { root: ROOT })).toEqual([
+      "口径层判定",
+      "结论兜底",
+      "回写 Check Run",
+      "判不了：回写 INFRA",
+    ]);
+    expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
+  });
+
+  it("轮十三-6：白名单第 3 条收死 —— 按内容分支（[[ ]] / test / grep）一律违规，只留存在性检查", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-content-branch-"));
+    const forbidden = [
+      ["字面量分支", 'body=$(cat .audit/result.json)\n[[ "$body" == *needs_revision* ]] && echo hot=1\n'],
+      ["不等分支", 'body=$(cat .audit/result.json)\n[[ "$body" != *pass* ]] && echo hot=1\n'],
+      ["正则分支", 'body=$(cat .audit/result.json)\n[[ "$body" =~ needs ]] && echo hot=1\n'],
+      ["grep 判定", 'body=$(cat .audit/result.json)\nprintf "%s" "$body" | grep -q needs_revision\n'],
+      ["test 通配", 'body=$(cat .audit/result.json)\ntest "$body" = "*needs*" && echo hot=1\n'],
+    ];
+    for (const [label, run] of forbidden) {
+      expect(resultJsonReaderViolations([{ id: "branch", run }], { root: dir }).length, label).toBeGreaterThan(0);
+    }
+    // 存在性检查是唯一保留的「元数据」放行：只回答文件在不在，不告诉内容是什么。
+    for (const run of ["[[ -s .audit/result.json ]]\n", "test -f .audit/result.json\n"]) {
+      expect(resultJsonReaderViolations([{ id: "exists", run }], { root: dir }), run).toEqual([]);
+      expect(auditDirReferenceViolations([{ name: "exists", run }], { root: dir }), run).toEqual([]);
+    }
+    // 围栏增长循环放行的理由：比较对象是**变量**（自己拼的引号串），分辨不出任何取值。
+    const fence = 'body=$(cat .audit/result.json)\nwhile [[ "$body" == *"$fence"* ]]; do fence="$fence"; done\necho "$body"\n';
+    expect(resultJsonReaderViolations([{ id: "fence", run: fence }], { root: dir })).toEqual([]);
+  });
+
+  it("轮十三-7：假红噪音修掉 —— jq -r / grep -r 的红来自「未认领的 .audit 引用」", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-noise-"));
+    // 旧判据把 -r 一律当 loader 旗标：jq -r 靠 loader-no-value / missing 落红，-rq / -rc 立刻绿。
+    // 那是误报兜住的覆盖真相。现在 -r 只在取值解得出一份真实脚本时才算模块取值。
+    const cases = [
+      ["jq -r", "jq -r '.executors | length' .audit/result.json\n"],
+      ["grep -rq", "grep -rq needs_revision .audit\n"],
+      ["grep -rc", "grep -rc needs_revision .audit\n"],
+    ];
+    for (const [label, run] of cases) {
+      const scripts = referencedScripts([{ name: "read", run }], { root: dir });
+      expect(scripts.unfollowable, label).toEqual([]);
+      expect(scripts.missing, label).toEqual([]);
+      expect(auditDirReferenceViolations([{ name: "read", run }], { root: dir }).map((v) => v.reason), label).toEqual([
+        "未认领的 .audit 引用",
+      ]);
+    }
   });
 });
 
