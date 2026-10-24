@@ -209,3 +209,24 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **止损（我定的）**：载体已扩到 workflow 能执行的每一种 step 形态。剩下的是**包装器里的读**（`bash x.sh`、`npm/pnpm`、`make`、`python3`、`npx tsx`、`node -`/stdin、`worker_threads`、`node_modules` 依赖）——那不属于「判据漏了」，属于「静态分析追不到进程边界」，继续修等于在测试里写半个解释器。这一类**登记为已知盲区**并停止追杀。
 
 **仍然未纳入（诚实）**：`with` 里用表达式拼出的脚本路径；跨载荷（env 只有路径、解析动作在另一个 step）；被拆开的路径字面量；绝对路径调脚本与裸模块名 import；白名单外的官方 action（如 `actions/cache`）会红——这是刻意方向（未知要响），风险由名单处注释说明。
+
+
+### 轮十：放行单位错了一层——「谁写过」不等于「谁在读」，载体漏了 `shell:` 与 job 级
+
+轮九把「放行单位」从文件收到步，方向对了，但**收得还不够**：步内只放行**一次**读才是正确粒度，整步放行等于让唯一能藏第二份口径层的位置（writer 步）免检。同一轮还暴露出载体清单按「step 里的哪个键」去想，漏掉了两个同族键。
+
+**两家的真绕过（我独立复现，均在 `1819b0a` 的隔离副本上）**
+
+| 缺陷 | 变异 | 旧判据 | 后果 |
+| --- | --- | --- | --- |
+| 豁免单位=整步（high） | 兜底步的读之后再挂一次 `Object.entries(read(".audit/result.json"))` 打 key/value（零字段名） | 87 全绿 | 读者排在兜底补写之后、成功路径也照跑，推翻「解引用字段的读者只有口径层一处、且排在兜底之前」 |
+| `step.shell` 不在载荷集（high） | 新步 `shell: bash -c 'node scripts/probe-read.mjs' {0}` + `run: \| echo done` | 87 全绿（连 `unfollowable` 都不进） | 命令由 shell 字段本身携带，该字段零扫描 |
+| job 级 `env` / job `defaults.run.shell` 不在扫描面（high） | job env `NODE_OPTIONS: --require ./scripts/probe-env.cjs`（模块内读 result.json） | 87 全绿 | 它在 GitHub 里对 job 内每次 node 启动生效，与 step env 执行面等价，只是语法位置不同 |
+
+**修法（`tests/audit-findings.test.mjs`，92 例）**：`resultJsonReaderViolations`(:1604) 重写——豁免单位从「整步」改成「一次读」（writer 步只放行第一次读，`reads.slice(1)` 全报），配套 `resultJsonReads`(:1548) 按行计数不去重、`RESULT_JSON_PATH_CALL`(:1544) 让 `read(".audit/result.json")` 这种把路径当实参的写法也被数成一次、`wholeResultEnumerations`(:1565) 禁 writer 步对整份 result 做 `Object.entries/keys/values` 与 `JSON.stringify`（整体枚举 = 一次读就拿到全部字段，按读次数放行会漏）；载体侧新增 `jobPayloads`(:1258，job.env.* / doc.env.* / defaults.run.shell) 与 `scanShellField`(:1189，按 custom shell 的 `command [options] {0}` 语义解，两层 `bash -c` 内递归，更深落 `unfollowable{kind:"shell-c"}` 而不是静默)，`payloadScriptRefs`(:1272) 去重合并（否则 `--require` 两路各算一条会误报）。
+
+**我的独立复验（不是转述）**：`step.shell` 读者 → 4 红；job env `--require` 读者 → 2 红；兜底步第二处读 → 6 红；还原后 92 绿。
+
+**我自己坏掉的探针（第三次，记下来）**：把 job 级 `NODE_OPTIONS` 插成**第二个 `env:`** 键（与既有 `env:` 重复）→ YAML 非法 → vitest 报 `Tests no tests`。那不是「绿」，是根本没跑。固定动作再加一条：**同一个 mapping 里插键，要往既有键下插，不许新开同名键**；并且看到 `Tests no tests` 一律当「探针坏了」而不是「没红」。
+
+**仍未覆盖（诚实登记）**：读额度按行计，一个包装函数把多次读塞进一行不区分；custom shell 只解两层 `bash -c`；非 node 的 custom shell（`python3 -c`）既不产引用也不进 `unfollowable`；`scriptTree` 深度 3 之外不跟；base64/变量拼接的路径不在扫描面。

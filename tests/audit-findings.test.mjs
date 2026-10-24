@@ -511,7 +511,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 照 tests/state-writer-wiring.test.mjs 的办法：假 gh 记账到 calls.log，
   // 于是「到底调了哪个 API、payload 里 conclusion 是什么」是实测而不是读字面。
   const doc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
-  const steps = doc.jobs["audit-runner"].steps;
+  const job = doc.jobs["audit-runner"];
+  const steps = job.steps;
+  // job 级载体（job.env.* / defaults.run.shell / 顶层 env）对每个 step 都生效，是同一个执行面，
+  // 不是扫描面之外的包装器；真仓库上它同样必须零读者。
+  const carrierPayloads = jobPayloads(job, doc);
 
   function sandbox() {
     const dir = mkdtempSync(join(tmpdir(), "audit-wf-"));
@@ -1179,6 +1183,43 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     return scanScriptRefs(runText, options).refs;
   }
 
+  // GitHub 的 custom shell 形如 `command [options] {0}`：{0} 处换成脚本文件路径，命令本身由
+  // **这个字段**携带。它不写在 run 里，所以只认 run 的扫描面连看都没看它 —— 而它真执行。
+  // 按「命令 + {0} 占位」解出 node 脚本；解析不下去就落 unfollowable，不静默跳过。
+  function scanShellField(shellText, options = {}) {
+    const root = options.root ?? ROOT;
+    const refs = [];
+    const unfollowable = [];
+    const add = (raw) => {
+      const rel = resolveScriptRef(root, raw);
+      if (rel && !refs.includes(rel)) refs.push(rel);
+    };
+    const visit = (body, depth) => {
+      for (const words of shellCommands(body)) {
+        const head = words[0] ?? "";
+        if (SHELL_C.test(head) && /^-{1,2}[a-z]*c$/.test(words[1] ?? "")) {
+          // bash -c '...' 的 body 才是真命令：往里走一层，走不动了才记 unfollowable。
+          if (depth >= 2) {
+            unfollowable.push({ kind: "shell-c", detail: body });
+            continue;
+          }
+          visit(words.slice(2).join(" "), depth + 1);
+          continue;
+        }
+        const parsed = parseNodeCommand(words);
+        for (const script of parsed.scripts) add(script);
+        unfollowable.push(...parsed.unfollowable);
+        if (parsed.scripts.length === 0 && DYNAMIC_NODE_WORD.test(head) && /NODE/i.test(head)) {
+          unfollowable.push({ kind: "dynamic-node", detail: words.join(" ") });
+        }
+        for (const word of words) if (word.startsWith("./")) add(word);
+      }
+    };
+    // {0} 是占位符不是命令词：留着会在 token 流里冒充参数。
+    visit(String(shellText).replace(/\{0\}/g, " "), 0);
+    return { refs, unfollowable };
+  }
+
   function scriptPath(root, rel) {
     return rel.startsWith("..") || rel.startsWith("/") ? null : join(root, rel);
   }
@@ -1201,10 +1242,45 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   function stepPayloads(step) {
     const payloads = [];
     if (typeof step.run === "string") payloads.push({ carrier: "run", text: step.run });
+    // shell 也是执行面：custom shell 形如 `command [options] {0}`，命令由这个字段携带。
+    // 它零扫描时，读者挂在它上面既不出违规、也不进 unfollowable —— 那是静默放行。
+    if (typeof step.shell === "string") payloads.push({ carrier: "shell", text: step.shell });
     for (const field of ["with", "env"]) {
       for (const leaf of payloadLeaves(step[field], [field])) payloads.push({ carrier: leaf.path, text: leaf.text });
     }
     return payloads;
+  }
+
+  // ---- job 级载体 ----
+  // 语法位置不同不等于执行面不同：job.env 对 job 内每次 node 启动都生效（--require 的模块
+  // 在 node 起来之前就跑），defaults.run.shell 决定每个 step 的 run 怎么被解释。
+  // 二者缺席时，读者只要从 step 搬到 job 上就全绿（实测 87 条），而它在 GitHub 里一字不差地执行。
+  function jobPayloads(job, doc = {}) {
+    const payloads = [];
+    for (const leaf of payloadLeaves(job?.env, ["job", "env"])) payloads.push({ carrier: leaf.path, text: leaf.text });
+    for (const leaf of payloadLeaves(doc?.env, ["env"])) payloads.push({ carrier: leaf.path, text: leaf.text });
+    for (const [carrier, shell] of [
+      ["defaults.run.shell", job?.defaults?.run?.shell],
+      ["defaults.run.shell", doc?.defaults?.run?.shell],
+    ]) {
+      if (typeof shell === "string") payloads.push({ carrier, text: shell });
+    }
+    return payloads;
+  }
+
+  // 一份载荷被执行到的脚本引用：shell 字段按 custom shell 命令解，其余按 shell 词法 + loader 取值。
+  function payloadScriptRefs(payload, options = {}) {
+    if (payload.carrier === "shell" || payload.carrier === "defaults.run.shell") {
+      return scanShellField(payload.text, options);
+    }
+    const scanned = scanScriptRefs(payload.text, options);
+    // 词法结果与 loader 取值可能指向同一个文件（--require ./x.cjs 两路都认得出）：
+    // 不合并就会让同一个文件被算成两处引用，下游按文件均摊判据时变成两条违规。
+    const refs = [];
+    for (const rel of [...scanned.refs, ...loaderValueRefs(payload.text, options)]) {
+      if (!refs.includes(rel)) refs.push(rel);
+    }
+    return { refs, unfollowable: scanned.unfollowable };
   }
 
   // NODE_OPTIONS / node 参数里的「模块取值」：--require x、-r x、--import=x、--loader x。
@@ -1226,7 +1302,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   function stepScriptRefs(step, options = {}) {
     const refs = [];
     for (const payload of stepPayloads(step)) {
-      for (const rel of [...scanScriptRefs(payload.text, options).refs, ...loaderValueRefs(payload.text, options)]) {
+      for (const rel of payloadScriptRefs(payload, options).refs) {
         if (!refs.includes(rel)) refs.push(rel);
       }
     }
@@ -1344,27 +1420,31 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       const clash = unfollowable.some((u) => u.step === entry.step && u.file === entry.file && u.kind === entry.kind);
       if (!clash) unfollowable.push(entry);
     };
-    for (const step of stepList) {
-      const stepId = step.id ?? step.name;
-      for (const payload of stepPayloads(step)) {
-        const scanned = scanScriptRefs(payload.text, { root });
-        for (const shape of scanned.unfollowable) note({ step: stepId, file: null, ...shape });
-        for (const rel of [...scanned.refs, ...loaderValueRefs(payload.text, { root })]) {
-          const tree = scriptTree(root, rel);
-          for (const file of tree.files) if (!files.includes(file)) files.push(file);
-          for (const gone of tree.missing) if (!missing.includes(gone)) missing.push(gone);
-          for (const file of tree.files) {
-            const abs = scriptPath(root, file);
-            for (const shape of unfollowableShapes(readFileSync(abs, "utf8"))) note({ step: stepId, file, ...shape });
-          }
+    const follow = (payload, source) => {
+      const { refs, unfollowable: shapes } = payloadScriptRefs(payload, { root });
+      for (const shape of shapes) note({ step: source, file: null, ...shape });
+      for (const rel of refs) {
+        const tree = scriptTree(root, rel);
+        for (const file of tree.files) if (!files.includes(file)) files.push(file);
+        for (const gone of tree.missing) if (!missing.includes(gone)) missing.push(gone);
+        for (const file of tree.files) {
+          const abs = scriptPath(root, file);
+          for (const shape of unfollowableShapes(readFileSync(abs, "utf8"))) note({ step: source, file, ...shape });
         }
       }
+    };
+    for (const step of stepList) {
+      const stepId = step.id ?? step.name;
+      for (const payload of stepPayloads(step)) follow(payload, stepId);
       // uses 是 run 之外的第二类载体：认不出的 action 会执行仓库外（或 composite 里）
       // 的代码，静态跟不下去 —— 记 unfollowable，让真 YAML 用例当场红。
       if (typeof step.uses === "string" && !ALLOWED_USES.some((re) => re.test(step.uses))) {
         note({ step: stepId, file: null, kind: "uses", detail: step.uses });
       }
     }
+    // job 级载体与 step 载荷是同一个执行面：它们的脚本不进扫描面时，
+    // 「没有别的读者」会退化成「这一个位置没扫到」。
+    for (const payload of options.jobPayloads ?? []) follow(payload, payload.carrier);
     return { files, missing, unfollowable };
   }
 
@@ -1400,6 +1480,20 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         }
       }
     }
+    // job 级载体（job.env.* / defaults.run.shell / 顶层 env）执行到的脚本同样进这一格：
+    // 读者搬到 job 上，字段名判据也得跟得上，否则它只是换了个字段名判据看不见的位置。
+    for (const payload of options.jobPayloads ?? []) {
+      for (const entry of payloadScriptRefs(payload, { root }).refs) {
+        if (writers.includes(entry)) continue;
+        for (const rel of scriptTree(root, entry).files) {
+          const text = readFileSync(scriptPath(root, rel), "utf8");
+          for (const { field, re } of FIELD_READERS) {
+            const hit = text.split("\n").find((line) => re.test(line));
+            if (hit) violations.push({ file: rel, field, excerpt: hit.trim() });
+          }
+        }
+      }
+    }
     return violations;
   }
 
@@ -1415,7 +1509,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
 
   // result.json 的落盘写法：口径层用 --out，兜底步用 writeFileSync 补写。
   // 它们是**允许的读者/写者**，而且放行单位是「步」不是「文件」：同一份口径层脚本被
-  // 另一个 step 引用时，那个 step 仍然是读者，必须红。所以按步检测「写」，再整步放行。
+  // 另一个 step 引用时，那个 step 仍然是读者，必须红。所以按步检测「写」；
+  // 步内再按**一次读**放行（见 resultJsonReaderViolations），不是整步免检。
   const RESULT_JSON_WRITE = [
     /--out\s+\.audit\/result\.json/,
     /writeFileSync\s*\(\s*["']\.audit\/result\.json["']/,
@@ -1443,22 +1538,93 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       .map((step) => step.id ?? step.name);
   }
 
-  // 行为判据的违规：碰了 result.json 的数据、却不是写它那一步。
-  // 报错带上载体（run / with.script / env.NODE_OPTIONS / 脚本文件），不是一个布尔。
+  // 把 result.json 路径当参数交给一个函数，也是在把它当数据取用 —— 哪怕解析动作藏在
+  // 包装函数里（兜底步的 read(p) 就是这种形状：那一行只有 JSON.parse 在函数定义处）。
+  // 不认这一形态，兜底步的合法读就数不到，「一次读」的额度会被一次额外读白白占掉。
+  const RESULT_JSON_PATH_CALL = /[A-Za-z_$][\w$]*\s*\(\s*["'][^"']*result\.json["']/;
+
+  // 一次「数据读」= 同一行里既有 result.json 路径、又把它当数据取用（且不是写）。
+  // 按行数的意义：放行单位是**一次读**，不是一整段文本 —— 一段里两次读就是两次。
+  function resultJsonReads(text) {
+    const reads = [];
+    for (const line of String(text).split("\n").map(stripShellComment)) {
+      if (RESULT_JSON_WRITE.some((re) => re.test(line))) continue;
+      if (!RESULT_JSON.test(line)) continue;
+      if (!RESULT_JSON_DATA_READ.test(line) && !RESULT_JSON_PATH_CALL.test(line)) continue;
+      reads.push(line.trim());
+    }
+    return reads;
+  }
+
+  // 「整体枚举整份 result」：把 result.json 解析成对象之后整份过一遍。
+  // 识别对象必须与「解析 result.json 的那个变量」绑定 —— 写者也会 JSON.stringify 自己拼的
+  // payload，那不是这条的形状。口径层只按字段取用，出现一次就说明它在搬数据而不是产出数据。
+  const RESULT_VAR_DECL = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^\n]*result\.json/g;
+  const WHOLE_ENUM_CALL = /(?:Object\.(?:entries|keys|values)|JSON\.stringify)\s*\(\s*([A-Za-z_$][\w$]*)/g;
+
+  function wholeResultEnumerations(text) {
+    const source = String(text);
+    const resultVars = [...source.matchAll(RESULT_VAR_DECL)].map((match) => match[1]);
+    if (resultVars.length === 0) return [];
+    const found = [];
+    for (const line of source.split("\n").map(stripShellComment)) {
+      for (const match of line.matchAll(WHOLE_ENUM_CALL)) {
+        if (resultVars.includes(match[1]) && !found.includes(line.trim())) found.push(line.trim());
+      }
+    }
+    return found;
+  }
+
+  // job 级载体被执行到的文本（含跟随到的脚本文件）：来源名指在 job 上（job.env.NODE_OPTIONS /
+  // defaults.run.shell / env.KEY），where 指真正坐着那行代码的位置。
+  function jobPayloadTexts(jobPayloadList, options = {}) {
+    const root = options.root ?? ROOT;
+    const texts = [];
+    for (const payload of jobPayloadList) {
+      texts.push({ source: payload.carrier, where: payload.carrier, text: payload.text });
+      for (const rel of payloadScriptRefs(payload, { root }).refs) {
+        for (const file of scriptTree(root, rel).files) {
+          const abs = scriptPath(root, file);
+          if (abs && existsSync(abs)) texts.push({ source: payload.carrier, where: file, text: readFileSync(abs, "utf8") });
+        }
+      }
+    }
+    return texts;
+  }
+
+  // 行为判据的违规：碰了 result.json 的数据、却不是**那一次**合法的读。
+  // 报错带上载体（run / shell / with.script / env.NODE_OPTIONS / 脚本文件），不是一个布尔。
+  //
+  // 写者步的放行从「整步」收到「一次读」：写者步只保留与写同源的那一次，
+  // 多出来的每一次都是读者；再额外禁止把整份 result 整体枚举。
+  // 整步放行等于「这一步只要写得了，挂什么读者都行」—— 兜底步里再挂一处 Object.entries dump
+  // 实测 87 条全绿，就是把豁免单位错设成步的结果。
+  //
+  // job 级载体对每个 step 都生效，没有「写它的那一步」可以豁免，所以整份都是读者候选。
   function resultJsonReaderViolations(stepList, options = {}) {
     const root = options.root ?? ROOT;
+    const producers = resultWriters(stepList, { root });
     const violations = [];
+    for (const { source, where, text } of jobPayloadTexts(options.jobPayloads ?? [], { root })) {
+      for (const excerpt of resultJsonReads(text)) violations.push({ step: source, where, excerpt });
+      for (const excerpt of wholeResultEnumerations(text)) violations.push({ step: source, where, excerpt });
+    }
     for (const step of stepList) {
       const source = step.id ?? step.name;
       const texts = stepTexts(step, { root });
-      if (texts.some(({ text }) => RESULT_JSON_WRITE.some((re) => re.test(text)))) continue;
+      const writes = texts.some(({ text }) => RESULT_JSON_WRITE.some((re) => re.test(text)));
+      const reads = texts.flatMap(({ where, text }) => resultJsonReads(text).map((excerpt) => ({ where, excerpt })));
+      if (!writes) {
+        for (const read of reads) violations.push({ step: source, ...read });
+        continue;
+      }
+      // 与写同源的那一次放行：正好一次读时这里什么都不报；多出来的读每一次都报。
+      for (const read of reads.slice(1)) violations.push({ step: source, ...read });
+      // 整体枚举一条也不放行。写者自己的脚本文件（texts 里 where 就是生产者本身）除外：
+      // 那份文件就是「与写同源」的那一份，它的按字段取用不该被当成搬运。
       for (const { where, text } of texts) {
-        if (!RESULT_JSON.test(text) || !RESULT_JSON_DATA_READ.test(text)) continue;
-        const excerpt = text
-          .split("\n")
-          .map((line) => line.trim())
-          .find((line) => RESULT_JSON.test(line) && RESULT_JSON_DATA_READ.test(line));
-        violations.push({ step: source, where, excerpt: excerpt ?? text.split("\n").find((l) => l.trim()) ?? "" });
+        if (producers.includes(where)) continue;
+        for (const excerpt of wholeResultEnumerations(text)) violations.push({ step: source, where, excerpt });
       }
     }
     return violations;
@@ -1541,13 +1707,13 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 兜底补出来的 {verdict,conclusion,exit,reason} 缺 executors / comparison；
     // 只要解引用这两个字段的读者只有口径层（在本步之前、只跑一次），它就不是活路径。
     // 报错要能直接看出「哪个 step、匹配到哪一行、哪个字段」，不是一个布尔。
-    const violations = fieldReadViolations(steps);
+    const violations = fieldReadViolations(steps, { jobPayloads: carrierPayloads });
     // 来源可以是 run 块（step）也可以是 run 块里被执行的脚本（file）：两者都算读者。
     const readers = [...new Set(violations.map((v) => v.step ?? v.file))];
     expect(readers, JSON.stringify(violations, null, 2)).toEqual(["decide"]);
     // 扫描面确实覆盖到了 run 块里被执行的脚本：引用解析不到就是扫描面漏了一格，
     // 那时「没有别的读者」会退化成「没扫到」，必须当成 harness 的错。
-    const scripts = referencedScripts(steps);
+    const scripts = referencedScripts(steps, { jobPayloads: carrierPayloads });
     expect(scripts.missing, JSON.stringify(scripts.missing)).toEqual([]);
     // 跟不下去的形态同样必须为零：未知写法被静默跳过，正是这一批绕过面的共同根因。
     // 口径层与落盘槽都不派生进程、不拼键，这条断言在真仓库上不该有任何豁免。
@@ -1557,7 +1723,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(resultWriters(steps)).toEqual(["scripts/audit-findings.mjs"]);
     // 行为判据（不认字段名）：任何碰 result.json 数据的步，都必须是写它的那一步。
     // 只写 Object.entries 枚举、不写任何字段名的读者，在这里没有藏身处。
-    const behaviorReaders = resultJsonReaderViolations(steps);
+    const behaviorReaders = resultJsonReaderViolations(steps, { jobPayloads: carrierPayloads });
     expect(behaviorReaders, JSON.stringify(behaviorReaders, null, 2)).toEqual([]);
     // 正向对照：确实有步在写 result.json。少了这条，上面那条会退化成「谁都没碰这个文件」。
     expect(resultJsonWriterSteps(steps)).toEqual(["decide", "fallback"]);
@@ -2409,4 +2575,174 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       unfollowable: [],
     });
   });
+
+describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () => {
+  it("缺陷1：豁免单位是一次读不是一整步 —— 兜底步里再挂第二处读必须红", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-read-budget-"));
+    // 与真 workflow 同形：读**一次** result.json 取结论，再写回同一份 —— 那一次读与写同源。
+    const legal = [
+      "node -e '",
+      'const r = JSON.parse(fs.readFileSync(".audit/result.json", "utf8"));',
+      'fs.writeFileSync(".audit/result.json", JSON.stringify({ verdict: r.conclusion ?? "INFRA" }));',
+      "'",
+      "echo done",
+    ].join("\n");
+    const fallback = { id: "fallback", run: legal };
+    expect(resultJsonWriterSteps([fallback])).toEqual(["fallback"]);
+    expect(resultJsonReaderViolations([fallback], { root: dir })).toEqual([]);
+
+    // 审查实测的变异：在同一个兜底步末尾再挂一处读，零字段名地打印 key/value。
+    // 旧判据（整步豁免）在这里 87 条全绿 —— 红绿只差「醒不醒豁免」，不是差有没有读到。
+    const second = 'const also = JSON.parse(fs.readFileSync(".audit/result.json", "utf8"));';
+    const mutated = { id: "fallback", run: [legal, second, "console.log(also.conclusion);"].join("\n") };
+    // 它仍然写 result.json：不是靠「不写了」把豁免躲掉的。
+    expect(resultJsonWriterSteps([mutated])).toEqual(["fallback"]);
+    expect(resultJsonReaderViolations([mutated], { root: dir })).toEqual([
+      { step: "fallback", where: "run", excerpt: second },
+    ]);
+  });
+
+  it("缺陷1：writer 步把整份 result 整体枚举 / 整体 dump 必须红（一个字段名都不写）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-enum-ban-"));
+    const build = (extra) =>
+      [
+        "node -e '",
+        'const r = JSON.parse(fs.readFileSync(".audit/result.json", "utf8"));',
+        'fs.writeFileSync(".audit/result.json", JSON.stringify({ verdict: r.conclusion ?? "INFRA" }));',
+        extra,
+        "'",
+      ].join("\n");
+    for (const extra of [
+      "for (const [k, v] of Object.entries(r)) console.log(k, v);",
+      "console.log(Object.keys(r).length, Object.values(r).length);",
+      "console.log(JSON.stringify(r));",
+    ]) {
+      const step = { id: "fallback", run: build(extra) };
+      // 一个字段名都没有：字段名判据在这条上完全是绿的，红的是「整份搬走」本身。
+      expect(step.run).not.toMatch(/executors|comparison|counts/);
+      expect(resultJsonReaderViolations([step], { root: dir }), extra).toEqual([
+        { step: "fallback", where: "run", excerpt: extra },
+      ]);
+    }
+    // 排除写法本身：整体枚举的对象不是从 result.json 解出来的，不算这条。
+    const other = { id: "fallback", run: build('console.log(JSON.stringify({ verdict: "INFRA" }));') };
+    expect(resultJsonReaderViolations([other], { root: dir })).toEqual([]);
+  });
+
+  it("缺陷2：job 级 env 是同一个执行面 —— --require 进来的模块读 result.json 必须红", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-job-env-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    const reader = 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.verdict, r.executors.length);\n';
+    writeFileSync(join(dir, "scripts/probe-jobenv.cjs"), reader);
+    const job = {
+      env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", NODE_OPTIONS: "--require ./scripts/probe-jobenv.cjs" },
+      steps: [{ id: "ok", run: "echo ok\n" }],
+    };
+    const carriers = jobPayloads(job, { jobs: { "audit-runner": job } });
+    expect(carriers.map((payload) => payload.carrier)).toEqual(["job.env.GH_TOKEN", "job.env.NODE_OPTIONS"]);
+    // 跟得下去、不缺失、不当成跟不下去的形态 —— 它是载体，不是盲区。
+    expect(referencedScripts(job.steps, { root: dir, jobPayloads: carriers })).toEqual({
+      files: ["scripts/probe-jobenv.cjs"],
+      missing: [],
+      unfollowable: [],
+    });
+    // 两道判据都要在 job 载体上生效：字段名判据 + 行为判据。
+    expect(fieldReadViolations([], { root: dir, jobPayloads: carriers }).map((v) => v.file)).toEqual([
+      "scripts/probe-jobenv.cjs",
+    ]);
+    expect(resultJsonReaderViolations([], { root: dir, jobPayloads: carriers })).toEqual([
+      {
+        step: "job.env.NODE_OPTIONS",
+        where: "scripts/probe-jobenv.cjs",
+        excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
+      },
+    ]);
+    // 反例：job env 里只有凭据，不造引用也不出违规。
+    const plain = jobPayloads({ env: { GH_TOKEN: "x" }, steps: [] }, {});
+    expect(plain.map((payload) => payload.carrier)).toEqual(["job.env.GH_TOKEN"]);
+    expect(referencedScripts([], { root: dir, jobPayloads: plain })).toEqual({
+      files: [],
+      missing: [],
+      unfollowable: [],
+    });
+    expect(resultJsonReaderViolations([], { root: dir, jobPayloads: plain })).toEqual([]);
+    expect(jobPayloads({ steps: [] }, { jobs: {} })).toEqual([]);
+  });
+
+  it("缺陷2b：step 的 shell: 字段本身携带命令，里面的 node 脚本必须进扫描面", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-step-shell-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    const body = 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.verdict, r.executors.length);\n';
+    writeFileSync(join(dir, "scripts/probe-read.mjs"), body);
+    const step = { id: "read", shell: "bash -c 'node scripts/probe-read.mjs' {0}", run: "echo done\n" };
+    // shell 是**执行面**不是说明文字：载体必须收它，且排在 run 之后。
+    expect(stepPayloads(step).map((payload) => payload.carrier)).toEqual(["run", "shell"]);
+    expect(stepScriptRefs(step, { root: dir })).toEqual(["scripts/probe-read.mjs"]);
+    expect(referencedScripts([step], { root: dir })).toEqual({
+      files: ["scripts/probe-read.mjs"],
+      missing: [],
+      unfollowable: [],
+    });
+    expect(fieldReadViolations([step], { root: dir }).map((v) => v.file)).toEqual(["scripts/probe-read.mjs"]);
+    expect(resultJsonReaderViolations([step], { root: dir })).toEqual([
+      {
+        step: "read",
+        where: "scripts/probe-read.mjs",
+        excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
+      },
+    ]);
+    // 引用解析不到也留在 missing 里：静默丢弃正是这一批绕过的共同根因。
+    const gone = { id: "gone", shell: "bash -c 'node scripts/gone.mjs' {0}", run: "echo ok\n" };
+    expect(referencedScripts([gone], { root: dir }).missing).toEqual(["scripts/gone.mjs"]);
+    // 反例：shell 里跑的不是 node、也没有 ./ 形态的脚本，不造引用。
+    expect(referencedScripts([{ id: "plain", shell: "bash -e {0}", run: "echo ok\n" }], { root: dir })).toEqual({
+      files: [],
+      missing: [],
+      unfollowable: [],
+    });
+    // 真 workflow 的 step 都不带 shell：这一格只能是新增，不能把既有面染红。
+    const doc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
+    const realSteps = doc.jobs["audit-runner"].steps;
+    expect(realSteps.filter((s) => typeof s.shell === "string")).toEqual([]);
+  });
+
+  it("缺陷2c：job 的 defaults.run.shell 与 workflow 级 env 同样进扫描面", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-job-defaults-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    const body = 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.verdict, r.executors.length);\n';
+    writeFileSync(join(dir, "scripts/probe-read.mjs"), body);
+    writeFileSync(join(dir, "scripts/probe-jobenv.cjs"), body);
+    const job = {
+      defaults: { run: { shell: "bash -c 'node scripts/probe-read.mjs' {0}" } },
+      steps: [{ id: "ok", run: "echo ok\n" }],
+    };
+    const carriers = jobPayloads(job, {});
+    expect(carriers.map((payload) => payload.carrier)).toEqual(["defaults.run.shell"]);
+    expect(referencedScripts(job.steps, { root: dir, jobPayloads: carriers }).files).toEqual([
+      "scripts/probe-read.mjs",
+    ]);
+    expect(resultJsonReaderViolations(job.steps, { root: dir, jobPayloads: carriers })).toEqual([
+      {
+        step: "defaults.run.shell",
+        where: "scripts/probe-read.mjs",
+        excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
+      },
+    ]);
+    // workflow 顶层 env 与 job env 同族：位置更高不等于执行面更远。
+    const docEnv = jobPayloads({}, { env: { NODE_OPTIONS: "--require ./scripts/probe-jobenv.cjs" } });
+    expect(docEnv.map((payload) => payload.carrier)).toEqual(["env.NODE_OPTIONS"]);
+    expect(resultJsonReaderViolations([], { root: dir, jobPayloads: docEnv }).map((v) => v.step)).toEqual([
+      "env.NODE_OPTIONS",
+    ]);
+    // 真 workflow 的 job 级载体只有一行凭据，且不派生任何脚本引用。
+    const realDoc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
+    const realCarriers = jobPayloads(realDoc.jobs["audit-runner"], realDoc);
+    expect(realCarriers.map((payload) => payload.carrier)).toEqual(["job.env.GH_TOKEN"]);
+    expect(referencedScripts(realDoc.jobs["audit-runner"].steps, { jobPayloads: realCarriers }).unfollowable).toEqual(
+      [],
+    );
+    expect(resultJsonReaderViolations(realDoc.jobs["audit-runner"].steps, { jobPayloads: realCarriers })).toEqual([]);
+  });
+});
+
 });
