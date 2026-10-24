@@ -58,7 +58,21 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **删掉的**：`.audit/changed-paths.txt`。全仓库只有产出它的那一行，`audit-findings.mjs` 不读——死取数，却能在 `gh` 失败时赶在 POST Check Run 之前把 job 掐死。
 
-**尚未解决（跨模块，留给 P-14 全量）**：`scripts/merge-gate.mjs` 的 G3 把 `conclusion !== success` 一律判 `E_CHECK_NOT_GREEN`，所以 audit 的 `action_required`（INFRA）在门这一层与真 FAIL 同形，与「INFRA 不计入合并判据」的契约文字相冲突。audit 现在不挂 PR 触发、也不是 required check，所以还咬不到人；一旦挂上就是在门里判「判不了 = 不合格」。要么 G3 给 INFRA 单开一档，要么 audit 的 INFRA 不落成 Check Run——二选一必须在打开触发面之前决定。
+**已决策（B）：判不了与判成不合格分两档**（下面这段原话曾被判为「还咬不到人」，证据见后，判为不成立）——
+
+> 曾被写下、已被推翻的判断：「**尚未解决（跨模块，留给 P-14 全量）**：`scripts/merge-gate.mjs` 的 G3 把 `conclusion !== success` 一律判 `E_CHECK_NOT_GREEN`，所以 audit 的 `action_required`（INFRA）在门这一层与真 FAIL 同形，与「INFRA 不计入合并判据」的契约文字相冲突。audit 现在不挂 PR 触发、也不是 required check，所以还咬不到人；一旦挂上就是在门里判「判不了 = 不合格」。要么 G3 给 INFRA 单开一档，要么 audit 的 INFRA 不落成 Check Run——二选一必须在打开触发面之前决定。」
+
+**推翻它的证据**（审查执行器 review-b 拿真门复跑）：G3 枚举该 sha 上**所有** check run，根本不依赖 required 注册，所以「挂 required 之前咬不到人」不成立。基线全绿 `exit=0 PASS`；只加一条 `audit(completed/action_required)` 就 `exit=1 FAIL E_CHECK_NOT_GREEN 不是绿的 1 项`；只加 `audit-runner(completed/failure)` 同样 `exit=1`；两者都在（一次真 INFRA 的产物）`exit=1 不是绿的 2 项`。门把「没有判过」读成了「判成不合格」。
+
+决策（B）三条：
+
+1. **契约文字改口径，而不是改方向**：`INFRA ≠ 不合格` 保留，但补齐为 `INFRA 计入「未判过」，因此不放行合并`。平台不给第三态放行，required check 只有 success / failure 两档；于是「未判过」必须继续挡住合并，只是**不许把它说成「代码不合格」**——两档都阻断，区别只在责任方向（去改代码 vs 去看管线）。
+2. **判定退出码三个写者，口径必须一致**（`success -> 0` / `failure -> 1` / `action_required -> 0`）：① POST 出去的 `audit` Check Run 的 conclusion，是结论的唯一载体；② job 级 check `audit-runner` 的 exit code，是**冗余信号**，只回答「这个 job 有没有出逻辑故障」，所以 `action_required` 不给它染红——让它红，G3 就会把「未判过」读成「代码不合格」，同一事实两个写者互相矛盾；③ merge-gate G3 读到的 conclusion。三者「一致」的定义不是「都红」，而是「不会互相矛盾」。
+
+   缺结论仍然不等于通过：口径层崩溃或未运行时，**结论兜底**补一条 `action_required`（写 `$GITHUB_STEP_SUMMARY` + `::error`）；「回写 Check Run」与「判不了：回写 INFRA」都加 `always()`，前置步骤红了照样写 Check Run；POST 失败不吞——那一步真红，因为「该留痕没留成」是一次真故障。
+3. **G3 分两档**：真失败 `{failure, timed_out, startup_failure, cancelled}` -> `E_CHECK_NOT_GREEN`（exit 1，文案「不是绿的 N 项」）；未判过 `{action_required, neutral, skipped, stale}` 以及枚举以外的 completed 结论 -> `E_CHECK_NOT_JUDGED`（exit 3，文案「N 项没有判过（不是判成不合格），未判过不允许合并」，逐项点名 `name(id) status/conclusion`）；两档同时存在时真失败优先（exit 1），但明细里两类分开数。既有的三条行为不动：自己不算进 required checks、同名取 id 最大、pending（未 completed）先判未就绪。未结 INFRA 记录（`E_INFRA_OPEN`）随之归「未判过」——两类 INFRA 都阻断合并，区别只在「是不是代码的问题」。
+
+**变异验证**：把 G3 的分类改回 `conclusion !== success` 一刀切，真失败档与两档并存两条用例必须红；把 `scripts/audit-slot.mjs` 的 realpath 入口改回字面比较，软链用例必须红（`exit 0` 但 `--out` 没写出来）。
 
 **验收证据**：`npm run check` 13 files / 204 tests 全绿；PR #10 上 `check / merge-gate / render / write` 四条真 check 全 pass，issue 被写者带到 `state:in-progress`。
 
@@ -78,3 +92,6 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **教训**：变异测试的备份用 `cp`，不要用 `git checkout` 去还原一个**工作区里有未提交正修**的文件；我这么干过一次，把四处正修一起回滚了，只能重放 patch。
 
 **验收证据**：`npm run check` 13 files / 207 tests 全绿；`npx oxlint scripts tests` 0 warnings 0 errors（原本有 5 条，是我上一轮引入的空 fallback spread 与未使用导入）。
+
+
+**接受了的一个残余（第四写者，不改）**：GitHub 的 job 结论不由「判定」步决定 —— 任一前置步骤（checkout / node / 两个「落盘」）红了，`audit-runner` 仍是 `failure`，而 `audit` Check Run 被兜底写成 `action_required`，于是 G3 走「真失败优先」并点名 `audit-runner`。彻底对齐要把两个「落盘」步也改成「失败即写 INFRA 记录」。不改的理由：这两步能红的场景是**管线真的坏了**（node 起不来、磁盘写不进），不是输入不合格 —— 输入不合格时 `audit-slot.mjs` 自己会写 INFRA 记录、步骤是绿的。那种情况下 job 红 + G3 点名 `audit-runner` 恰好把人引到日志里看真故障；把它改成绿的 INFRA 反而是「管线坏了也判成没判过」，比现在更糟。这条写在这里是为了下次看到 `audit-runner` 被点名时不去改分类。

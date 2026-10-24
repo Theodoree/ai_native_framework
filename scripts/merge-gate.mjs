@@ -12,13 +12,17 @@
 //                      —— 引用解析复用 build-intent.mjs 的 resolveIssueRefs，门牌靠 git cat-file 取证
 //   G3 checks          PR head 的 check runs 全绿，且没有未结 INFRA
 //                      —— 上游 JSON 注入，同名多次运行只看最新一次（旧绿不给新红背书）
+//                      —— 「判成不合格」与「没有判过」分成两档（见 guardChecks）
 //   G4 last-change     门牌写着本 PR 编号 —— 表格格式复用 last-change.mjs 的渲染器
 //
 // 「拒绝」与「未就绪」是两件事，退出码必须分开（真 PR 上四条同红时读不出根因，就是
 // 因为两者被混成一种红）：
 //   FAIL    = 这一笔本身不合格（issue 状态不允许、门牌撒谎、检查项 failure/cancelled…）
-//   INFRA   = 现在还判不了：门牌的生产者还没写完、别家检查还在跑、输入取不到
+//   INFRA   = 现在还判不了：门牌的生产者还没写完、别家检查还在跑、输入取不到、
+//             审计报 INFRA（action_required）、有未结 INFRA 记录
 // 所有「未就绪」的判定一律 exit 3、绝不当通过；stdout 的汇总行把两者分开计数。
+// 「没有判过」与「判成不合格」都阻断合并（required check 只有 success/failure 两档，
+// 平台没有第三态放行），区别只在责任方向：前者去看管线，后者去改代码。
 //
 // 门的结论必须建立在「门牌已由生产者写完」之后。生产者的完成信号是它自己的 check run
 // （last-change 的 job 名，脚本常量 PRODUCER）：job 完成 ⟹ 写回步骤已经跑完。只在生产者
@@ -285,9 +289,23 @@ function normalizeInfra(input) {
   return list;
 }
 
-// 「还没跑完」和「跑完是红的」是两种结论：
+// 「还没跑完」「没有判过」「判成不合格」是三种结论，不能混成一档：
 //   未完成（queued/in_progress/…）→ 未就绪，exit 3：别家检查在跑不是不合格，是还判不了
-//   completed 且非 success（failure/cancelled/timed_out/skipped/…）→ 真失败，exit 1
+//   completed 且结论可归因于代码 → 真失败，exit 1：这一笔的问题，去改代码
+//   completed 但结论说不清代码好还是坏（audit 的 INFRA / neutral / skipped / …）
+//     → 没有判过，exit 3：同样阻断合并（平台没有第三态放行），但不许被说成「代码不合格」
+// 「未判过也阻断」不是保守，是 contract：把没判过读成通过，等于让「没跑到」冒充「跑到并通过」。
+const CHECK_FAILED = ["failure", "timed_out", "startup_failure", "cancelled"];
+// action_required 是 audit 的 INFRA 结论（见 scripts/audit-findings.mjs 的文件头）；
+// neutral / skipped 在平台的 required check 语义里被视为通过 —— 门不信这一套：
+// 它们都只是「没有给出结论」，不是「给了一个通过的结论」。
+const CHECK_NOT_JUDGED = ["action_required", "neutral", "skipped", "stale"];
+// 分档的唯一家：枚举外的结论一律落到「未判过」（认不出 ≠ 通过，也不等于不合格）。
+const VERDICT_OF = new Map([
+  ["success", "pass"],
+  ...CHECK_FAILED.map((c) => [c, "failed"]),
+  ...CHECK_NOT_JUDGED.map((c) => [c, "not-judged"]),
+]);
 // 自己不能给自己背书：check 名就是我们自己（CHECK）的那条一律不看 —— 要求「自己已经绿」
 // 是逻辑死结（本 job 此刻必然 in_progress），把它算进去就等于永远红。
 function guardChecks(ctx) {
@@ -322,15 +340,29 @@ function guardChecks(ctx) {
       "E_CHECK_PENDING",
       `${pending.length} 项还没跑完: ${pending.map(label).join(", ")} —— 等它们出结论再算`,
     );
-  const bad = others.filter((r) => r.conclusion !== "success");
-  if (bad.length)
+  // 枚举以外的 completed 结论也归「未判过」：门只对枚举得出的失败下判断，
+  // 认不出的结论不许被读成通过，也不许被说成「代码不合格」。
+  const verdictOf = (r) => VERDICT_OF.get(String(r.conclusion)) ?? "not-judged";
+  const failed = others.filter((r) => verdictOf(r) === "failed");
+  const unjudged = others.filter((r) => verdictOf(r) === "not-judged");
+  const unjudgedWord = (list) =>
+    `${list.length} 项没有判过（不是判成不合格，但未判过不允许合并）: ${list
+      .map(label)
+      .join(", ")}`;
+  // 两类同时存在时真失败优先（可动手的部分已经明确，exit 1），
+  // 但两类必须分开数：混成一句「不是绿的 N 项」会让读者去查不存在的缺陷。
+  if (failed.length)
     throw reject(
       "E_CHECK_NOT_GREEN",
-      `不是绿的 ${bad.length} 项: ${bad.map(label).join(", ")}`,
+      `不是绿的 ${failed.length} 项: ${failed.map(label).join(", ")}` +
+        (unjudged.length ? `；另有 ${unjudgedWord(unjudged)}` : ""),
     );
+  if (unjudged.length) throw infra("E_CHECK_NOT_JUDGED", unjudgedWord(unjudged));
   const open = normalizeInfra(ctx.infra);
+  // 未结 INFRA 记录属于「某件事还没判过」，不是「代码不合格」：它照样阻断合并，
+  // 归 INFRA 而不是 FAIL —— 区别只在责任方向（去修 PR 还是去看管线）。
   if (open.length)
-    throw reject(
+    throw infra(
       "E_INFRA_OPEN",
       `还有 ${open.length} 条未结 INFRA: ${open
         .map((i) => i?.id ?? JSON.stringify(i))

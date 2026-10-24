@@ -10,9 +10,26 @@ name: audit
 #
 # 路由（哪家模型）不在 CI 里：本文件只出现逻辑名 review-a / review-b，真源在
 # .agents/platform/routing.yml（docs/audit-contract.md 四）。
-
+#
+# 判定步骤的退出码有三个写者，口径必须一致（success -> 0、failure -> 1、
+# action_required -> 0）：
+#   1) POST 出去的 audit Check Run 的 conclusion —— 结论的唯一载体；
+#   2) job 级 check audit-runner 的 exit code —— 冗余信号：只回答「这个 job 有没有出
+#      逻辑故障」，不回答「代码合不合格」。所以 action_required 不给它染红：
+#      让它红，merge-gate 的 G3 就会把「未判过」读成「代码不合格」，
+#      同一事实两个写者互相矛盾；
+#   3) merge-gate G3 读到的 conclusion —— 真失败（failure / timed_out /
+#      startup_failure / cancelled）与未判过（action_required / neutral /
+#      skipped / stale）分两档，两档都阻断合并，区别只在责任方向。
+# 「一致」的定义不是「都红」，而是「不会互相矛盾」：Check Run 说判不了时，
+# job 级 check 不许说这一笔不合格。
+#
+# 服务器上一定有一条 audit Check Run：口径层崩了 / 没跑也一样。缺结论的形态是
+# 「结论兜底」补一条 action_required —— 缺结论绝不等于通过（P-13 的 schema 不合格、
+# 脚本崩溃都落在这条路径上）。
+#
 # 触发面刻意只有手动：手动 dispatch 时由 inputs 注入两个执行器的 findings（真跑用），
-# 不注入就落 INFRA。不挂 pull_request 的理由是 merge-gate 的 G3 要求每个非自身 check 都是
+# 不注入就落 INFRA。不挂 pull_request 的理由是 merge-gate 的 G3 要求每个非自身 check 都
 # success，于是一个可能产出 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
 # 那是结构性死锁，而且会训练人忽略红灯。等上游真执行器能保证「PR 事件一律有结论」之后再
 # 打开 pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
@@ -114,13 +131,17 @@ jobs:
         run: |
           AUDIT_INPUT="$AUDIT_FINDINGS_B" node scripts/audit-slot.mjs --slot review-b --executor github --out .audit/review-b.json
 
-      - name: verdict
+      # 这一步永不失败（set +e + 最后 exit 0）：口径层的判不了是一种结论，
+      # 不是一种故障。失败只体现在 result.json / check-run.json 有没有落地，
+      # 由「结论兜底」补、由「判定」按结论定 job 的红绿 —— 混在一步里做，
+      # 就会重演「脚本崩了但步骤绿、且没有 conclusion」。
+      - name: 口径层判定
         id: decide
         if: steps.ctx.outputs.ok == '1'
         run: |
           set +e
           node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json
-          code=$?
+          set -e
           node -e '
             const fs = require("node:fs");
             const r = JSON.parse(fs.readFileSync(".audit/result.json", "utf8"));
@@ -128,8 +149,15 @@ jobs:
             const lines = [];
             for (const e of r.executors) lines.push(e.slot + ": 申报=" + e.declared + " 计入=" + e.effective + " schema=" + (e.valid ? "ok" : "不合格") + " findings=" + e.findings.length);
             if (r.comparison) lines.push("agreed=" + r.comparison.counts.agreed + " onlyA=" + r.comparison.counts.onlyA + " onlyB=" + r.comparison.counts.onlyB + " severityMismatch=" + r.comparison.counts.severityMismatch);
+            // 三个写者的口径（见文件头）：success->0、failure->1、action_required->0。
+            // action_required 不给 job 染红 —— 结论的红已经由 audit Check Run 承载，
+            // job 再红一次，G3 就会把「未判过」读成「代码不合格」。
+            // 认不出的 conclusion 退 3：那是口径层坏了，管线故障不能装作没事。
+            const JOB_EXIT = { success: 0, failure: 1, action_required: 0 };
+            const exit = Object.hasOwn(JOB_EXIT, r.conclusion) ? JOB_EXIT[r.conclusion] : 3;
             fs.appendFileSync(out, "verdict=" + r.verdict + "\n");
             fs.appendFileSync(out, "conclusion=" + r.conclusion + "\n");
+            fs.appendFileSync(out, "exit=" + exit + "\n");
             fs.writeFileSync(".audit/check-run.json", JSON.stringify({
               name: "audit",
               head_sha: process.env.AUDIT_SHA,
@@ -138,13 +166,82 @@ jobs:
               output: { title: "audit " + r.verdict, summary: lines.join("\n").slice(0, 60000) },
             }));
           '
-          echo "exit=$code" >> "$GITHUB_OUTPUT"
           exit 0
         env:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
 
-      - name: Check Run
-        if: steps.ctx.outputs.ok == '1'
+      # 口径层崩了 / 没跑 / 写到一半，都不能让「没有结论」变成「看起来没有坏消息」。
+      # 这里补的是**同一条结论**（action_required），不是第二套判据：
+      # 服务器上必须存在一条 audit Check Run，缺结论绝不等价于通过。
+      # 也正因为如此，job 级 check 不为这条补的记录染红（exit=0）——
+      # 结论的红由 Check Run 承载，同一事实只该有一个写者。
+      - name: 结论兜底
+        id: fallback
+        if: always() && steps.ctx.outputs.ok == '1'
+        env:
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
+        run: |
+          set +e
+          node -e '
+            const fs = require("node:fs");
+            const read = (p) => {
+              try {
+                const v = JSON.parse(fs.readFileSync(p, "utf8"));
+                return v && typeof v === "object" ? v : null;
+              } catch {
+                return null;
+              }
+            };
+            const reason = "口径层没有产出结论（脚本崩溃或未运行）";
+            let repaired = false;
+            const result = read(".audit/result.json");
+            if (!result || typeof result.conclusion !== "string") {
+              fs.mkdirSync(".audit", { recursive: true });
+              fs.writeFileSync(".audit/result.json", JSON.stringify({
+                verdict: "INFRA",
+                conclusion: "action_required",
+                exit: 0,
+                reason: reason,
+              }, null, 2) + "\n");
+              repaired = true;
+            }
+            const payload = read(".audit/check-run.json");
+            if (!payload || typeof payload.conclusion !== "string") {
+              fs.writeFileSync(".audit/check-run.json", JSON.stringify({
+                name: "audit",
+                head_sha: process.env.AUDIT_SHA,
+                status: "completed",
+                conclusion: "action_required",
+                output: {
+                  title: "audit INFRA（口径层没有产出结论）",
+                  summary: reason + "：按 INFRA 留痕，别把它读成通过。",
+                },
+              }));
+              repaired = true;
+            }
+            if (!repaired) process.exit(0);
+            // 补出来的结论是 action_required，与口径层同一条口径：job 不染红。
+            if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, "exit=0\n");
+            process.exit(9);
+          '
+          wrote=$?
+          set -e
+          if [[ $wrote -ne 0 ]]; then
+            {
+              echo '## audit: 口径层没有产出结论 → 按 INFRA 留痕，别把它读成通过'
+              echo ''
+              echo '口径层脚本崩溃或没跑到，.audit/result.json 与 Check Run payload 至少有一个没落地。'
+              echo '这里补的是一条 action_required 的 audit Check Run：缺结论不等于通过。'
+              echo 'job 级 check 不为它染红 —— 结论的红由 audit Check Run 承载。'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '::error title=audit INFRA::口径层没有产出结论'
+          fi
+
+      # 不吞错误：POST 失败 = 该留痕没留成，这是一次真故障，步骤必须红。
+      # 前置步骤红了也要照跑（always()）：Check Run 才是结论的唯一载体，
+      # 一个红步骤把它跳过去，就等于「这次判不了」退化成「上次判过了」。
+      - name: 回写 Check Run
+        if: always() && steps.ctx.outputs.ok == '1'
         run: |
           gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
 
@@ -155,11 +252,11 @@ jobs:
             echo '## audit: INFRA（判不了，不是通过）'
             echo ''
             echo '上游执行器没有给出可用结论（超时 / 额度耗尽 / 模型不可达，或 schema 不合格）。'
-            echo 'INFRA 不计入合并判据，但必须落在这里，不许静默当通过。'
+            echo 'INFRA 计入「未判过」，因此不放行合并；但也不许把它读成「代码不合格」。'
             echo ''
-            echo '\`\`\`'
+            echo '```'
             cat .audit/result.json
-            echo '\`\`\`'
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo '::warning title=audit INFRA::判不了，不是通过；详情见本次运行摘要'
 
@@ -167,7 +264,7 @@ jobs:
       # 但落点是**猜的**（GITHUB_SHA = dispatch ref 的提交），所以标题与摘要都写明这一点，
       # 别写成「已经在正确的位置留过痕」。
       - name: 判不了：回写 INFRA
-        if: steps.ctx.outputs.ok != '1'
+        if: always() && steps.ctx.outputs.ok != '1'
         env:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
         run: |
@@ -201,11 +298,30 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo '::error title=audit INFRA::判不了：取不到 PR head sha，落点是 dispatch 提交而不是 PR head'
 
-
+      # job 级 check 只回答「这个 job 有没有出逻辑故障」：
+      # 0 = 跑完了（不论结论是 success 还是 action_required；结论的红由 Check Run 承载）
+      # 1 = 结论是 failure（代码不合格，红线一致）
+      # 3 = 口径层与兜底都没给出退出码 —— 结论没落地，绝不能绿
       - name: 判定
-        if: steps.ctx.outputs.ok == '1'
-        run: exit ${{ steps.decide.outputs.exit }}
+        if: always() && steps.ctx.outputs.ok == '1'
+        run: |
+          code='${{ steps.decide.outputs.exit }}'
+          # 口径层被跳过（前一步红了）或崩在写 outputs 之前：退出码由兜底步给。
+          # 它补的是同一条结论（action_required -> 0），不是另一套判据。
+          if [[ -z "$code" ]]; then code='${{ steps.fallback.outputs.exit }}'; fi
+          case "$code" in
+            0 | 1) exit "$code" ;;
+            *)
+              echo '::error title=audit 判定::没有拿到退出码：口径层与兜底都没有落地，不能当作通过'
+              exit 3
+              ;;
+          esac
 
+      # 这条路径的结论同样是 action_required（由「判不了：回写 INFRA」POST 出去），
+      # 所以 job 级 check 也是绿的：结论的红由 Check Run 承载。
+      # 真出故障（POST 失败）时红的是那一步本身，不是这里补的一刀。
       - name: 判定（判不了）
-        if: steps.ctx.outputs.ok != '1'
-        run: exit 3
+        if: always() && steps.ctx.outputs.ok != '1'
+        run: |
+          echo '判不了：结论已由「判不了：回写 INFRA」POST 成 action_required；job 级 check 只回答「有没有出逻辑故障」。'
+          exit 0

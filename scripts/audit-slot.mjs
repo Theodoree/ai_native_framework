@@ -7,7 +7,7 @@
 //
 // 口径（与 scripts/audit-findings.mjs 同源）：判不了写 INFRA 记录，绝不写 pass。
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -58,7 +58,12 @@ function main(argv) {
   return 0;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// 入口判定走 realpath（与 scripts/audit-findings.mjs 的入口同一条规矩）：
+// 检出目录可能是符号链接（worktree、npm link、CI 的挂载点），那时 argv[1] 与
+// import.meta.url 不是同一条字面路径。判不中不是报错而是静默不判定、退出 0 ——
+// 于是 --out 那份记录根本没写出去，而调用方看到的是绿：对门来说这是最坏的失败形态。
+const invoked = process.argv[1] ? realpathSync(process.argv[1]) : undefined;
+if (invoked === realpathSync(fileURLToPath(import.meta.url))) {
   process.exit(main(process.argv.slice(2)));
 }
 

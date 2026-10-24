@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -17,8 +17,10 @@ import {
   assess,
   compareFindings,
   normalizeVerdict,
+  run,
   toCheckConclusion,
   validateResult,
+  workflowExitFor,
 } from "../scripts/audit-findings.mjs";
 
 const ROOT = process.cwd();
@@ -81,10 +83,39 @@ describe("validateResult", () => {
   });
 
   it("占位符 model 不算证据", () => {
-    for (const model of ["", "unknown", "TODO", "n/a", "unset"]) {
+    // pending-* 是本仓自己承认的占位值（见 .agents/platform/routing.yml），
+    // 漏了它，"没跑到" 就能写成 "跑到并通过"。
+    for (const model of [
+      "",
+      "unknown",
+      "TODO",
+      "n/a",
+      "unset",
+      "pending",
+      "pending-review-a",
+      "PENDING-impl",
+    ]) {
       const out = validateResult(result({ evidence: { ...result().evidence, model } }));
       expect(out.ok).toBe(false);
       expect(out.errors.join("\n")).toContain("evidence.model");
+    }
+  });
+
+  it("路由表里声明的 pending-* 一律判不合格（真源：.agents/platform/routing.yml）", () => {
+    // 这一条不引用脚本里的常量表：它读的是仓库声明的占位值本身。
+    // 表只覆盖「你想得到的那几个词」，真源覆盖「仓库实际在用的那几个」。
+    const routes = YAML.parse(readFileSync(join(ROOT, ".agents/platform/routing.yml"), "utf8")).routes;
+    const pending = routes
+      .map((route) => route.model)
+      .filter((model) => typeof model === "string" && /^pending-/i.test(model));
+    expect(pending.length).toBeGreaterThan(0);
+    for (const model of pending) {
+      const declared = result({ evidence: { ...result().evidence, model } });
+      const out = validateResult(declared);
+      expect(out.ok, model).toBe(false);
+      expect(out.errors.join("\n")).toContain("evidence.model");
+      // 口径是「没判过」，不是「判成不合格」。
+      expect(assess({ a: declared }).conclusion).toBe("action_required");
     }
   });
 
@@ -163,6 +194,11 @@ describe("compareFindings", () => {
   });
   it("接受裸 findings 数组", () => {
     expect(compareFindings([shared], [shared]).agreed).toHaveLength(1);
+  });
+  it("非对象元素不参与比对：null/字符串/数组不是一条缺陷，也不许被解引用", () => {
+    const out = compareFindings({ findings: [shared, null, "x", ["y"]] }, { findings: [shared] });
+    expect(out.agreed).toHaveLength(1);
+    expect(out.counts).toEqual({ agreed: 1, onlyA: 0, onlyB: 0, severityMismatch: 0 });
   });
 });
 
@@ -247,6 +283,101 @@ describe("退出码", () => {
     expect(spawned.status).toBe(3);
     expect(spawned.stdout).toContain("读不到输入");
   });
+
+  // 下面三条各自钉一件事：不崩、不伪造注解、两个退出码不混。
+  // 三条都走真进程（spawn 脚本），而不是调一个「测试专用入口」：
+  // 崩溃与输出面是入口 + main 的产物，只测内部函数就等于没测。
+  const seatFor = (body, executor, agent) => ({
+    ...body,
+    evidence: { ...body.evidence, executor, agent },
+  });
+  const runSeats = (a, b) => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-cli-"));
+    const write = (name, body) => {
+      const path = join(dir, name);
+      writeFileSync(path, JSON.stringify(body));
+      return path;
+    };
+    const out = join(dir, "result.json");
+    const spawned = spawnSync(
+      process.execPath,
+      [SCRIPT, "--a", write("a.json", a), "--b", write("b.json", b), "--out", out],
+      { encoding: "utf8" },
+    );
+    return { spawned, out, dir, read: () => JSON.parse(readFileSync(out, "utf8")) };
+  };
+
+  it("findings 里有 null 元素：不崩，schema 不合格落 INFRA，且照样写出 result.json", () => {
+    // 崩掉的代价不是「少打一行」：没有 result.json，workflow 既写不出 Check Run
+    // 也没有 INFRA 留痕，上一个 sha 上的 success 会原样留着 —— 一次失败变成一次假绿。
+    const { spawned, read } = runSeats(
+      seatFor({ ...result(), findings: [finding(), null] }, "sandbox", "review-a"),
+      seatFor({ ...result(), findings: [finding()] }, "github", "review-b"),
+    );
+    expect(spawned.stderr).not.toContain("TypeError");
+    expect(spawned.status).toBe(3);
+    const parsed = read();
+    expect(parsed.conclusion).toBe("action_required");
+    expect(spawned.stdout).toContain("findings[1]: 必须是对象");
+    // 两个码的读者不同：脚本自己 3（INFRA），job 级读到的 exit 是 0（红由 Check Run 承载）。
+    expect(parsed.exit_code).toBe(3);
+    expect(parsed.exit).toBe(0);
+  });
+
+  it("来自输入的换行不许变成第二行，更不许凭空长出一条 :: 注解", () => {
+    const forged =
+      "看着像一条判据\n::error title=forged annotation::pwned\r\n::warning::also forged";
+    const { spawned } = runSeats(
+      seatFor({ ...result(), findings: [finding({ criterion: forged })] }, "sandbox", "review-a"),
+      seatFor(result(), "github", "review-b\n::error::from-agent"),
+    );
+    const lines = spawned.stdout.split("\n");
+    // 一行都不是注解：注解是 stdout 每一行的前缀，一行由输入构造，就是一条伪造注解。
+    expect(lines.filter((line) => line.startsWith("::"))).toEqual([]);
+    // 修法不是把证据丢掉：文本还在，只是被压成一行。
+    const carried = lines.find((line) => line.includes("forged annotation"));
+    expect(carried).toBeDefined();
+    expect(carried).toContain("看着像一条判据");
+    expect(carried).toContain("pwned");
+    expect(carried).toContain("also forged");
+    expect(lines.some((line) => line.includes("from-agent"))).toBe(true);
+  });
+
+  it("两个退出码不混：只有 failure 让 job 红，action_required 不染 job", () => {
+    // job 级 check 不是第二个结论写者：它的红会把「未判过」说成「代码不合格」。
+    expect(workflowExitFor("success")).toBe(0);
+    expect(workflowExitFor("action_required")).toBe(0);
+    expect(workflowExitFor("failure")).toBe(1);
+  });
+});
+
+describe("崩溃兜底", () => {
+  it("任何未预期异常也必须产出 result.json：宁可写一条 INFRA，也不许留空", () => {
+    // 崩溃面最容易被忽略的一处：结论已经算出来了，死在把它写出去的路上。
+    // 用「stdout 写第一行就抛」来注入一个未预期异常，走到的是真入口函数 run()。
+    const dir = mkdtempSync(join(tmpdir(), "audit-crash-"));
+    const a = join(dir, "a.json");
+    writeFileSync(a, JSON.stringify(result()));
+    const out = join(dir, "result.json");
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementationOnce(() => {
+        throw new Error("stdout 挂了");
+      });
+    let code;
+    try {
+      code = run(["--a", a, "--out", out]);
+    } finally {
+      write.mockRestore();
+    }
+    expect(code).toBe(3);
+    const parsed = JSON.parse(readFileSync(out, "utf8"));
+    expect(parsed.conclusion).toBe("action_required");
+    expect(parsed.exit_code).toBe(3);
+    expect(parsed.exit).toBe(0);
+    expect(String(parsed.reason)).toContain("口径层崩溃");
+    expect(String(parsed.reason)).toContain("stdout 挂了");
+  });
 });
 
 describe("跨槽不变式", () => {
@@ -281,8 +412,15 @@ describe("wiring: .github/workflows/audit.yml", () => {
     expect(job.name).toBe("audit-runner");
     const posted = steps.filter((s) => s.run?.includes("--input .audit/check-run.json"));
     expect(posted).toHaveLength(2);
-    const writers = steps.filter((s) => s.run?.includes("check-run.json") && s.run.includes('name: "audit"'));
-    expect(writers).toHaveLength(2);
+    // payload 的写者可以多于一处（判定 / 兜底 / 判不了），但每一处写的名字都必须是 audit：
+    // 名字一旦换成 job 名（audit-runner），job 的红与结论的红就抢同一个名字。
+    const writers = steps.filter(
+      (s) => s.run?.includes("check-run.json") && s.run.includes('name: "audit"'),
+    );
+    expect(writers.length).toBeGreaterThanOrEqual(2);
+    for (const step of steps) {
+      expect(String(step.run ?? ""), step.name).not.toContain('name: "audit-runner"');
+    }
   });
 
   it("权限最小：只开错误里用到的那几项，且 checks: write 是硬的", () => {
@@ -348,6 +486,25 @@ describe("wiring: .github/workflows/audit.yml", () => {
     const ctxStep = steps.find((s) => s.name === "解析 PR 上下文");
     expect(ctxStep.env.PR_INPUT).toContain("inputs.pr");
   });
+
+  it("写回与兜底都是 always()：前置步骤红了也必须把结论写到 sha 上", () => {
+    // 少了 always()，一步红就把 Check Run 的写回跳过去，这次「判不了」退化成「沿用上一轮的绿」。
+    // 这一半语义沙箱模拟不了（它不因上一步非 0 而跳过后续步骤），只能按形状钉死。
+    for (const name of ["结论兜底", "回写 Check Run", "判不了：回写 INFRA"]) {
+      const step = steps.find((s) => s.name === name);
+      expect(step, name).toBeDefined();
+      expect(String(step.if), name).toContain("always()");
+    }
+    // 兜底夹在判定与写回之间：在判定之前看不到「缺结论」，在写回之后改不动 payload。
+    const order = steps.map((s) => s.name);
+    expect(order.indexOf("结论兜底")).toBeGreaterThan(order.indexOf("口径层判定"));
+    expect(order.indexOf("结论兜底")).toBeLessThan(order.indexOf("回写 Check Run"));
+  });
+
+  it("判定步骤没拿到退出码时退 3：没拿到不等于通过", () => {
+    const gate = steps.find((s) => s.name === "判定");
+    expect(gate.run).toContain("exit 3");
+  });
 });
 
 describe("wiring: 真跑 YAML 的 run 块", () => {
@@ -399,12 +556,21 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       return String(ctx[key]);
     });
 
-  const ifMatches = (expr, outputs) => {
-    const m = /^steps\.(\w+)\.outputs\.(\w+)\s*(==|!=)\s*'([^']*)'$/.exec(String(expr).trim());
-    if (!m) throw new Error("本 runner 只支持 steps.<id>.outputs.<key> == 'v' 形式的 if: " + expr);
-    const actual = outputs[m[1]]?.[m[2]];
-    return m[3] === "==" ? actual === m[4] : actual !== m[4];
-  };
+  // if: 只支持两种成分：always() 与 steps.<id>.outputs.<key> (==|!=) 'v'，用 && 连起来。
+  // 注意本 runner 测不到 always() 的那一半语义（它不模拟「前一步红了就跳过后续步骤」）：
+  // 「前一步红了仍然照写」这件事由 YAML 形状断言兜住，见 wiring 形状那条用例。
+  const ifMatches = (expr, outputs) =>
+    String(expr)
+      .trim()
+      .split("&&")
+      .map((term) => term.trim())
+      .every((term) => {
+        if (term === "always()") return true;
+        const m = /^steps\.(\w+)\.outputs\.(\w+)\s*(==|!=)\s*'([^']*)'$/.exec(term);
+        if (!m) throw new Error("本 runner 只认 always() 与 steps.<id>.outputs.<key> 'v' 的 && 组合: " + expr);
+        const actual = outputs[m[1]]?.[m[2]];
+        return m[3] === "==" ? actual === m[4] : actual !== m[4];
+      });
 
   // 槽位身份是真判据（一个执行器不许占两个槽），所以夹具必须像真执行器那样
   // 各自自报所在槽；要测「冒充」的用例用 raw:true 显式绕过这层改写。
@@ -419,8 +585,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     }
   };
 
-  function runWorkflow(findings, ctxOverride = {}) {
+  // mutate：让用例在「YAML 已经跑起来之前」动一下沙箱，用来喂真故障
+  // （比如把口径层脚本换成一个什么都不写的空壳，模拟崩溃）。
+  function runWorkflow(findings, ctxOverride = {}, mutate) {
     const { dir, bin } = sandbox();
+    if (mutate) mutate(dir);
     const ctx = {
       "github.event.pull_request.number": "2",
       // 事件 sha 故意与假 gh 返回的 headRefOid 不同：两个值相同的话，
@@ -527,14 +696,19 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(out.ran.at(-1).status).toBe(1);
   });
 
-  it("INFRA：conclusion=action_required（required check 不会变绿）+ 摘要留痕", () => {
+  it("INFRA：Check Run 落 action_required（required check 不会变绿），job 级不染红", () => {
     const out = runWorkflow({ AUDIT_FINDINGS_A: infra, AUDIT_FINDINGS_B: pass });
     expect(out.payload.conclusion).toBe("action_required");
     expect(out.payload.conclusion).not.toBe("neutral");
-    expect(out.outputs.decide.exit).toBe("3");
-    expect(out.ran.at(-1).status).toBe(3);
+    // job 级 check 只回答「这个 job 有没有跑错」：INFRA 是「判不了」，不是「代码不合格」。
+    // 让它也红，merge-gate 的 G3 就会把一个未判过读成一次不合格。
+    expect(out.outputs.decide.exit).toBe("0");
+    expect(out.ran.at(-1).status).toBe(0);
     expect(out.summary).toContain("INFRA");
-    expect(out.summary).toContain("不许静默当通过");
+    // 方向决策：INFRA ≠ 不合格，但「未判过」照样挡合并。
+    expect(out.summary).toContain("未判过");
+    expect(out.summary).toContain("不放行合并");
+    expect(out.summary).toContain("不许把它读成「代码不合格」");
   });
 
   it("注入不被求值：findings 里的 $( ) 原样进 payload，不在 CI 里执行", () => {
@@ -581,7 +755,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(String(out.payload.output.title)).toContain("不是 PR head");
     expect(out.ran.some((s) => String(s.stdout).includes("::error"))).toBe(true);
     expect(out.summary).toContain("落点不一定是 PR head");
-    expect(out.ran.at(-1).status).toBe(3);
+    // 结论的红由 POST 出去的 Check Run 承载，job 级 check 不重复染红。
+    expect(out.ran.at(-1).status).toBe(0);
   });
 
   it("-e 作用：留痕回写失败必须让步骤红，不许被后面的 echo 盖成绿", () => {
@@ -590,6 +765,38 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       { "inputs.pr": "" },
     );
     const step = out.ran.find((s) => s.name === "判不了：回写 INFRA");
+    expect(step.status).not.toBe(0);
+  });
+
+  it("口径层崩溃、result.json 没落地：兜底照样 POST 一条 action_required，job 不染红", () => {
+    // 「崩溃也必须显式留痕」的落地点。把沙箱里的口径层脚本换成一个什么都不写就死的空壳：
+    // 这条不测脚本自己（脚本的兜底另有单元用例），测的是 workflow 在「脚本什么都没留下」时的行为。
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      {},
+      (dir) => writeFileSync(join(dir, "scripts/audit-findings.mjs"), "process.exit(70);\n"),
+    );
+    expect(out.payload).toMatchObject({ name: "audit", conclusion: "action_required" });
+    expect(String(out.payload.output.summary)).toContain("口径层没有产出结论");
+    const repaired = JSON.parse(readFileSync(join(out.dir, ".audit/result.json"), "utf8"));
+    expect(repaired.conclusion).toBe("action_required");
+    expect(String(repaired.reason)).toContain("口径层没有产出结论");
+    // 留痕要读得懂：摘要点名「别读成通过」，并打出一条 error 注解。
+    expect(out.summary).toContain("口径层没有产出结论");
+    expect(out.summary).toContain("别把它读成通过");
+    expect(out.ran.some((s) => String(s.stdout).includes("::error title=audit INFRA::"))).toBe(true);
+    // 兜底补的是同一条结论（action_required），job 级 check 仍然不染红。
+    expect(out.outputs.fallback.exit).toBe("0");
+    expect(out.ran.at(-1).status).toBe(0);
+  });
+
+  it("POST 失败必须让回写步骤红：留痕没留成就是一次真故障，不许被吞", () => {
+    const out = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_POST_FAILS: "1",
+    });
+    const step = out.ran.find((s) => s.name === "回写 Check Run");
     expect(step.status).not.toBe(0);
   });
 
