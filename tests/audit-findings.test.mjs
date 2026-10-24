@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   symlinkSync,
   writeFileSync,
@@ -2039,6 +2040,298 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   const CHECK_RUNS_INPUT = /--input[=\s]+["']?\.audit\/check-run\.json["']?/;
   const CHECK_RUNS_POST_STEPS = ["回写 Check Run", "判不了：回写 INFRA"];
 
+  // ---- 轮十五：run 文本之外的四个面（YAML 的键 / env / 目录 / 命令词）----
+  // 上面全部判据都建立在 run 文本上。下面四类东西**不在 run 文本里**，因此全部绿（审查实测）：
+  //   1) step 级 continue-on-error: outcome=failure / conclusion=success，job 仍绿；
+  //   2) step 级 env: 把 $GITHUB_REPOSITORY 指到别人的仓库，sanctioned 那行一字未改；
+  //   3) 同目录另一个 workflow: 第二条同名 Check Run 盖掉真结论；
+  //   4) 按目录树寻址的读取 / 包装词之后的写命令 / 解包打补丁。
+  // 判据一律按**白名单**收口：多出来的键就是违规。
+  const STEP_ALLOWED_KEYS = ["name", "id", "if", "run", "uses", "with", "env", "shell", "working-directory"];
+  // job 级 continue-on-error 与 step 级同义（一步红不算 job 红），同样不在白名单里。
+  const JOB_ALLOWED_KEYS = [
+    "name",
+    "runs-on",
+    "steps",
+    "env",
+    "defaults",
+    "permissions",
+    "if",
+    "concurrency",
+    "timeout-minutes",
+    "needs",
+    "container",
+    "strategy",
+    "outputs",
+    "uses",
+    "with",
+    "secrets",
+  ];
+
+  // fail-closed：白名单外的键一律违规，且点名这个键与该 step。
+  function unknownKeyViolations(payload, allowed, options = {}) {
+    const label = options.label ?? "step";
+    const violations = [];
+    for (const key of Object.keys(payload ?? {})) {
+      if (allowed.includes(key)) continue;
+      violations.push({
+        step: payload?.name ?? payload?.id ?? options.fallback ?? label,
+        where: key,
+        excerpt: label + "." + key + ": " + JSON.stringify(payload[key]),
+        reason: label + " 键不在白名单：" + key,
+      });
+    }
+    return violations;
+  }
+
+  function stepKeyViolations(stepList) {
+    const violations = [];
+    stepList.forEach((step, index) => {
+      violations.push(
+        ...unknownKeyViolations(step, STEP_ALLOWED_KEYS, { label: "step", fallback: "第 " + (index + 1) + " 个 step" }),
+      );
+    });
+    return violations;
+  }
+
+  function jobKeyViolations(jobPayloadObject, options = {}) {
+    return unknownKeyViolations(jobPayloadObject, JOB_ALLOWED_KEYS, {
+      label: "job",
+      fallback: options.fallback ?? "audit-runner",
+    });
+  }
+
+  // 结论的落点、凭据、以及三条留痕通道本身：step 级 env 覆写任何一个都等于换了一个执行面。
+  const ENV_OVERRIDE_FORBIDDEN = [
+    "GITHUB_REPOSITORY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_OUTPUT",
+    "GITHUB_STEP_SUMMARY",
+    "GITHUB_SHA",
+  ];
+
+  function stepEnvOverrideViolations(stepList, options = {}) {
+    const jobEnv = options.jobEnv ?? {};
+    const workflowEnv = options.workflowEnv ?? {};
+    const hasKey = (bag, key) => Object.prototype.hasOwnProperty.call(bag ?? {}, key);
+    const violations = [];
+    for (const step of stepList) {
+      const env = step?.env;
+      if (!env || typeof env !== "object" || Array.isArray(env)) continue;
+      const name = step.name ?? step.id;
+      for (const key of Object.keys(env)) {
+        let reason = null;
+        if (ENV_OVERRIDE_FORBIDDEN.includes(key)) reason = key + " 是禁止覆写的环境变量（step「" + name + "」）";
+        else if (hasKey(jobEnv, key)) reason = "step「" + name + "」的 env 覆写了 job 级 env 的 " + key;
+        else if (hasKey(workflowEnv, key)) reason = "step「" + name + "」的 env 覆写了 workflow 级 env 的 " + key;
+        if (reason) violations.push({ step: name, where: "env", excerpt: key + ": " + env[key], reason });
+      }
+    }
+    return violations;
+  }
+
+  // ---- 结论写面跨文件收口 ----
+  // 只认**写**：第二条同名 Check Run 必须写出来才会盖掉真结论；读 checks 列表（merge-gate.yml
+  // 这类就绪轮询）不产生结论。判据因此是「端点 + 写形态」，不是「端点」。
+  const WORKFLOW_DIR = ".github/workflows";
+  const CHECK_RUNS_WRITE_HINT = /(?:--method[=\s]+POST\b|-X\s*POST\b|--input[=\s]|\s-f\s|\s--field[=\s]|\s-F\s)/;
+
+  function checkRunWriteSurface(line) {
+    const text = String(line);
+    if (/\bcreateCheckRun\b/.test(text)) return "createCheckRun";
+    // gh api graphql 与 https://api.github.com/graphql 是同一个端点，写法不同不改面。
+    if (/\bgraphql\b/.test(text)) return "/graphql";
+    if (/\bcheck-runs\b/.test(text) && CHECK_RUNS_WRITE_HINT.test(text)) return "check-runs";
+    return null;
+  }
+
+  function workflowFiles(options = {}) {
+    const root = options.root ?? ROOT;
+    const dir = join(root, WORKFLOW_DIR);
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((name) => /\.ya?ml$/.test(name))
+      .sort();
+  }
+
+  // 命中结论写面的文件清单（含 audit.yml）。用它断言「只有 audit.yml」。
+  function workflowWriteSurfaceFiles(options = {}) {
+    const root = options.root ?? ROOT;
+    return workflowFiles({ root }).filter((file) =>
+      readFileSync(join(root, WORKFLOW_DIR, file), "utf8")
+        .split("\n")
+        .some((line) => checkRunWriteSurface(stripShellComment(line)) !== null),
+    );
+  }
+
+  // 除 audit.yml 外任何 workflow 写结论都是违规：scripts/merge-gate.mjs 按 name 取 id 最新，
+  // 不钉来源/app，第二条同名结论会盖掉真结论。
+  function workflowWriteSurfaceViolations(options = {}) {
+    const root = options.root ?? ROOT;
+    const files = options.files ?? workflowFiles({ root });
+    const violations = [];
+    for (const file of files) {
+      if (file === "audit.yml") continue;
+      for (const rawLine of readFileSync(join(root, WORKFLOW_DIR, file), "utf8").split("\n")) {
+        const line = stripShellComment(rawLine);
+        const surface = checkRunWriteSurface(line);
+        if (!surface) continue;
+        violations.push({
+          step: file,
+          where: surface,
+          excerpt: line.trim(),
+          reason: "结论写面只允许 audit.yml：同名的第二条 Check Run 会盖掉真结论（" + file + "）",
+        });
+      }
+    }
+    return violations;
+  }
+
+  // ---- 按目录树寻址的读取 ----
+  // grep -rn needs_revision . 读的是整棵树：字面上既没有 .audit 也没有 result.json，
+  // 旧判据全盲。任何非口径层步都能据此分叉，违反「只有口径层能解释结论」。
+  const TREE_SEARCH_COMMANDS = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "ack-grep"]);
+  // rg/ag/ack 默认递归，grep 系要显式 -r/-R。
+  const TREE_RECURSIVE_BY_DEFAULT = new Set(["rg", "ag", "ack", "ack-grep"]);
+  const TREE_SEARCH_FLAG = /^-[A-Za-z]*[rR]/;
+
+  function isTreeTarget(token) {
+    const value = unquote(String(token ?? ""));
+    if (!value) return false;
+    // .audit 面已由目录级判据认领，这里只补它看不见的「指到目录」的写法。
+    if (value === ".audit" || value.startsWith(".audit/")) return false;
+    if (value === "." || value === ".." || value === "/") return true;
+    if (value.endsWith("/")) return true;
+    if (WILDCARD_CHAR.test(value)) return false;
+    // 有扩展名的当文件；没有扩展名的**默认按目录处理**（认不出就判到响的那一侧）。
+    return !/\.[A-Za-z0-9]+$/.test(value);
+  }
+
+  function treeAddressingReads(line) {
+    const hits = [];
+    for (const words of shellCommands(line)) {
+      const head = (words[0] ?? "").replace(/^.*\//, "");
+      const flags = words.slice(1).filter((word) => word.startsWith("-"));
+      let command = null;
+      let targets = [];
+      if (head === "git" && words[1] === "grep") {
+        command = "git grep";
+        targets = words
+          .slice(2)
+          .filter((word) => !word.startsWith("-"))
+          .slice(1);
+      } else if (head === "find") {
+        command = "find";
+        // find 的操作数是第一个表达式之前的路径，其余是表达式（-name / -exec ...）。
+        for (const word of words.slice(1)) {
+          if (word.startsWith("-") || word === "(" || word === "!") break;
+          targets.push(word);
+        }
+      } else if (head === "ls") {
+        if (!flags.some((word) => /^-[A-Za-z]*R/.test(word) || word === "--recursive")) continue;
+        command = "ls -R";
+        targets = words.slice(1).filter((word) => !word.startsWith("-"));
+      } else if (TREE_SEARCH_COMMANDS.has(head)) {
+        if (!TREE_RECURSIVE_BY_DEFAULT.has(head) && !flags.some((word) => TREE_SEARCH_FLAG.test(word))) continue;
+        command = head;
+        // 第一个非旗标词是 pattern，其后才是路径。
+        targets = words
+          .slice(1)
+          .filter((word) => !word.startsWith("-"))
+          .slice(1);
+        // rg / ag / ack 不给路径时搜的就是 cwd，等于 "."。
+        if (TREE_RECURSIVE_BY_DEFAULT.has(head) && targets.length === 0) targets = ["."];
+      } else continue;
+      for (const word of targets) {
+        if (!isTreeTarget(word)) continue;
+        hits.push({ command, target: unquote(word) });
+      }
+    }
+    return hits;
+  }
+
+  // ---- 写命令识别要穿透包装词 ----
+  // copyWriteTargets 只看每段命令的**首词**：find -exec cp / xargs cp / env cp / sudo cp ...
+  // 之下那个 cp 隐形（实测全绿）。包装词之后的那段词同样参与命令词判定。
+  const COMMAND_WRAPPERS = new Set(["env", "command", "time", "sudo", "nohup", "nice", "busybox", "xargs", "exec"]);
+  const WRAPPER_VALUE_FLAGS = new Set(["-u", "-g", "-n", "-i", "-I", "-L", "-P", "-s", "-d", "-E", "-e", "-a"]);
+
+  function wrappedWriteCommands(line) {
+    const found = [];
+    for (const words of shellCommands(line)) {
+      const head = (words[0] ?? "").replace(/^.*\//, "");
+      if (head === "find") {
+        const index = words.findIndex((word) => ["-exec", "-execdir", "-ok", "-okdir"].includes(word));
+        if (index < 0) continue;
+        const nested = words.slice(index + 1);
+        found.push({ wrapper: "find -exec", head: (nested[0] ?? "").replace(/^.*\//, ""), words: nested });
+        continue;
+      }
+      if (["bash", "sh", "zsh", "dash"].includes(head)) {
+        // 再嵌一层 shell：-c 之后的正文还是命令，穿透一层继续判；穿不透的才轮到 unfollowable。
+        const index = words.findIndex((word) => word === "-c");
+        if (index >= 0 && words[index + 1])
+          for (const nestedWords of shellCommands(words[index + 1]))
+            found.push({ wrapper: head + " -c", head: (nestedWords[0] ?? "").replace(/^.*\//, ""), words: nestedWords });
+        continue;
+      }
+      if (!COMMAND_WRAPPERS.has(head)) continue;
+      let index = 1;
+      while (index < words.length) {
+        const word = words[index];
+        if (WRAPPER_VALUE_FLAGS.has(word)) {
+          index += 2;
+          continue;
+        }
+        if (word.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      if (index >= words.length) continue;
+      found.push({ wrapper: head, head: (words[index] ?? "").replace(/^.*\//, ""), words: words.slice(index) });
+    }
+    return found;
+  }
+
+  // ---- 按内容落盘 ----
+  // tar -xf / unzip -o / cpio -id / patch -i / git apply / git checkout -- <p> / git restore
+  // 把包内/补丁里的内容写进工作树，静态层看不出包内有什么（实测把 check-run.json 从
+  // conclusion=failure 换成 success 后全绿）。打包（tar -cf）不在此列：它不写工作树。
+  function commandWordLists(line) {
+    const lists = shellCommands(line);
+    for (const nested of wrappedWriteCommands(line)) lists.push(nested.words);
+    return lists;
+  }
+
+  function contentLandingCommands(line) {
+    const hits = [];
+    for (const words of commandWordLists(line)) {
+      const head = (words[0] ?? "").replace(/^.*\//, "");
+      const flags = words.slice(1).filter((word) => word.startsWith("-"));
+      const first = words[1] ?? "";
+      if (head === "tar") {
+        const extracting =
+          flags.some((word) => /^-[A-Za-z]*x/.test(word) || word === "--extract" || word === "--get") ||
+          (!first.startsWith("-") && /^[A-Za-z]*x[A-Za-z]*$/.test(first));
+        if (extracting) hits.push({ command: "tar" });
+      } else if (head === "unzip") {
+        hits.push({ command: "unzip" });
+      } else if (head === "cpio") {
+        if (flags.some((word) => /^-[A-Za-z]*i/.test(word))) hits.push({ command: "cpio" });
+      } else if (head === "patch") {
+        hits.push({ command: "patch" });
+      } else if (head === "git") {
+        const sub = words[1];
+        if (sub === "apply" || sub === "restore") hits.push({ command: "git " + sub });
+        else if (sub === "checkout" && words.includes("--")) hits.push({ command: "git checkout --" });
+      }
+    }
+    return hits;
+  }
+
   // 一行文本里出现的 .audit 路径（含父目录、通配、别的文件名）。
   function auditDirPaths(line) {
     const raw = String(line);
@@ -2249,6 +2542,34 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
             where,
             excerpt: line.trim(),
             reason: "载体的写通道只能是产出那一行（cp/tee/install 不是产出）",
+          });
+        }
+        // 写命令藏在包装词之后：find -exec / xargs / env / sudo / bash -c … 之下的 cp 不在首词位置。
+        for (const nested of wrappedWriteCommands(line)) {
+          if (!COPY_WRITE_COMMANDS.has(nested.head)) continue;
+          violations.push({
+            step: name,
+            where,
+            excerpt: line.trim(),
+            reason: "写命令藏在包装词之后（" + nested.wrapper + " " + nested.head + "）：静态层看不出目标",
+          });
+        }
+        // 按内容落盘：解包 / 打补丁 / 还原文件都能改写被 POST 的载体，包内有什么静态层看不出。
+        for (const landing of contentLandingCommands(line)) {
+          violations.push({
+            step: name,
+            where,
+            excerpt: line.trim(),
+            reason: "按内容落盘（" + landing.command + "）：解包/打补丁能改写被 POST 的载体，只能默认拒绝",
+          });
+        }
+        // 按目录树寻址的读取：操作数指到目录或 . / .. / / 时，读的是整棵树。
+        for (const read of treeAddressingReads(line)) {
+          violations.push({
+            step: name,
+            where,
+            excerpt: line.trim(),
+            reason: "按目录树寻址的读取（" + read.command + " " + read.target + "）",
           });
         }
         // 通配操作数：认不出就必须响。
@@ -4066,6 +4387,306 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     expect(real.missing).toEqual([]);
     // 真 workflow 的 -r 噪音已清零（轮十三-7 的判据在这条规则收紧后仍然成立）。
     expect(referencedScripts(steps, { root: ROOT, jobPayloads: carrierPayloads }).missing).toEqual([]);
+  });
+
+  // ---- 轮十五：run 文本之外的面（YAML 键 / env / 目录 / 命令词）----
+  // 下面每一组都同时给「真触发」与「不该红」两个方向：只红不绿说明判据在误伤，只绿不红说明它空转。
+  const SH = String.fromCharCode(10);
+  // -exec 的终止符 \; 在本文件里逐字构造，免得转义在源码里被吃掉一层。
+  const SEMI = String.fromCharCode(92) + ";";
+
+  it("轮十五-1：step 键是白名单（fail-closed）—— 白名单外的键一律违规并点名键与 step", () => {
+    // continue-on-error 让 outcome=failure / conclusion=success，job 仍是绿的。
+    // 行为层跑的是 run 块，永远看不到这个 YAML 键，所以它只能在结构层收口。
+    expect(STEP_ALLOWED_KEYS).not.toContain("continue-on-error");
+    expect(JOB_ALLOWED_KEYS).not.toContain("continue-on-error");
+    const base = { name: "回写 Check Run", if: "steps.ctx.outcome == 'success'", run: "gh api x" + SH };
+    expect(stepKeyViolations([base])).toEqual([]);
+    expect(unknownKeyViolations(base, STEP_ALLOWED_KEYS)).toEqual([]);
+    for (const key of ["continue-on-error", "timeout-minutes", "retries", "concurrency", "permissions"]) {
+      const violations = stepKeyViolations([{ ...base, [key]: true }]);
+      expect(violations.map((v) => v.where), key).toEqual([key]);
+      expect(violations[0].step, key).toBe("回写 Check Run");
+      expect(violations[0].reason, key).toContain(key);
+    }
+    // 一步塞两个未知键要逐一点名，不是只报第一个。
+    expect(stepKeyViolations([{ ...base, "continue-on-error": true, retries: 2 }]).map((v) => v.where)).toEqual([
+      "continue-on-error",
+      "retries",
+    ]);
+    // 没有 name 的步也要能被点名（下标当身份），否则「无 name」就是白名单的旁路。
+    expect(stepKeyViolations([{ run: "true" + SH, "continue-on-error": true }]).map((v) => v.step)).toEqual([
+      "第 1 个 step",
+    ]);
+    // 正向对照：真 workflow 每一个 step 全过白名单。
+    expect(stepKeyViolations(steps)).toEqual([]);
+  });
+
+  it("轮十五-2：三步各自显式断言没有 continue-on-error，job 键同样按白名单收窄", () => {
+    for (const name of ["回写 Check Run", "判定", "判不了：回写 INFRA"]) {
+      const step = steps.find((candidate) => candidate.name === name);
+      expect(step, name).toBeTruthy();
+      expect(step["continue-on-error"], name).toBeUndefined();
+    }
+    // 这三步就是这个契约的要害：POST、判定、以及判不了时的 INFRA 回写。
+    expect(steps.filter((step) => step["continue-on-error"] !== undefined)).toEqual([]);
+    // job 级白名单按真文件实有键收窄（name / runs-on / env / steps）。
+    expect(jobKeyViolations(job)).toEqual([]);
+    expect(Object.keys(job).filter((key) => !JOB_ALLOWED_KEYS.includes(key))).toEqual([]);
+    const mutated = { ...job, "continue-on-error": true };
+    expect(jobKeyViolations(mutated).map((v) => v.where)).toEqual(["continue-on-error"]);
+    expect(jobKeyViolations(mutated)[0].reason).toContain("continue-on-error");
+    // 白名单不收新的执行面键：permissions/timeout-minutes 等在 job 上也不在白名单内是刻意的收窄，
+    // 一旦真需要就显式加进 JOB_ALLOWED_KEYS 并在这里同步 —— 于是「加了键」永远是一次可见的改动。
+    expect(JOB_ALLOWED_KEYS).not.toContain("continue-on-error");
+  });
+
+  it("轮十五-3：step 级 env 不许覆写落点与凭据 —— 禁止覆写集合与键交叉都要红", () => {
+    expect(ENV_OVERRIDE_FORBIDDEN).toEqual(
+      expect.arrayContaining([
+        "GITHUB_REPOSITORY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_OUTPUT",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_SHA",
+      ]),
+    );
+    // 正向对照：真 workflow 的 step env 全是输入面（PR_INPUT / AUDIT_* / RUN_SHA / CTX_OK）。
+    expect(stepEnvOverrideViolations(steps, { jobEnv: job.env, workflowEnv: doc.env })).toEqual([]);
+    const base = steps.find((step) => step.name === "回写 Check Run");
+    for (const key of ENV_OVERRIDE_FORBIDDEN) {
+      const violations = stepEnvOverrideViolations([{ ...base, env: { [key]: "someone/else" } }], {});
+      expect(violations.map((v) => v.where), key).toEqual(["env"]);
+      expect(violations[0].step, key).toBe("回写 Check Run");
+      expect(violations[0].reason, key).toContain(key);
+    }
+    // 覆写 GITHUB_REPOSITORY 时 sanctioned 那行一字未改 —— 判据必须落在 env，不是 run 文本。
+    const rewritten = {
+      ...base,
+      env: { GITHUB_REPOSITORY: "someone/else" },
+    };
+    expect(String(rewritten.run)).toBe(String(base.run));
+    expect(stepEnvOverrideViolations([rewritten], {}).length).toBeGreaterThan(0);
+  });
+
+  it("轮十五-4：step 级 env 与 job 级 / workflow 级同键也算覆写，点名两边；新增键不算", () => {
+    const base = steps.find((step) => step.name === "回写 Check Run");
+    // 与 job 级同键（GH_TOKEN 本身已在禁止集合里，这里取一个不在集合内的键，单看交叉那一面）。
+    const jobLevel = stepEnvOverrideViolations([{ ...base, env: { AUDIT_FIXTURE: "1" } }], {
+      jobEnv: { AUDIT_FIXTURE: "0" },
+    });
+    expect(jobLevel).toHaveLength(1);
+    expect(jobLevel[0].reason).toContain("job 级 env 的 AUDIT_FIXTURE");
+    expect(jobLevel[0].step).toBe("回写 Check Run");
+    const workflowLevel = stepEnvOverrideViolations([{ ...base, env: { CI: "1" } }], { workflowEnv: { CI: "0" } });
+    expect(workflowLevel).toHaveLength(1);
+    expect(workflowLevel[0].reason).toContain("workflow 级 env 的 CI");
+    // 反面对照：新增键不覆写任何东西，不是「有 env 就红」。
+    expect(stepEnvOverrideViolations([{ ...base, env: { EXTRA: "1" } }], { jobEnv: job.env, workflowEnv: doc.env })).toEqual(
+      [],
+    );
+    // 没有 env 的步直接跳过 —— 判据看键交叉，不看「有没有 env」。
+    expect(stepEnvOverrideViolations(steps.filter((step) => step.env === undefined), {})).toEqual([]);
+  });
+
+  it("轮十五-5：结论写面按目录收口 —— 只有 audit.yml 命中，且只有 audit.yml 时判据稳定", () => {
+    expect(workflowFiles()).toContain("audit.yml");
+    // 正向断言：写面文件清单精确等于 [audit.yml]。
+    expect(workflowWriteSurfaceFiles()).toEqual(["audit.yml"]);
+    expect(workflowWriteSurfaceViolations()).toEqual([]);
+    // merge-gate.yml 只是**读** checks 列表（就绪轮询）：读不产生结论，不是写面。
+    const gate = readFileSync(join(ROOT, WORKFLOW_DIR, "merge-gate.yml"), "utf8").split(SH);
+    const gateLines = gate.filter((line) => line.includes("check-runs"));
+    expect(gateLines.length).toBeGreaterThan(0);
+    expect(gateLines.filter((line) => checkRunWriteSurface(stripShellComment(line)))).toEqual([]);
+    // 只放一个 audit.yml 的临时目录：判据在真仓库当前形状下稳定（不靠 peer 文件的缺席）。
+    const dir = mkdtempSync(join(tmpdir(), "audit-workflow-surface-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    // 非 yml 文件不参与扫描（目录里还有别的垃圾时不误报）。
+    writeFileSync(join(dir, WORKFLOW_DIR, "README.md"), "gh api repos/o/r/check-runs --method POST" + SH);
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+  });
+
+  it("轮十五-6：同目录第二个 workflow 写结论即违规 —— 同名的第二条 Check Run 会盖掉真结论", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-workflow-peer-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    const peer = [
+      "name: peer",
+      "on: pull_request",
+      "jobs:",
+      "  peer:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - run: |",
+      "          gh api repos/$GITHUB_REPOSITORY/check-runs --method POST -f name=audit -f conclusion=success",
+      "",
+    ].join(SH);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer.yml"), peer);
+    const violations = workflowWriteSurfaceViolations({ root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["peer.yml"]);
+    expect(violations.map((v) => v.where)).toEqual(["check-runs"]);
+    expect(violations[0].reason).toContain("结论写面只允许 audit.yml");
+    expect(violations[0].reason).toContain("盖掉真结论");
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml", "peer.yml"]);
+    // 同一个写面的另两种写法（.yaml 后缀也扫）：GraphQL createCheckRun 与 REST -f 直拼。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer2.yaml"),
+      ["name: peer2", "on: pull_request", "jobs:", "  p:", "    steps:", "      - run: gh api graphql -f query=mutation"].join(SH),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.step)).toEqual(["peer.yml", "peer2.yaml"]);
+    // 反面对照：只读查询（--jq / 重定向到文件）不是写面，不产生结论。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "gate.yml"),
+      ["name: gate", "jobs:", "  g:", "    steps:", "      - run: gh api repos/$GITHUB_REPOSITORY/check-runs --jq .[0]"].join(SH),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.step)).toEqual(["peer.yml", "peer2.yaml"]);
+    // 真仓库仍然零违规。
+    expect(workflowWriteSurfaceViolations()).toEqual([]);
+  });
+
+  it("轮十五-7：按目录树寻址的读取 —— 操作数指到目录或 . / .. / / 就是读整棵树", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-tree-read-"));
+    const mustFire = [
+      ["grep -rn .", "grep -rn needs_revision . > /tmp/read.txt || true" + SH],
+      ["grep -r 目录", "grep -r pass scripts/" + SH],
+      ["rg 无路径（默认 cwd）", "rg needs_revision" + SH],
+      ["rg .", "rg -n conclusion ." + SH],
+      ["ag", "ag verdict" + SH],
+      ["ack", "ack needs_revision" + SH],
+      ["git grep", "git grep needs_revision ." + SH],
+      ["find 目录", "find scripts -name '*.mjs'" + SH],
+      ["find -exec cat", "find . -name result.json -exec cat {} +" + SH],
+      ["ls -R .", "ls -R ." + SH],
+    ];
+    for (const [label, run] of mustFire) {
+      expect(treeAddressingReads(run).length, label).toBeGreaterThan(0);
+      const violations = auditDirReferenceViolations([{ name: "插一步", run }], { root: dir });
+      expect(violations.some((v) => v.reason.includes("按目录树寻址的读取")), label).toBe(true);
+    }
+    // 点名命令与操作数，不是只喊一句「有读」。
+    expect(treeAddressingReads("grep -rn needs_revision ." + SH)).toEqual([{ command: "grep", target: "." }]);
+    expect(treeAddressingReads("find scripts -name x" + SH)).toEqual([{ command: "find", target: "scripts" }]);
+    expect(treeAddressingReads("ls -R ." + SH)).toEqual([{ command: "ls -R", target: "." }]);
+  });
+
+  it("轮十五-8：树内搜索的反面对照 —— 字面载体 / 非递归 / 通配 / 具体文件都不是这条规则", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-tree-read-neg-"));
+    // 已由「未认领的 .audit 引用」接住的写法，不许在这条规则上重复计一次。
+    for (const run of ["grep -n needs_revision .audit/result.json" + SH, "grep -rn needs_revision .audit" + SH]) {
+      expect(treeAddressingReads(run)).toEqual([]);
+    }
+    expect(auditDirReferenceViolations([{ name: "插一步", run: "grep -n needs_revision .audit/result.json" + SH }], {
+      root: dir,
+    }).map((v) => v.reason)).toEqual(["未认领的 .audit 引用"]);
+    for (const [label, run] of [
+      ["非递归 grep", "grep needs_revision result.json" + SH],
+      ["ls 无 -R", "ls -la scripts" + SH],
+      ["通配不是目录", "grep -n pass *.json" + SH],
+      ["cat 具体文件", "cat scripts/merge-gate.mjs" + SH],
+      ["grep 从 stdin", "printf %s \"$body\" | grep -q needs_revision" + SH],
+    ]) {
+      expect(treeAddressingReads(run), label).toEqual([]);
+    }
+    // 正向对照：真 workflow 的每一步都没有按目录树寻址的读取。
+    for (const step of steps) {
+      for (const { where, text } of stepTexts(step, { root: ROOT })) {
+        for (const line of String(text).split(SH)) {
+          expect(treeAddressingReads(stripShellComment(line)), step.name + "/" + where).toEqual([]);
+        }
+      }
+    }
+    expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
+  });
+
+  it("轮十五-9：写命令识别穿透包装词 —— find -exec / xargs / env / sudo / bash -c 之下的 cp 不隐形", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-wrapper-"));
+    // 行首写法本来就被既有判据接住；这一行只是把同一个 cp 挪到包装词之后。
+    const atHead = "cp /tmp/pwn.json .audit/check-run.json" + SH;
+    expect(copyWriteTargets(atHead)).toContain(".audit/check-run.json");
+    expect(wrappedWriteCommands(atHead)).toEqual([]);
+    const canonical = "find . -name check-run.json -exec cp /tmp/pwn.json {} " + SEMI + " ; true" + SH;
+    expect(wrappedWriteCommands(canonical).map((n) => n.head)).toEqual(["cp"]);
+    expect(copyWriteTargets(canonical)).toEqual([]);
+    const cases = [
+      ["find -exec", canonical],
+      ["xargs", "find . -name check-run.json | xargs cp /tmp/pwn.json" + SH],
+      ["env", "env FOO=1 cp /tmp/pwn.json .audit/check-run.json" + SH],
+      ["command", "command cp /tmp/pwn.json .audit/check-run.json" + SH],
+      ["time", "time cp /tmp/pwn.json .audit/check-run.json" + SH],
+      ["sudo", "sudo cp /tmp/pwn.json .audit/check-run.json" + SH],
+      ["sudo -u", "sudo -u root cp /tmp/pwn.json .audit/check-run.json" + SH],
+      ["nohup", "nohup cp /tmp/pwn.json .audit/check-run.json &" + SH],
+      ["bash -c", "bash -c 'cp /tmp/pwn.json .audit/check-run.json'" + SH],
+    ];
+    for (const [label, run] of cases) {
+      expect(wrappedWriteCommands(run).map((n) => n.head), label).toContain("cp");
+      const violations = auditDirReferenceViolations([{ name: "插一步", run }], { root: dir });
+      expect(violations.some((v) => v.reason.includes("包装词")), label).toBe(true);
+    }
+  });
+
+  it("轮十五-10：包装词的反面对照 —— 非写命令照旧放行，真 workflow 无包装词承载写命令", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-wrapper-neg-"));
+    expect(wrappedWriteCommands("sudo -u root cat README.md" + SH).map((n) => n.head)).toEqual(["cat"]);
+    expect(wrappedWriteCommands("xargs -I {} echo {}" + SH).map((n) => n.head)).toEqual(["echo"]);
+    expect(wrappedWriteCommands("find . -name '*.mjs'" + SH)).toEqual([]);
+    expect(auditDirReferenceViolations([{ name: "插一步", run: "sudo -u root cat scripts/probe.mjs" + SH }], {
+      root: dir,
+    })).toEqual([]);
+    for (const step of steps) {
+      for (const { where, text } of stepTexts(step, { root: ROOT })) {
+        for (const line of String(text).split(SH)) {
+          expect(wrappedWriteCommands(stripShellComment(line)), step.name + "/" + where).toEqual([]);
+        }
+      }
+    }
+  });
+
+  it("轮十五-11：按内容落盘 —— 解包 / 打补丁 / 还原文件都能改写被 POST 的载体", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-landing-"));
+    for (const [label, run] of [
+      ["tar -xf", "tar -xf .github/audit-fixture.tar -C ." + SH],
+      ["tar xf", "tar xf fixture.tar" + SH],
+      ["tar --extract", "tar --extract --file fixture.tar" + SH],
+      ["unzip -o", "unzip -o fixture.zip -d ." + SH],
+      ["cpio -id", "cpio -id < fixture.cpio" + SH],
+      ["patch -p1", "patch -p1 -i fix.diff" + SH],
+      ["git apply", "git apply fix.patch" + SH],
+      ["git checkout --", "git checkout -- .audit/check-run.json" + SH],
+      ["git restore", "git restore .audit/check-run.json" + SH],
+    ]) {
+      expect(contentLandingCommands(run).length, label).toBeGreaterThan(0);
+      const violations = auditDirReferenceViolations([{ name: "插一步", run }], { root: dir });
+      expect(violations.some((v) => v.reason.includes("按内容落盘")), label).toBe(true);
+      expect(violations.map((v) => v.reason).join("|"), label).toContain("只能默认拒绝");
+    }
+  });
+
+  it("轮十五-12：按内容落盘的反面对照 —— 打包不是落盘，建分支不是还原", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-landing-neg-"));
+    // 打包把工作树读出去，不写回来：它不是「按内容落盘」，改的也不是载体。
+    expect(contentLandingCommands("tar -cf /tmp/x.tar .audit" + SH)).toEqual([]);
+    expect(contentLandingCommands("tar -czf out.tgz scripts" + SH)).toEqual([]);
+    expect(contentLandingCommands("git checkout -b fix" + SH)).toEqual([]);
+    expect(contentLandingCommands("git restore --staged x.json" + SH).length).toBeGreaterThan(0);
+    // 打包 .audit 仍然红 —— 但红在「未认领的 .audit 引用」（读面），不是这条新规则。
+    expect(auditDirReferenceViolations([{ name: "搬运", run: "tar -cf /tmp/x.tar .audit" + SH }], { root: dir }).map(
+      (v) => v.reason,
+    )).toEqual(["未认领的 .audit 引用"]);
+    // 正向对照：真 workflow 没有一步解包 / 打补丁 / 还原文件。
+    for (const step of steps) {
+      for (const { where, text } of stepTexts(step, { root: ROOT })) {
+        for (const line of String(text).split(SH)) {
+          expect(contentLandingCommands(stripShellComment(line)), step.name + "/" + where).toEqual([]);
+        }
+      }
+    }
+    expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
   });
 });
 

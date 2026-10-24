@@ -331,3 +331,46 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **仍未覆盖（登记，我认可）**：变量中转后再落盘、python/perl 一行写文件、`curl -o`；通配判据偏保守（任何 `*.json` 通配都红，`/tmp/*.json` 会误报）；GraphQL 只钉字面端点（自建代理中转不可见）；job 级 `defaults.run.working-directory` 的 cwd 只影响引用判定、不影响写者归属。
 
 **到这一轮的判断**：判据已从「文本像不像」走到「执行发生在哪个坐标」，剩下的洞开始集中在**进程边界之后**（解释器一行写文件、变量中转）。那是静态分析追不到的地方，再往下修等于写半个解释器——这是我的止损线，下一轮若仍在本层出新洞，我会带止损判断请人定。
+## 十二、轮十五：判据开始看见「执行坐标」，但这层是开放集
+
+**这一轮两家找到的 5 条有一个共同形态**：YAML 与命令行里**没有一段文本是坏的**，但红绿被改掉了。
+
+**A. `continue-on-error: true`（high，review-b）**：给「回写 Check Run」/「判定」/「判不了：回写 INFRA」任一加这个键 → 115 全绿。它 step 的 outcome=failure、conclusion=success，job 仍绿——**这是唯一能把「步骤必红」翻成「job 必绿」的键**；而「POST 失败必须让回写步骤红」那条用例是在 sandbox 里直接跑 run 块，永远看不见 YAML 键。
+
+**B. step 级 `env` 覆写（medium）**：`env: { GITHUB_REPOSITORY: someone/else }` → 全绿，sanctioned 那一行一字未改，POST 却换了仓库。
+
+**C. 兄弟 workflow 冒名 POST（high，我复现）**：另建 `.github/workflows/peer.yml` 跑 `gh api .../check-runs --method POST -f name=audit -f conclusion=success` → 全绿；`merge-gate` 的 G3 按 name 取 id 最新、不钉来源。
+
+**D. 按目录树寻址的读取（high，review-a）**：`grep -rn needs_revision . > /tmp/read.txt || true` → 0 红。判据只认字面 `.audit`/`result.json`/通配，**以 `.` 为操作数的搜索**完全失明。
+
+**E. 写命令藏在包装词之后（high，review-a）**：`find . -name check-run.json -exec cp /tmp/pwn.json {} \\; ; true` → 0 红（同一命令写在行首才红）。`copyWriteTargets` 只把每段命令的**首词**当命令词。
+
+**F. 按内容落盘整类（high，review-a）**：`tar -xf .github/audit-fixture.tar -C .` → 0 红，本地实跑把 `.audit/check-run.json` 由 `conclusion=failure` 改成 `success`；`unzip -o`/`cpio -id`/`patch -p1 -i`/`git apply` 同族。命令行里一个路径都没有，写者集合与写面判据双双失明。review-a 问过它与已登记的 `curl -o` 是否同族——**我判为不同族**（那是下载，这是解包/打补丁改工作树），按未登记处理。
+
+**修复（`tests/audit-findings.test.mjs` 115→127 例，+621/−0，0 条 expect/it 删除；执行器 `ffdd8922`）**：
+- `STEP_ALLOWED_KEYS`:2050 / `JOB_ALLOWED_KEYS`:2052 → `unknownKeyViolations`:2072、`stepKeyViolations`:2087、`jobKeyViolations`:2097：**未知键即 violation**（fail-closed），`continue-on-error` 不在白名单里，另加三步显式断言为 undefined。
+- `ENV_OVERRIDE_FORBIDDEN`:2105 + `stepEnvOverrideViolations`:2114：step env 不得覆写 job/workflow 级同名键，也不得碰 `GITHUB_REPOSITORY/GITHUB_TOKEN/GH_TOKEN/GITHUB_OUTPUT/GITHUB_STEP_SUMMARY/GITHUB_SHA`。
+- `CHECK_RUNS_WRITE_HINT`:2138 + `checkRunWriteSurface`:2140 + `workflowFiles`:2149 + `workflowWriteSurfaceViolations`:2170：扫描面从单文件扩到 `.github/workflows/*.ya?ml`，结论写面只允许 `audit.yml`。
+- `TREE_SEARCH_COMMANDS`:2194 / `isTreeTarget`:2199 / `treeAddressingReads`:2211：`grep -r`、`rg/ag/ack`、`find -exec cat|grep`、`git grep`、`ls -R` 以目录为操作数 → violation「按目录树寻址的读取」。
+- `COMMAND_WRAPPERS`:2257 / `wrappedWriteCommands`:2260：命令词穿透 `find -exec/-ok`、`xargs`、`env`、`command`、`time`、`sudo`、`nohup`、`nice`、`busybox` 与 `bash|sh -c` 一层。
+- `contentLandingCommands`:2309：`tar -x/-xf/--extract`、`unzip`、`cpio -i*`、`patch`、`git apply/restore/checkout -- <path>` 在非白名单步 → violation「按内容落盘」；`tar -cf` 打包**不**算。
+
+**我的独立复核（七组变异，`/tmp/vrf-r15` 副本，先 `yaml.parse` 验过再跑）**：
+| 变异 | 结果 |
+| --- | --- |
+| 基线（`mut none`） | 127 passed |
+| `peer.yml` gh api POST 同名 check | 2 红 |
+| `continue-on-error: true` 插步 | 2 红 |
+| step `env: GITHUB_REPOSITORY` | 1 红 |
+| `grep -rn needs_revision .` | 6 红 |
+| `find -exec cp` | 8 红 |
+| `tar -xf` | 6 红 |
+| `find -exec sh -c 'cp …'`（执行器登记为残余） | **8 红**（一层 `sh -c` 被我实测咬住，残余比登记的小） |
+| `peer.yml` + `actions/github-script` 里 `github.rest.checks.create({name:"audit",conclusion:"success"})` | **127 全绿——真残余，未关闭** |
+
+**探针第四次坏**：`mut.mjs` 在 `peer.yml` 不存在时无条件 `readFileSync` 抛 ENOENT，而 shell 用 `&&` 串起来 → vitest 根本没跑、输出为空，看起来像「没红」。固定动作补一条：**变异脚本自身失败必须显式打印**，输出为空一律先怀疑探针。
+
+**仍未覆盖（登记，按可利用度）**：① `github.rest.checks.create`/`octokit.*.checks` 这类**无字面端点**的写面（已实测全绿，是真洞）；② 包装词只穿透一层（`eval "$CMD"`、`xargs -I{} sh -c`）；③ 树内读取只认列出的命令集（`git ls-files`、`node -e 'fs.readdirSync(".")'`）；④ 按内容落盘只认列出的工具（`7z x`、`bsdtar`、`zstd -d`、`git stash pop`、`docker cp`），而 `unzip -l` 只列目录也红（fail-closed 偏宽）；⑤ workflow 级 env 交叉判据有实现无真数据；⑥ reusable workflow（`uses: …/.github/workflows/x.yml@ref`）不覆盖；⑦ 键白名单按名字收口，看不见「允许键用出新语义」。
+
+**这一轮的判断（写给下一个读的人）**：判据已经从「文本像不像」走到「执行发生在哪个坐标」，而**坐标是开放集**——每修一条就是给对手一张「还差哪几种」的清单。剩余洞的性质是一致的：**静态层列举不完执行形态**。要根治只能换观测点（回读本 sha 上 `name=audit` 的 Check Run 恰好 1 条且由本次 run 创建），而不是继续枚举。
+
