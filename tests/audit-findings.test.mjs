@@ -522,6 +522,13 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     mkdirSync(bin, { recursive: true });
     const gh = [
       "#!/usr/bin/env bash",
+      // 账本**无条件创建**：这样「账本不存在」就只有一个来历 —— 假 gh 压根没跑起来
+      // （PATH / shebang / 权限 / 记账被改坏），而不是「零次调用」的正常形态。
+      // 否则读不到账本返回的 [] 与真的零调用是同一个值，一批 toHaveLength(0) 的断言
+      // 会因为 harness 断开而空过。
+      "touch \"$PWD/calls.log\"",
+      // harness 自检探针：跑得起来就说明账本路径与 PATH 是通的，但它自己不进账本。
+      "if [[ \"$1\" == \"--audit-harness-canary\" ]]; then exit 0; fi",
       "echo \"$*\" >> \"$PWD/calls.log\"",
       "if [[ \"$*\" == *\"pr view\"* && \"$*\" == *\"headRefOid\"* ]]; then",
       "  printf 'cafebabe\\n'",
@@ -544,7 +551,32 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     ].join("\n");
     writeFileSync(join(bin, "gh"), gh);
     chmodSync(join(bin, "gh"), 0o755);
+    // harness 自检：账本由假 gh 自己创建，所以先证明它真的跑得起来。
+    // 少了这一步，「账本不在」既可能是 harness 坏了、也可能是这一步合法地一次没调 ——
+    // 而这两种情况的正确反应完全相反。
+    const probe = spawnSync(join(bin, "gh"), ["--audit-harness-canary"], { cwd: dir, encoding: "utf8" });
+    if (probe.status !== 0) {
+      throw new Error("假 gh 跑不起来（harness 自检失败）：" + String(probe.stderr ?? probe.error ?? ""));
+    }
     return { dir, bin };
+  }
+
+  // 「零次调用」是「账本在、0 行」；「账本不在」只有一个来历：假 gh 一次都没跑起来。
+  // 把它读成 [] 就等于让 harness 故障伪装成一次合法的零调用。
+  function readGhLedger(dir) {
+    const ledger = join(dir, "calls.log");
+    if (!existsSync(ledger)) {
+      throw new Error(
+        "假 gh 的调用账本不存在（" + ledger + "）：这是 harness 故障，不是「零次调用」。零调用 = 账本在、0 行。",
+      );
+    }
+    return readFileSync(ledger, "utf8").split("\n").filter(Boolean);
+  }
+
+  // 「一次都没调」必须同时断言账本存在：否则「读不到账本」与「零次调用」又合流了。
+  function expectNoGhCalls(out, needle = "") {
+    expect(existsSync(join(out.dir, "calls.log")), "调用账本必须存在").toBe(true);
+    expect(out.calls.filter((call) => call.includes(needle))).toHaveLength(0);
   }
 
   const interpolate = (text, ctx, outputs) =>
@@ -670,11 +702,9 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       outputs,
       // 每个带 id 的步骤写进 $GITHUB_OUTPUT 的原文：注解注入面看的是这些行本身。
       raw,
-      // 一次 gh 都没调是完全合法的状态（比如落点为空、步骤红在调用之前）：
-      // 那时没有 calls.log，空清单比 ENOENT 更接近事实，也让「零次调用」可断言。
-      calls: existsSync(join(dir, "calls.log"))
-        ? readFileSync(join(dir, "calls.log"), "utf8").split("\n").filter(Boolean)
-        : [],
+      // 一次 gh 都没调是完全合法的状态（比如落点为空、步骤红在调用之前），
+      // 但那时**账本仍然在**：它的存在由 fake gh 自己担保，它的 0 行才是「零次调用」。
+      calls: readGhLedger(dir),
       summary: readFileSync(join(dir, "summary.md"), "utf8"),
       payload: (() => {
         try {
@@ -808,22 +838,118 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
 
   // 判据是**字段名**，不是某一种拼写：r.executors / .["executors"] /
   // `jq -r '.["executors"] | length'` 都是同一个字段的同一种读法。
-  // 扫描面只有 run 块（YAML 注释、name、env 都不在里面），run 块内的 shell 注释行不算读。
+  // 扫描面是 run 块（YAML 注释、name、env 都不在里面，run 块内的 shell 注释行不算读）
+  // **加上 run 块里被执行到的脚本文件**：一个 step 的 run 只有 `node scripts/x.mjs` 一行时，
+  // 字段名在文件里、不在 run 文本里 —— 只扫 run 就等于给读者留了一整类绕道。
+  //
+  // 剔除注释是**有意的近似**，不解析 shell 引号（可靠判定要上真的词法器，不值得）：
+  // 只有 `#` 出现在行首或紧邻空白时才算注释起点，其余一律当普通字符。
+  // 因此 `$#`、`${#x}`、`foo#bar` 不会被误切；
+  // 代价是 `echo "a # executors"` 这种引号内的 `#` 会被当成注释起点 —— 已知漏判。
+  function stripShellComment(line) {
+    const at = line.search(/(^|\s)#/);
+    return at === -1 ? line : line.slice(0, at);
+  }
+
   const RESULT_FIELDS = ["executors", "comparison", "counts"];
-  function fieldReadViolations(stepList) {
+  // 标识符边界：前后都不能紧邻 [A-Za-z0-9_]。所以 `executors_count` 不是 `executors` 的读，
+  // 判据是「是不是这个字段的读者」，不是「这行出现过这串字」。
+  const FIELD_READERS = RESULT_FIELDS.map((field) => ({
+    field,
+    re: new RegExp(`(?<![A-Za-z0-9_])${field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_])`),
+  }));
+
+  // run 块里 `node` 启动的脚本：node 后面允许跟 flag，第一个非 flag 词才算脚本路径。
+  // 不以 .mjs/.cjs/.js 结尾的词不算（`node -e '...'` 的内联块就是这种）。
+  function scriptRefs(runText) {
+    const refs = [];
+    for (const line of String(runText).split("\n").map(stripShellComment)) {
+      for (const match of line.matchAll(/(?:^|[\s;&|(])node\s+((?:-{1,2}\S+\s+)*)(\S+)/g)) {
+        const target = match[2].replace(/^['"]/, "");
+        if (!/\.(?:mjs|cjs|js)$/.test(target)) continue;
+        const rel = target.replace(/^\.\//, "");
+        if (!refs.includes(rel)) refs.push(rel);
+      }
+    }
+    return refs;
+  }
+
+  function scriptPath(root, rel) {
+    return rel.startsWith("..") || rel.startsWith("/") ? null : join(root, rel);
+  }
+
+  // result.json 的**写者**：run 块里同一行既用 node 启动某个脚本、又写 `--out .audit/result.json`。
+  // 生产者必然同时出现这些字段名（它要造出这些字段），把它算成「读者」只会逼出一份手写豁免名单 ——
+  // 判据变成名单的一刻就不再是判据。所以从 run 文本里推导，且这条推导本身被断言钉住。
+  const RESULT_OUT_FLAG = "--out .audit/result.json";
+  function resultWriters(stepList) {
+    const writers = [];
+    for (const step of stepList) {
+      if (typeof step.run !== "string") continue;
+      for (const line of step.run.split("\n").map(stripShellComment)) {
+        if (!line.includes(RESULT_OUT_FLAG)) continue;
+        for (const rel of scriptRefs(line)) if (!writers.includes(rel)) writers.push(rel);
+      }
+    }
+    return writers;
+  }
+
+  // 扫描面覆盖到的脚本文件（含解析不到的）：解析不到就是扫描面漏了一格，
+  // 这件事由形状用例显式断言，不在这里静默吞掉。
+  function referencedScripts(stepList, options = {}) {
+    const root = options.root ?? ROOT;
+    const files = [];
+    const missing = [];
+    for (const step of stepList) {
+      if (typeof step.run !== "string") continue;
+      for (const rel of scriptRefs(step.run)) {
+        const abs = scriptPath(root, rel);
+        (abs && existsSync(abs) ? files : missing).push(rel);
+      }
+    }
+    return { files: [...new Set(files)], missing: [...new Set(missing)] };
+  }
+
+  // JS 注释刻意**不剥离**（取舍）：要分清 `"http://x"` 里的 // 与注释起点，得上真的 JS 词法器；
+  // 用正则会把它当注释起点，把同一行后面真正的解引用一起切掉 —— 欠判的方向正是担保失效的方向。
+  // 所以宁可误报（注释里出现字段名也记一条，改注释即可），不许漏读。
+  function fieldReadViolations(stepList, options = {}) {
+    const root = options.root ?? ROOT;
+    const writers = resultWriters(stepList);
     const violations = [];
     for (const step of stepList) {
       if (typeof step.run !== "string") continue;
-      const body = step.run
-        .split("\n")
-        .filter((line) => !/^\s*#/.test(line))
-        .join("\n");
-      for (const field of RESULT_FIELDS) {
-        const hit = body.split("\n").find((line) => line.includes(field));
-        if (hit) violations.push({ step: step.id ?? step.name, field, excerpt: hit.trim() });
+      const source = step.id ?? step.name;
+      const lines = step.run.split("\n").map(stripShellComment);
+      for (const { field, re } of FIELD_READERS) {
+        const hit = lines.find((line) => re.test(line));
+        if (hit) violations.push({ step: source, field, excerpt: hit.trim() });
+      }
+      for (const rel of scriptRefs(step.run)) {
+        if (writers.includes(rel)) continue;
+        const abs = scriptPath(root, rel);
+        if (!abs || !existsSync(abs)) continue;
+        const text = readFileSync(abs, "utf8");
+        for (const { field, re } of FIELD_READERS) {
+          const hit = text.split("\n").find((line) => re.test(line));
+          if (hit) violations.push({ file: rel, field, excerpt: hit.trim() });
+        }
       }
     }
     return violations;
+  }
+
+  // 「解引用形态」：.field 或 ["field"]（含 [ 'field' ]）。正向对照必须落在这一层，
+  // 不能落在「这行出现过这串字」：把真解引用换成 `lines.push("executors comparison counts")`
+  // 之后字段名还在、读没了，按字面看的对照照样绿 —— 那正是这份担保失效的方式。
+  const FIELD_DEREFERENCES = RESULT_FIELDS.map((field) => ({
+    field,
+    re: new RegExp(`\\.${field}(?![A-Za-z0-9_])|\\[\\s*["']${field}["']\\s*\\]`),
+  }));
+
+  function fieldDereferences(runText) {
+    const lines = String(runText).split("\n").map(stripShellComment);
+    return FIELD_DEREFERENCES.filter(({ re }) => lines.some((line) => re.test(line))).map(({ field }) => field);
   }
 
   it("兜底补的结果不是第二份口径层：解引用 result.json 字段的读者只有口径层，且排在兜底之前", () => {
@@ -835,16 +961,20 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 只要解引用这两个字段的读者只有口径层（在本步之前、只跑一次），它就不是活路径。
     // 报错要能直接看出「哪个 step、匹配到哪一行、哪个字段」，不是一个布尔。
     const violations = fieldReadViolations(steps);
-    const readers = [...new Set(violations.map((v) => v.step))];
+    // 来源可以是 run 块（step）也可以是 run 块里被执行的脚本（file）：两者都算读者。
+    const readers = [...new Set(violations.map((v) => v.step ?? v.file))];
     expect(readers, JSON.stringify(violations, null, 2)).toEqual(["decide"]);
-    // 正向对照：口径层确实读了这几个字段名。少了它，正则哪天扫不中任何东西时，
+    // 扫描面确实覆盖到了 run 块里被执行的脚本：引用解析不到就是扫描面漏了一格，
+    // 那时「没有别的读者」会退化成「没扫到」，必须当成 harness 的错。
+    const scripts = referencedScripts(steps);
+    expect(scripts.missing, JSON.stringify(scripts.missing)).toEqual([]);
+    expect(scripts.files).toContain("scripts/audit-findings.mjs");
+    // 唯一的豁免是 result.json 的生产者，且它必须是从 run 文本里推出来的那一个。
+    expect(resultWriters(steps)).toEqual(["scripts/audit-findings.mjs"]);
+    // 正向对照：口径层确实**解引用**了这几个字段（`.<field>` / `["<field>"]`），
+    // 不是「这行出现过这串字」。少了它，正则哪天扫不中任何东西时，
     // 「没有别的读者」会退化成「什么都没扫到」而照样绿。
-    for (const field of RESULT_FIELDS) {
-      expect(
-        violations.some((v) => v.step === "decide" && v.field === field),
-        field,
-      ).toBe(true);
-    }
+    expect(fieldDereferences(steps.find((s) => s.id === "decide").run)).toEqual(RESULT_FIELDS);
   });
 
   it("形状判据认字段名不认拼写：jq 的 .[\"executors\"] 也是读者（逃得过旧正则，逃不过这条）", () => {
@@ -873,6 +1003,89 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     ]);
   });
 
+  it("判据是字段名不是子串：executors_count 只是前缀一样，不是 executors 的读者", () => {
+    // 审查实测的误报形态：run 块里出现 executors_count（另一个名字）曾被判成 executors 的读者。
+    expect(fieldReadViolations([{ id: "count", run: "echo executors_count\n" }])).toEqual([]);
+    // 反向对照：同一个字段换个边界照样抓得住，边界不是「怎么都不算」。
+    expect(fieldReadViolations([{ id: "count", run: "echo $((executors_count + executors))\n" }])).toEqual([
+      { step: "count", field: "executors", excerpt: "echo $((executors_count + executors))" },
+    ]);
+  });
+
+  it("行尾注释不是读：# 之后的字段名不算读者（整行注释与行尾注释同一判据）", () => {
+    expect(fieldReadViolations([{ id: "c", run: "echo ok   # executors\n" }])).toEqual([]);
+    expect(fieldReadViolations([{ id: "c", run: "echo ok; # r.executors 只在口径层读\n" }])).toEqual([]);
+    // 剔除注释不许把真正的读一起切掉：代码在 # 之前，仍然算读者。
+    expect(fieldReadViolations([{ id: "c", run: "jq -r '.[\"executors\"]' x.json   # 取执行器\n" }])).toEqual([
+      { step: "c", field: "executors", excerpt: "jq -r '.[\"executors\"]' x.json" },
+    ]);
+    // 近似边界的一面：# 前面不是空白就不当注释起点（$# / ${#x} / foo#bar 都不切）。
+    expect(fieldReadViolations([{ id: "c", run: "echo $# ${#x} executors\n" }])).toEqual([
+      { step: "c", field: "executors", excerpt: "echo $# ${#x} executors" },
+    ]);
+    // 近似边界的另一面（已知漏判）：引号内的 # 也会被当成注释起点。这是近似的代价，不是达成。
+    expect(fieldReadViolations([{ id: "c", run: 'echo "a # executors"\n' }])).toEqual([]);
+  });
+
+  it("真读者照样红：r.executors / .[\"executors\"] / 动态键 r[k] 都是同一字段的读法", () => {
+    const readers = [
+      { id: "dot", run: "for (const e of r.executors) keep(e)\n" },
+      { id: "bracket", run: "jq -r '.[\"executors\"] | length'\n" },
+      { id: "dynkey", run: 'const k = "executors"; r[k]\n' },
+    ];
+    expect(fieldReadViolations(readers)).toEqual([
+      { step: "dot", field: "executors", excerpt: "for (const e of r.executors) keep(e)" },
+      { step: "bracket", field: "executors", excerpt: "jq -r '.[\"executors\"] | length'" },
+      { step: "dynkey", field: "executors", excerpt: 'const k = "executors"; r[k]' },
+    ]);
+  });
+
+
+  it("扫描面含 run 块里被执行的脚本：加一个 scripts/probe-read.mjs 读 r.executors 必须红", () => {
+    // 审查实测的绕过：读者写在脚本文件里，run 块只有一行 `node scripts/probe-read.mjs`。
+    // 只扫 run 文本时这条 step 一无所获 —— 那种绿是扫描面缺失，不是判据合格。
+    const probeStep = { id: "probe", name: "探针", run: "node scripts/probe-read.mjs\n" };
+    // run 文本里一个字段名都没有：只扫 run 时这条 step 见不到任何读者。
+    expect(probeStep.run).not.toMatch(/executors|comparison|counts/);
+    // 沙箱里放一个真读者，再把它加进同一条 workflow 的 step 清单。
+    const dir = mkdtempSync(join(tmpdir(), "audit-probe-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length, r.comparison.counts.agreed);\n',
+    );
+    const violations = fieldReadViolations([...steps, probeStep], { root: dir });
+    const excerpt = "console.log(r.executors.length, r.comparison.counts.agreed);";
+    expect(violations.filter((v) => v.file === "scripts/probe-read.mjs")).toEqual([
+      { file: "scripts/probe-read.mjs", field: "executors", excerpt },
+      { file: "scripts/probe-read.mjs", field: "comparison", excerpt },
+      { file: "scripts/probe-read.mjs", field: "counts", excerpt },
+    ]);
+    // 形状判据整体必须红：读者集合不再只有口径层。
+    const readers = [...new Set(violations.map((v) => v.step ?? v.file))];
+    expect(readers).toContain("scripts/probe-read.mjs");
+    expect(readers).not.toEqual(["decide"]);
+  });
+
+  it("正向对照必须是解引用：把口径层真读那两行换成纯字面量拼接，对照必须红", () => {
+    // 审查实测的蒙法：字段名还在，读没了。按字面看的对照照样绿。
+    const decide = steps.find((s) => s.id === "decide");
+    const mutated = decide.run
+      .split("\n")
+      .map((line) =>
+        line.includes("r.executors") || line.includes("r.comparison.counts")
+          ? 'lines.push("executors comparison counts");'
+          : line,
+      )
+      .join("\n");
+    // 先证明变异真的落地：那两处解引用不在文本里了。
+    expect(mutated).not.toContain("r.executors");
+    expect(mutated).not.toContain("r.comparison.counts");
+    // 字段名还在，所以「有没有读者」照样命中 —— 这正是旧对照空过的方式。
+    expect(fieldReadViolations([{ id: "decide", run: mutated }]).map((v) => v.field)).toEqual(RESULT_FIELDS);
+    // 但它不是解引用形态，正向对照必须红。
+    expect(fieldDereferences(mutated)).toEqual([]);
+  });
 
   it("注入不被求值：findings 里的 $( ) 原样进 payload，不在 CI 里执行", () => {
     // 输入走 env 而不是内联进 run 块，所以它只能作为字符串到达脚本。
@@ -936,8 +1149,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 值面：$GITHUB_OUTPUT 的原文件里任何一行都不许以 :: 开头 —— 那就是一条注解。
     expect(out.raw.ctx.split("\n").filter((line) => line.startsWith("::"))).toEqual([]);
     expect(out.raw.ctx).not.toContain("pwned");
-    // 恶意串没有被当成 PR 号去查：一次 headRefOid 都没调。
-    expect(out.calls.filter((c) => c.includes("headRefOid"))).toHaveLength(0);
+    // 恶意串没有被当成 PR 号去查：一次 headRefOid 都没调（账本在、这一项 0 条）。
+    expectNoGhCalls(out, "headRefOid");
     // ctx 自己那条 warning 也不许被注入拆成第二行注解。
     const ctxStdout = out.ran.find((s) => s.name === "解析 PR 上下文").stdout;
     expect(ctxStdout.split("\n").filter((line) => line.startsWith("::"))).toEqual([
@@ -1022,12 +1235,15 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect.soft(step).toBeDefined();
     // 红，而且红在「落点非空」这条断言上（不是别的错误恰好在同一行附近）。
     expect.soft(step?.status).not.toBe(0);
-    expect.soft(`${step?.stderr}${step?.stdout}`).toContain("判不了也要有个落点");
+    // 只断言「喊了」，不断言喊的措辞：文案可以改（改成「没有落点」也算），行为不变就不该红。
+    expect.soft(String(step?.stderr ?? "").trim().length).toBeGreaterThan(0);
     // 硬断言与落盘是二选一：它响了，就不许有半份 head_sha 为空的 payload 落地。
     expect.soft(existsSync(join(out.dir, ".audit/check-run.json"))).toBe(false);
     expect.soft(existsSync(join(out.dir, ".audit/payload.json"))).toBe(false);
     expect.soft(out.payload).toBeNull();
-    expect.soft(out.calls.filter((c) => c.includes("check-runs"))).toHaveLength(0);
+    // 「零次调用」的显式形态：账本在（假 gh 跑得起来）、行数是 0（一次都没调）。
+    expect.soft(existsSync(join(out.dir, "calls.log"))).toBe(true);
+    expect.soft(out.calls).toHaveLength(0);
   });
 
   it("-e 作用：留痕回写失败必须让步骤红，不许被后面的 echo 盖成绿", () => {
@@ -1069,6 +1285,37 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     });
     const step = out.ran.find((s) => s.name === "回写 Check Run");
     expect(step.status).not.toBe(0);
+  });
+
+  it("账本是假 gh 建的而不是「读不到就当空」：ENOENT 抛错，零调用是账本在、0 行", () => {
+    // 缺陷形态：`existsSync ? readFileSync : []` 让「harness 断了」与「一次没调」同值，
+    // 于是所有 toHaveLength(0) 的断言在假 gh 不记账时照样绿。
+    const dir = mkdtempSync(join(tmpdir(), "audit-ledger-"));
+    expect(() => readGhLedger(dir)).toThrow(/账本不存在/);
+    writeFileSync(join(dir, "calls.log"), "");
+    expect(readGhLedger(dir)).toEqual([]);
+    writeFileSync(join(dir, "calls.log"), "gh pr view 2 --json headRefOid\n");
+    expect(readGhLedger(dir)).toEqual(["gh pr view 2 --json headRefOid"]);
+
+    // 真跑一条合法零调用的路径（管线在调 gh 之前就红了）：账本在、0 行。
+    const zero = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      { "github.sha": "" },
+      undefined,
+      { skip: ["解析 PR 上下文"] },
+    );
+    expect(existsSync(join(zero.dir, "calls.log"))).toBe(true);
+    expect(zero.calls).toHaveLength(0);
+
+    // 反向对照：同一条 harness 路径上真调用一次，账本恰好长一行。
+    // 把假 gh 的记账行换成 `true`（审查者的变异），这里立刻 0 行 → 红。
+    const one = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      { "inputs.pr": "" },
+    );
+    expect(existsSync(join(one.dir, "calls.log"))).toBe(true);
+    expect(one.calls).toHaveLength(1);
+    expect(one.calls[0]).toContain("check-runs");
   });
 
   it("上游没注入 findings：不写 pass，落成 INFRA", () => {
