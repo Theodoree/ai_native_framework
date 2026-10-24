@@ -249,3 +249,29 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **一条判定尺度的重申**：这四类都不是「功能错」，而是**断言看着在盯、其实放行**。每次修完都要问一句「把被测代码改成什么样，会全绿」——本轮三个 high 全是这么找出来的，且都由外部执行器先找到，说明我给自己的复核还不够狠。
 
 **仍未覆盖（诚实登记）**：`console.log(JSON.parse(readFileSync(".audit/result.json")))` 这种不落变量的纯表达式打印判不到（整体 dump 只认标识符）；跨行改名再枚举（`const all = r; console.log(all)`）；`cat/head/gh api` 这类把内容泼进日志的 shell 形态不在读取面；`container.options` 里写容器内绝对路径只能落 missing/unfollowable；heredoc 里的 `#` 有误剥风险；loader 取值含空格会被截断。
+
+### 轮十二：枚举拼写这条路走到头了——改成默认拒绝 + 白名单放行
+
+轮十一把读的计价单位从「行」收到「调用」，但**计价仍然靠枚举调用拼写**（`\breadFileSync\s*\(`、标识符紧邻 `(`）。两家执行器各自证明：换一种等价拼写就完全不计价。
+
+| 变异 | 轮十一后 | 说明 |
+| --- | --- | --- |
+| `fs["readFileSync"](".audit/result.json", …)` 走 `node -e` | **0 红**（我自己复现，98 passed） | 方括号字符串索引不匹配点号形态的正则；同行无 `JSON.parse` 故兜底不补 |
+| 同一行改回点号 | 3 红 | 红绿只差一个 `.` 与 `["…"]` |
+| 读者写进 `scripts/x.cjs`（`raw.includes("verdict")` 只做分支，不 dump 不 parse），step 只写 `node scripts/x.cjs` | **0 红** | 被引用脚本的内容没有走同一套判定 |
+| `fs["writeFileSync"](".audit/result.json", …)` 改写结论 | 0 判据红 | 写形态同样按字面点号枚举，既不成写者也不触发写形态 |
+| `echo "--out .audit/result.json"` 造伪写者步 | 3 红，但靠 `resultJsonWriterSteps` 整集等值断言兜着 | `hasResultJsonWrite` 不掩字符串字面量 |
+
+**根因判断（我定的方向）**：判据的**默认方向**决定它拦不拦得住人，**枚举**决定它多久被绕过一次。每补一种拼写就是给对手一张「还差哪几种」的清单（计算属性、`.call`、别名、`util.promisify` 都能再生）。所以不再补拼写。
+
+**新结构（`tests/audit-findings.test.mjs`，98→103 例）**：
+- **默认拒绝**：任一行（掩掉字符串字面量后）出现 `result.json` 路径或 `.audit/*.json` 通配即算「引用」；非写者步的引用默认 violation，不再需要先「认出一次读调用」。整行注释不计，行尾注释照计。
+- **白名单（显式且最小）**：只放行「纯文本倒出」——`cat <该文件>`（可 `2>/dev/null`、`|| true`、可 `$(...)` 赋值给变量）与该变量随后 `echo`/`printf` 原样输出、`[[ ]]/test` 比较。附带 FORBIDDEN 名单（`jq` / `JSON.parse` / `Object.keys|entries|values` / `node|python|perl|ruby` / `sed|awk|cut|tee|dd|grep|head|tail|xargs|exec|eval|source|base64|openssl|curl|wget|nc`）与真管道一律 violation。
+- **写侧默认拒绝**：写者 = 引用 + 写意图（写族名字出现，含计算属性 `["writeFileSync"]`、`--out`）。判写形态前先掩字符串，`echo "--out …"` 造不出伪写者。写者步仍只给一次纯读额度。
+- **同一套扫描作用在被引用脚本的文件内容上**（`referencedScripts`/`scriptTree` 已经跟进去），否则「读者写进 .cjs」是永久免费通道。
+
+**我的独立复核（四种变异，我自己在 `/tmp` 副本上跑，改后 `yaml.safe_load` 验证、有 `Tests` 汇总行）**：`fs["readFileSync"]` 走 `node -e` → 3 红；别名 `const rf=fs.readFileSync; rf(...)` → 3 红；`fs["writeFileSync"]` 改写 → 3 红；`.cjs` 内方括号读只做分支 → 3 红。还原后 103 绿；整仓 269 tests / 13 files。
+
+**仍未覆盖（诚实登记）**：拆分/变量拼路径（`"res"+"ult.json"`）、Base64 后倒出、`cat $(echo .audit/result.json)` 这类动态取值（不跟踪，也不落 `unfollowable`）；白名单允许 `echo`/`printf` 把原文本重定向到别处（只禁管道与加工）；别名仅在同一段文本内有效，跨 step 借变量不跟踪。
+
+**白名单是新的绕过面，不是安全区**：每一条放行都必须在报告里带理由，且「把 `cat` 换成 `sed`/`tee`/`dd`/`while read`」必须落 violation 而不是静默放行——这一点已用 8 条反例钉住。
