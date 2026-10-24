@@ -176,11 +176,11 @@ export function compareFindings(a, b) {
   const slots = new Map();
   for (const finding of findingsOf(a)) {
     const key = keyOf(finding);
-    slots.set(key, { ...(slots.get(key) ?? {}), a: finding });
+    slots.set(key, { ...slots.get(key), a: finding });
   }
   for (const finding of findingsOf(b)) {
     const key = keyOf(finding);
-    slots.set(key, { ...(slots.get(key) ?? {}), b: finding });
+    slots.set(key, { ...slots.get(key), b: finding });
   }
   const agreed = [];
   const onlyA = [];
@@ -283,6 +283,19 @@ export function assess({ a, b } = {}) {
     ["b", b],
   ].filter(([, raw]) => raw !== undefined);
   const executors = inputs.map(([slot, raw]) => accountFor(slot, raw));
+  // 槽内已经校验「自报的执行器 == 所在槽」，但槽间没有人管：两个槽都自报同一个执行器时，
+  // 双执行器独立比对的前提就没了 —— 一份意见会被记成两票，比对永远是 agreed。
+  // 这条不变式原先只写在 audit-slot.mjs 的注释里，注释拦不住一次配置改动，所以这里也判一次。
+  const claimants = executors
+    .map((e) => (e.evidence && typeof e.evidence.executor === "string" ? e.evidence.executor : null))
+    .filter((x) => x !== null);
+  const duplicated = claimants.find((x, i) => claimants.indexOf(x) !== i) ?? null;
+  if (duplicated) {
+    for (const e of executors) {
+      e.effective = "INFRA";
+      e.reason = "两个槽自报同一个执行器 " + duplicated + "：双执行器独立比对的前提消失";
+    }
+  }
   const verdict = normalizeVerdict(executors.map((e) => e.effective));
   const comparison =
     a !== undefined && b !== undefined ? compareFindings(a, b) : null;

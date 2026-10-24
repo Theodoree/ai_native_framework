@@ -16,6 +16,14 @@ name: audit
 # success，于是一个可能产出 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
 # 那是结构性死锁，而且会训练人忽略红灯。等上游真执行器能保证「PR 事件一律有结论」之后再
 # 打开 pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
+#
+# 手动触发的硬约束：**从 PR 的 head 分支 dispatch**。dispatch 的 ref 决定 job 的 GITHUB_SHA，
+# 与 PR head 无关。能解出 PR head sha 时，判定落点永远是那个 sha（与 ref 无关）；
+# 解不出来时只能退回 GITHUB_SHA，那时落点才是 dispatch ref 的提交 —— ref 不是 head 分支，
+# 留痕就落在别的提交上，PR head 上上一轮的结论原样保留。
+# 这条不靠注释兜着：「判不了：回写 INFRA」把落点 sha 写进 Check Run 标题，并用 ::error:: 喊出来。
+# 该窗口在 audit 被挂成 required check 之前没有消费者（P-14 全量时才关上）。
+
 on:
   workflow_dispatch:
     inputs:
@@ -68,6 +76,10 @@ jobs:
           PR_INPUT: ${{ inputs.pr }}
         run: |
           pr="$PR_INPUT"
+          # PR 号只允许是数字：它要进 $GITHUB_OUTPUT 和注解，一个换行就能伪造一条注解。
+          case "$pr" in
+            '' | *[!0-9]*) pr="" ;;
+          esac
           sha=""
           if [ -n "$pr" ]; then
             sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
@@ -152,6 +164,8 @@ jobs:
           echo '::warning title=audit INFRA::判不了，不是通过；详情见本次运行摘要'
 
       # 判不了也要在 sha 上留下 action_required：不写等于让对方继续沿用上一轮的绿。
+      # 但落点是**猜的**（GITHUB_SHA = dispatch ref 的提交），所以标题与摘要都写明这一点，
+      # 别写成「已经在正确的位置留过痕」。
       - name: 判不了：回写 INFRA
         if: steps.ctx.outputs.ok != '1'
         env:
@@ -166,7 +180,13 @@ jobs:
               head_sha: sha,
               status: "completed",
               conclusion: "action_required",
-              output: { title: "audit INFRA", summary: "解析 PR 上下文失败：不知道审哪个 sha，判不了。落点 " + sha },
+              output: {
+                title: "audit INFRA（落点 " + sha + "：不是 PR head）",
+                summary:
+                  "解析 PR 上下文失败：不知道这个 PR 的 head sha，判不了。落点是本次 dispatch 的提交 " +
+                  sha +
+                  "，不保证等于 PR head —— dispatch 的 ref 不是 head 分支时，PR head 上的旧结论仍然保留。",
+              },
             }));
           '
           gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
@@ -174,7 +194,13 @@ jobs:
             echo '## audit: INFRA（解析不了 PR 上下文）'
             echo ''
             echo 'PR 号给了，但取不到它的 head sha。审计没有对象，判不了，按 INFRA 回写。'
+            echo ''
+            echo '**落点不一定是 PR head**：写到的 sha 是本次 dispatch 的提交。'
+            echo 'dispatch 的 ref 不是这个 PR 的 head 分支时，这条留痕落在别的提交上，'
+            echo 'PR head 上的旧结论原样保留——别把「看见过 audit 的红」当成「这个 PR 判过」。'
           } >> "$GITHUB_STEP_SUMMARY"
+          echo '::error title=audit INFRA::判不了：取不到 PR head sha，落点是 dispatch 提交而不是 PR head'
+
 
       - name: 判定
         if: steps.ctx.outputs.ok == '1'

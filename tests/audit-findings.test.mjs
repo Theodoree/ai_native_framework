@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -14,8 +14,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import {
+  assess,
   compareFindings,
-  exitCodeFor,
   normalizeVerdict,
   toCheckConclusion,
   validateResult,
@@ -196,8 +196,14 @@ describe("退出码", () => {
       writeFileSync(path, JSON.stringify(body));
       return path;
     };
-    const args = [SCRIPT, "--a", write("a.json", a)];
-    if (b) args.push("--b", write("b.json", b));
+    // 两个槽各写一个执行器：同一份证据填两槽是跨槽不变式要判 INFRA 的情形，
+    // 而这里测的是 verdict -> 退出码，不是槽位身份。
+    const seat = (body, executor, agent) => ({
+      ...body,
+      evidence: { ...body.evidence, executor, agent },
+    });
+    const args = [SCRIPT, "--a", write("a.json", seat(a, "sandbox", "review-a"))];
+    if (b) args.push("--b", write("b.json", seat(b, "github", "review-b")));
     const out = join(dir, "result.json");
     args.push("--out", out);
     const spawned = spawnSync(process.execPath, args, { encoding: "utf8" });
@@ -240,6 +246,23 @@ describe("退出码", () => {
     );
     expect(spawned.status).toBe(3);
     expect(spawned.stdout).toContain("读不到输入");
+  });
+});
+
+describe("跨槽不变式", () => {
+  it("两个槽自报同一个执行器 -> INFRA（一份意见不许记成两票）", () => {
+    const same = result({
+      evidence: { ...result().evidence, executor: "github", agent: "review-b" },
+    });
+    const out = assess({ a: same, b: same });
+    expect(out.verdict).toBe("INFRA");
+    expect(out.conclusion).toBe("action_required");
+    expect(out.executors.map((e) => e.reason).join("\n")).toContain("同一个执行器");
+  });
+
+  it("两个槽不同执行器时不受影响", () => {
+    const other = result({ evidence: { ...result().evidence, executor: "github", agent: "review-b" } });
+    expect(assess({ a: result(), b: other }).verdict).toBe("pass");
   });
 });
 
@@ -315,8 +338,15 @@ describe("wiring: .github/workflows/audit.yml", () => {
     ]) {
       const step = steps.find((s) => s.name === name);
       expect(step.env[key]).toContain("inputs.findings_" + (name.endsWith("a") ? "a" : "b"));
-      expect(step.run).not.toContain("inputs.findings_");
     }
+    // 不逐个点名 key：手写清单只会覆盖你想到的那几个槽。任何 step 的 run 块里
+    // 出现 inputs. 就是一次 shell 拼接，一律算违规。
+    for (const step of steps) {
+      if (!step.run) continue;
+      expect(step.run, step.name).not.toContain("inputs.");
+    }
+    const ctxStep = steps.find((s) => s.name === "解析 PR 上下文");
+    expect(ctxStep.env.PR_INPUT).toContain("inputs.pr");
   });
 });
 
@@ -345,6 +375,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       "  exit 0",
       "fi",
       "if [[ \"$*\" == *\"check-runs\"* ]]; then",
+      "  if [[ -n \"$FAKE_GH_POST_FAILS\" ]]; then echo 'gh: 422' >&2; exit 1; fi",
       "  while [[ $# -gt 0 ]]; do",
       "    if [[ \"$1\" == \"--input\" ]]; then cp \"$2\" \"$PWD/payload.json\"; fi",
       "    shift",
@@ -381,7 +412,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     if (typeof json !== "string" || json.trim() === "") return "";
     try {
       const parsed = JSON.parse(json);
-      parsed.evidence = { ...(parsed.evidence ?? {}), executor, agent };
+      parsed.evidence = { ...parsed.evidence, executor, agent };
       return JSON.stringify(parsed);
     } catch {
       return json;
@@ -413,6 +444,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       GH_TOKEN: "fake-token",
       GITHUB_OUTPUT: join(dir, "output.env"),
       GITHUB_STEP_SUMMARY: join(dir, "summary.md"),
+      // 与假 gh 返回的 headRefOid（cafebabe）故意不同：这样「落点来自 gh 还是来自 dispatch 提交」
+      // 是能被断言区分的，而不是两边恰好相等、怎么改都绿。
+      GITHUB_SHA: "f00dfeed",
+      GITHUB_REPOSITORY: "o/r",
       CI: "true",
       ...findings,
     };
@@ -538,8 +573,24 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     );
     expect(out.outputs.ctx.ok).toBe("0");
     expect(out.payload).toMatchObject({ name: "audit", conclusion: "action_required" });
-    expect(out.summary).toContain("判不了");
+    // 落点必须是一个真 sha：空 head_sha 会被 GitHub 422 拒，一个 Check Run 都写不出去。
+    expect(out.payload.head_sha).toBe("f00dfeed");
+    expect(out.calls.some((c) => c.includes("repos/o/r/check-runs"))).toBe(true);
+    // 落点不等于 PR head 这件事要喊出来，不能只写在注释里。
+    expect(String(out.payload.output.title)).toContain("f00dfeed");
+    expect(String(out.payload.output.title)).toContain("不是 PR head");
+    expect(out.ran.some((s) => String(s.stdout).includes("::error"))).toBe(true);
+    expect(out.summary).toContain("落点不一定是 PR head");
     expect(out.ran.at(-1).status).toBe(3);
+  });
+
+  it("-e 作用：留痕回写失败必须让步骤红，不许被后面的 echo 盖成绿", () => {
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: "", AUDIT_FINDINGS_B: "", FAKE_GH_POST_FAILS: "1" },
+      { "inputs.pr": "" },
+    );
+    const step = out.ran.find((s) => s.name === "判不了：回写 INFRA");
+    expect(step.status).not.toBe(0);
   });
 
   it("上游没注入 findings：不写 pass，落成 INFRA", () => {
