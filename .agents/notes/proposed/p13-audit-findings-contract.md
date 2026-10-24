@@ -230,3 +230,22 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **我自己坏掉的探针（第三次，记下来）**：把 job 级 `NODE_OPTIONS` 插成**第二个 `env:`** 键（与既有 `env:` 重复）→ YAML 非法 → vitest 报 `Tests no tests`。那不是「绿」，是根本没跑。固定动作再加一条：**同一个 mapping 里插键，要往既有键下插，不许新开同名键**；并且看到 `Tests no tests` 一律当「探针坏了」而不是「没红」。
 
 **仍未覆盖（诚实登记）**：读额度按行计，一个包装函数把多次读塞进一行不区分；custom shell 只解两层 `bash -c`；非 node 的 custom shell（`python3 -c`）既不产引用也不进 `unfollowable`；`scriptTree` 深度 3 之外不跟；base64/变量拼接的路径不在扫描面。
+
+### 轮十一：收口只到「行」和「空白」，一个注释、一个等号就把豁免让开
+
+轮十把豁免单位从「整步」收到「一次读」，方向对；轮十一两家各自证明**收口位置错了一层**：写形态按**整行原始文本**判，载体按「flag 前面必须有空白」认。
+
+| 缺陷 | 变异 | 轮十后 | 根因 |
+| --- | --- | --- | --- |
+| 写豁免按行判（high） | 口径层写入那一行行尾追加一次真读 | 0 红 | `RESULT_JSON_WRITE.some(re => re.test(line)) → continue` 判「行里有没有写的样子」，不是「这一行是不是纯写」 |
+| 注释可洗白（high） | 同上再加尾注释 `# 上游写者：--out .audit/result.json` | 0 红（删注释则 2 红，红绿只差四个字） | 写形态不剥 shell 注释 |
+| `--require=./x.cjs` 等号形态（high） | 新步 `run: NODE_OPTIONS=--require=./scripts/probe-env.cjs node -e …` | 0 红（换成空格则 2 红） | `LOADER_FLAG_VALUE` 前缀要求行首/空白/引号，`=` 不是起点；取值也不认 `flag=value` 拼写 |
+| `job.container.env`（medium） | `container: { env: { NODE_OPTIONS: --require … } }` | 0 红 | `jobPayloads` 只收 `job.env.*` / `doc.env.*` / `defaults.run.shell` |
+
+**修法（`tests/audit-findings.test.mjs`，92→98 例）**：读改成按**调用**计数（`resultJsonReadCalls`:1560，`readFileSync`/`readFile`/`createReadStream`/`jq`/非写名单的 `callee("…result.json")` 各算一次，同一行两次读就是两条）；写豁免降到调用级（`resultJsonReads`:1615 给每条读标 `onWriteLine`，:1702 `exempt = reads.findIndex(r => !r.onWriteLine)` 只把「不在写行上的第一次读」当合法额度）；写形态改由 `hasResultJsonWrite`:1584 逐行 `stripShellComment` 后判（注释不再生产写形态）；整体枚举补 `WHOLE_DUMP_CALL`:1634（`console.log/info/debug/warn/dir/table`、`process.stdout.write(标识符)`）并对**所有**步生效（原来非写者分支直接 `continue`，`wholeResultEnumerations` 对非写者步是死代码）；`LOADER_FLAG_VALUE`:1305 前缀改 `(?<![\w-])`、取值认 `=` 与 `\s+` 两种，取不到落 `loader-no-value`、含变量落 `loader-dynamic`。载体侧 `jobPayloads` 补 `job.container.env.KEY` 与 `job.container.options`。
+
+**我的独立复核（五种变异，全部我自己在 `/tmp` 副本上跑）**：写行内真读 → 3 红；写行内真读 + 尾注释 → 3 红（同组，证明注释不再是写形态）；兜底步双读 + 写 + dump → 5 红；`container.env --require` → 2 红；`--require=` 等号形态 → 3 红。还原后 98 绿；整仓 264 tests / 13 files。
+
+**一条判定尺度的重申**：这四类都不是「功能错」，而是**断言看着在盯、其实放行**。每次修完都要问一句「把被测代码改成什么样，会全绿」——本轮三个 high 全是这么找出来的，且都由外部执行器先找到，说明我给自己的复核还不够狠。
+
+**仍未覆盖（诚实登记）**：`console.log(JSON.parse(readFileSync(".audit/result.json")))` 这种不落变量的纯表达式打印判不到（整体 dump 只认标识符）；跨行改名再枚举（`const all = r; console.log(all)`）；`cat/head/gh api` 这类把内容泼进日志的 shell 形态不在读取面；`container.options` 里写容器内绝对路径只能落 missing/unfollowable；heredoc 里的 `#` 有误剥风险；loader 取值含空格会被截断。

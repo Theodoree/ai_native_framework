@@ -1258,6 +1258,17 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   function jobPayloads(job, doc = {}) {
     const payloads = [];
     for (const leaf of payloadLeaves(job?.env, ["job", "env"])) payloads.push({ carrier: leaf.path, text: leaf.text });
+    // 容器上的环境变量与 job.env 同一机制：GitHub 里 container.env 对 job 内全部 step 生效，
+    // 位置换了、执行面没换。它零扫描时，读者只要从 job.env 搬到 container.env 就全绿（实测）。
+    for (const leaf of payloadLeaves(job?.container?.env, ["job", "container", "env"])) {
+      payloads.push({ carrier: leaf.path, text: leaf.text });
+    }
+    // container.options 是交给 docker create 的参数表：--env NODE_OPTIONS=--require x 与
+    // container.env 同族可执行。但它只是**一段参数文本**，--entrypoint / --env-file / -v 挂载
+    // 这类形态由 docker 解释，判不出来（见测试里的诚实残余）；只有字面出现的 loader 取值进扫描面。
+    for (const leaf of payloadLeaves(job?.container?.options, ["job", "container", "options"])) {
+      payloads.push({ carrier: leaf.path, text: leaf.text });
+    }
     for (const leaf of payloadLeaves(doc?.env, ["env"])) payloads.push({ carrier: leaf.path, text: leaf.text });
     for (const [carrier, shell] of [
       ["defaults.run.shell", job?.defaults?.run?.shell],
@@ -1270,32 +1281,51 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
 
   // 一份载荷被执行到的脚本引用：shell 字段按 custom shell 命令解，其余按 shell 词法 + loader 取值。
   function payloadScriptRefs(payload, options = {}) {
-    if (payload.carrier === "shell" || payload.carrier === "defaults.run.shell") {
-      return scanShellField(payload.text, options);
-    }
-    const scanned = scanScriptRefs(payload.text, options);
+    const scanned =
+      payload.carrier === "shell" || payload.carrier === "defaults.run.shell"
+        ? scanShellField(payload.text, options)
+        : scanScriptRefs(payload.text, options);
     // 词法结果与 loader 取值可能指向同一个文件（--require ./x.cjs 两路都认得出）：
     // 不合并就会让同一个文件被算成两处引用，下游按文件均摊判据时变成两条违规。
+    // loader 取值对**每一类载体**都成立（shell 字段与 env 一样能带 NODE_OPTIONS），
+    // 取不到 / 拼出来的取值进 unfollowable，不许静默跳过。
+    const loaded = loaderValueRefs(payload.text, options);
     const refs = [];
-    for (const rel of [...scanned.refs, ...loaderValueRefs(payload.text, options)]) {
+    for (const rel of [...scanned.refs, ...loaded.refs]) {
       if (!refs.includes(rel)) refs.push(rel);
     }
-    return { refs, unfollowable: scanned.unfollowable };
+    return { refs, unfollowable: [...scanned.unfollowable, ...loaded.unfollowable] };
   }
 
   // NODE_OPTIONS / node 参数里的「模块取值」：--require x、-r x、--import=x、--loader x。
   // 取值本身在 node 启动前就被加载（它本身就是扫描面），所以不是「看不出来的 flag」。
+  // 前缀只要求「不是词字符、也不是连字符」：空格、引号、等号、$ 都算起点。
+  // 旧写法要求 flag 前面是行首/空白/引号，于是 NODE_OPTIONS=--require=./x.cjs 整个不在扫描面 ——
+  // 红绿只差一个等号，而它在 node 里一字不差地先跑模块（本机 node 实测：先跑 REQUIRED 再跑 main）。
   const LOADER_FLAG_VALUE =
-    /(?:^|[\s"'])(?:--require|--import|-r|--loader|--experimental-loader)(?:=|\s+)([^\s"';|&]+)/g;
+    /(?<![\w-])(?:--require|--import|-r|--loader|--experimental-loader)(?:=|\s+|$)([^\s"';|&]*)/g;
+  // 变量/通配拼出来的取值静态不可解：落 unfollowable（不许猜它拼出了什么）。
+  const LOADER_DYNAMIC_VALUE = /[$*?{\u0060]/;
 
   function loaderValueRefs(text, options = {}) {
     const root = options.root ?? ROOT;
     const refs = [];
+    const unfollowable = [];
     for (const match of String(text).matchAll(LOADER_FLAG_VALUE)) {
-      const rel = resolveScriptRef(root, match[1]);
+      const value = match[1];
+      // 取不到取值（flag 收在文本末尾）：不猜，记 unfollowable。
+      if (!value) {
+        unfollowable.push({ kind: "loader-no-value", detail: match[0].trim() });
+        continue;
+      }
+      if (LOADER_DYNAMIC_VALUE.test(value)) {
+        unfollowable.push({ kind: "loader-dynamic", detail: match[0].trim() });
+        continue;
+      }
+      const rel = resolveScriptRef(root, value);
       if (rel && !refs.includes(rel)) refs.push(rel);
     }
-    return refs;
+    return { refs, unfollowable };
   }
 
   // 一个 step 被执行到的脚本引用：所有载荷的 shell 词法结果 + loader 取值。
@@ -1504,8 +1534,39 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 同一段被执行到的文本里既出现 result.json 路径、又出现把文件内容当数据解析的形态
   // （JSON.parse / readFile / require / jq / Object.entries），无条件算读者。
   const RESULT_JSON = /result\.json/;
-  const RESULT_JSON_DATA_READ =
-    /JSON\.parse|readFile|createReadStream|require\s*\(|\bjq\b|--jq|Object\.(?:entries|keys|values)\s*\(/;
+  // 没有显式读调用、但把整份内容当数据过一遍的兜底形态（JSON.parse / Object.entries）。
+  // 只在**这一行数不到任何读调用**时才记一次：否则 JSON.parse(fs.readFileSync(...)) 会被数成两次读。
+  const RESULT_JSON_PARSE_SHAPES = [/JSON\.parse/, /Object\.(?:entries|keys|values)\s*\(/];
+  // 读的计价单位是**调用**，不是行：一行里两次 readFileSync 就是两次读。
+  // 旧判据是「这一行里有没有写的样子」→ 整行 continue，于是写行里顺带的那次真读
+  // 既不进 reads、也不占「一次读」的额度（实测：--out 行尾追加一次整体打印，92 条全绿）。
+  const RESULT_JSON_READ_FILE_CALLS = [/\breadFileSync\s*\(/g, /\breadFile\s*\(/g, /\bcreateReadStream\s*\(/g];
+  const RESULT_JSON_JQ = /\bjq\b/g;
+  // 把 result.json 路径当参数交给一个函数，也是在把它当数据取用 —— 哪怕解析动作藏在
+  // 包装函数里（兜底步的 read(p) 就是这种形状：那一行只有 JSON.parse 在函数定义处）。
+  const RESULT_JSON_PATH_CALL = /([A-Za-z_$][\w$]*)\s*\(\s*["'][^"']*result\.json["']/g;
+  // 已在别处计过的名字（读函数本身、写函数）：同一次调用不许算两遍，写调用更不是读。
+  const RESULT_JSON_COUNTED_NAMES = [
+    "readFileSync",
+    "readFile",
+    "createReadStream",
+    "writeFileSync",
+    "writeFile",
+    "appendFileSync",
+    "appendFile",
+    "createWriteStream",
+  ];
+
+  function resultJsonReadCalls(line) {
+    let count = 0;
+    for (const re of RESULT_JSON_READ_FILE_CALLS) count += [...line.matchAll(re)].length;
+    count += [...line.matchAll(RESULT_JSON_JQ)].length;
+    for (const match of line.matchAll(RESULT_JSON_PATH_CALL)) {
+      if (!RESULT_JSON_COUNTED_NAMES.includes(match[1])) count += 1;
+    }
+    if (count === 0 && RESULT_JSON_PARSE_SHAPES.some((re) => re.test(line))) return 1;
+    return count;
+  }
 
   // result.json 的落盘写法：口径层用 --out，兜底步用 writeFileSync 补写。
   // 它们是**允许的读者/写者**，而且放行单位是「步」不是「文件」：同一份口径层脚本被
@@ -1516,6 +1577,16 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     /writeFileSync\s*\(\s*["']\.audit\/result\.json["']/,
     /writeFile\s*\(\s*["']\.audit\/result\.json["']/,
   ];
+
+  // 「这一行到底写没写」只在剥掉 shell 注释之后的行上判：注释里留一句
+  // 「# 上游写者：--out .audit/result.json」就能把一整步洗成写者步、白拿「一次读」的额度
+  // （实测红绿只差注释里那四个字）。注释是给人看的，不许参与执行面的判定。
+  function hasResultJsonWrite(text) {
+    return String(text)
+      .split("\n")
+      .map(stripShellComment)
+      .some((line) => RESULT_JSON_WRITE.some((re) => re.test(line)));
+  }
 
   function stepTexts(step, options = {}) {
     const root = options.root ?? ROOT;
@@ -1534,24 +1605,21 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   function resultJsonWriterSteps(stepList, options = {}) {
     const root = options.root ?? ROOT;
     return stepList
-      .filter((step) => stepTexts(step, { root }).some(({ text }) => RESULT_JSON_WRITE.some((re) => re.test(text))))
+      .filter((step) => stepTexts(step, { root }).some(({ text }) => hasResultJsonWrite(text)))
       .map((step) => step.id ?? step.name);
   }
 
-  // 把 result.json 路径当参数交给一个函数，也是在把它当数据取用 —— 哪怕解析动作藏在
-  // 包装函数里（兜底步的 read(p) 就是这种形状：那一行只有 JSON.parse 在函数定义处）。
-  // 不认这一形态，兜底步的合法读就数不到，「一次读」的额度会被一次额外读白白占掉。
-  const RESULT_JSON_PATH_CALL = /[A-Za-z_$][\w$]*\s*\(\s*["'][^"']*result\.json["']/;
-
-  // 一次「数据读」= 同一行里既有 result.json 路径、又把它当数据取用（且不是写）。
-  // 按行数的意义：放行单位是**一次读**，不是一整段文本 —— 一段里两次读就是两次。
+  // 一次「数据读」= 同一行里既有 result.json 路径，又有读调用（或整份数据的解析形态）。
+  // 判写/判读都在**剥掉 shell 注释之后**的行上做：注释里写一句 --out 不能让整行读洗白。
+  // onWriteLine 只影响豁免资格，不改变计数（见 resultJsonReaderViolations）。
   function resultJsonReads(text) {
     const reads = [];
     for (const line of String(text).split("\n").map(stripShellComment)) {
-      if (RESULT_JSON_WRITE.some((re) => re.test(line))) continue;
       if (!RESULT_JSON.test(line)) continue;
-      if (!RESULT_JSON_DATA_READ.test(line) && !RESULT_JSON_PATH_CALL.test(line)) continue;
-      reads.push(line.trim());
+      const calls = resultJsonReadCalls(line);
+      if (calls === 0) continue;
+      const onWriteLine = RESULT_JSON_WRITE.some((re) => re.test(line));
+      for (let i = 0; i < calls; i += 1) reads.push({ excerpt: line.trim(), onWriteLine });
     }
     return reads;
   }
@@ -1561,6 +1629,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // payload，那不是这条的形状。口径层只按字段取用，出现一次就说明它在搬数据而不是产出数据。
   const RESULT_VAR_DECL = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^\n]*result\.json/g;
   const WHOLE_ENUM_CALL = /(?:Object\.(?:entries|keys|values)|JSON\.stringify)\s*\(\s*([A-Za-z_$][\w$]*)/g;
+  // 整体 dump 同一性质：console.log(整份对象) 一次就把 verdict / conclusion / executors /
+  // comparison 全写进公开 run log。只认「整个变量」——console.log(r.verdict) 是按字段取用。
+  const WHOLE_DUMP_CALL =
+    /(?:console\.(?:log|info|debug|warn|dir|table)|process\.stdout\.write)\s*\(\s*([A-Za-z_$][\w$]*)(?![.\w$?[\]])/g;
 
   function wholeResultEnumerations(text) {
     const source = String(text);
@@ -1568,8 +1640,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     if (resultVars.length === 0) return [];
     const found = [];
     for (const line of source.split("\n").map(stripShellComment)) {
-      for (const match of line.matchAll(WHOLE_ENUM_CALL)) {
-        if (resultVars.includes(match[1]) && !found.includes(line.trim())) found.push(line.trim());
+      for (const re of [WHOLE_ENUM_CALL, WHOLE_DUMP_CALL]) {
+        for (const match of line.matchAll(re)) {
+          if (resultVars.includes(match[1]) && !found.includes(line.trim())) found.push(line.trim());
+        }
       }
     }
     return found;
@@ -1606,20 +1680,30 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const producers = resultWriters(stepList, { root });
     const violations = [];
     for (const { source, where, text } of jobPayloadTexts(options.jobPayloads ?? [], { root })) {
-      for (const excerpt of resultJsonReads(text)) violations.push({ step: source, where, excerpt });
+      for (const read of resultJsonReads(text)) violations.push({ step: source, where, excerpt: read.excerpt });
       for (const excerpt of wholeResultEnumerations(text)) violations.push({ step: source, where, excerpt });
     }
     for (const step of stepList) {
       const source = step.id ?? step.name;
       const texts = stepTexts(step, { root });
-      const writes = texts.some(({ text }) => RESULT_JSON_WRITE.some((re) => re.test(text)));
-      const reads = texts.flatMap(({ where, text }) => resultJsonReads(text).map((excerpt) => ({ where, excerpt })));
+      const writes = texts.some(({ text }) => hasResultJsonWrite(text));
+      const reads = texts.flatMap(({ where, text }) => resultJsonReads(text).map((read) => ({ where, ...read })));
       if (!writes) {
-        for (const read of reads) violations.push({ step: source, ...read });
+        for (const read of reads) violations.push({ step: source, where: read.where, excerpt: read.excerpt });
+        // 整体枚举对**所有**步生效：不写 result.json 的步同样能把整份数据 dump 进日志，
+        // 把它放在写者分支里，这道第二防线在非写者步上就是死代码。
+        for (const { where, text } of texts) {
+          for (const excerpt of wholeResultEnumerations(text)) violations.push({ step: source, where, excerpt });
+        }
         continue;
       }
-      // 与写同源的那一次放行：正好一次读时这里什么都不报；多出来的读每一次都报。
-      for (const read of reads.slice(1)) violations.push({ step: source, ...read });
+      // 与写同源的那一次放行：**只在纯读行上**放行一次。挂在写行上的读不享豁免 ——
+      // 写行是产出那一行，往它后面挂一次 readFileSync + dump 就是把产物整份搬进 run log。
+      const exempt = reads.findIndex((read) => !read.onWriteLine);
+      reads.forEach((read, index) => {
+        if (index === exempt) return;
+        violations.push({ step: source, where: read.where, excerpt: read.excerpt });
+      });
       // 整体枚举一条也不放行。写者自己的脚本文件（texts 里 where 就是生产者本身）除外：
       // 那份文件就是「与写同源」的那一份，它的按字段取用不该被当成搬运。
       for (const { where, text } of texts) {
@@ -2458,6 +2542,13 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         where: "with.script",
         excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
       },
+      // 第二道防线（整体枚举）对**所有**载体生效，不只对写者步：不写 result.json 的载体
+      // 同样能把整份数据 dump 进日志。把它关在写者分支里，那道判据就是死代码。
+      {
+        step: "gs",
+        where: "with.script",
+        excerpt: "for (const [k, v] of Object.entries(r)) console.log(k, v);",
+      },
     ]);
     // 认不出的 action 也不许静默跳过：它执行的是仓库外的实现。
     expect(referencedScripts([githubScript], { root: dir }).unfollowable).toEqual([
@@ -2488,6 +2579,12 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         step: "env",
         where: "scripts/probe-env.cjs",
         excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
+      },
+      // env 载体上第二道防线同样生效：整份枚举不看载体，只看「碰没碰这份数据」。
+      {
+        step: "env",
+        where: "scripts/probe-env.cjs",
+        excerpt: "for (const [k, v] of Object.entries(r)) console.log(k, v);",
       },
     ]);
 
@@ -2520,6 +2617,12 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         where: "scripts/probe-pos.mjs",
         excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
       },
+      // 同上：整体枚举对非写者步同样生效，一次 Object.entries 就把整份数据搬走。
+      {
+        step: "probe",
+        where: "scripts/probe-pos.mjs",
+        excerpt: "for (const [k, v] of Object.entries(r)) console.log(k, JSON.stringify(v));",
+      },
     ]);
     // 反例：解析的是别的文件，不算 result.json 的读者。
     writeFileSync(
@@ -2543,7 +2646,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const thief = { id: "thief", run: "node scripts/audit-findings.mjs --out /tmp/elsewhere.json\n" };
     // 同一个文件被两步引用：写 result.json 的那一步放行，另一个不是。
     expect(resultJsonWriterSteps([writer, thief])).toEqual(["decide"]);
-    expect(resultJsonReaderViolations([writer, thief], { root: dir }).map((v) => v.step)).toEqual(["thief"]);
+    // 两处：一次按数据读，一次整份枚举（第二道防线对非写者步同样生效）。
+    expect(resultJsonReaderViolations([writer, thief], { root: dir }).map((v) => v.step)).toEqual([
+      "thief",
+      "thief",
+    ]);
   });
 
   it("env 里的模块取值不靠 ./ 前缀才认：--require / -r / --import= / --loader 的取值都是扫描面", () => {
@@ -2564,7 +2671,9 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       const step = { id: "env", env: { NODE_OPTIONS: value }, run: 'node -e "console.log(1)"\n' };
       expect(stepScriptRefs(step, { root: dir }), value).toEqual(["scripts/probe-env.cjs"]);
       expect(referencedScripts([step], { root: dir }).missing, value).toEqual([]);
+      // 同一条文本报两处：一次按数据读、一次整份枚举 —— 第二道防线不因为载体不是 run 就缺席。
       expect(resultJsonReaderViolations([step], { root: dir }).map((v) => v.where), value).toEqual([
+        "scripts/probe-env.cjs",
         "scripts/probe-env.cjs",
       ]);
     }
@@ -2742,6 +2851,176 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       [],
     );
     expect(resultJsonReaderViolations(realDoc.jobs["audit-runner"].steps, { jobPayloads: realCarriers })).toEqual([]);
+  });
+
+  function mutatedWorkflow(mutate) {
+    const doc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
+    mutate(doc);
+    return YAML.parse(YAML.stringify(doc));
+  }
+
+  it("缺陷1d：写行里追加一次真读 —— 整行不再被写形态吞掉", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-write-line-read-"));
+    const write = "node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json";
+    const legal = [
+      "set +e",
+      write,
+      "set -e",
+      "node -e '",
+      'const r = JSON.parse(fs.readFileSync(".audit/result.json", "utf8"));',
+      "const lines = [];",
+      "for (const e of r.executors) lines.push(e.slot + ': ' + e.declared);",
+      "'",
+      "exit 0",
+    ].join("\n");
+    const step = { id: "decide", run: legal };
+    expect(resultJsonWriterSteps([step])).toEqual(["decide"]);
+    // 合法：写一次、读一次（纯读行），两次都不在同一行上 —— 绿。
+    expect(resultJsonReaderViolations([step], { root: dir })).toEqual([]);
+
+    // 审查实测的变异：写那一行的行尾再挂一次真读 + 整体打印。旧判据看「行内有写样」就整行跳过。
+    const appended =
+      write + " ; node -e 'console.log(JSON.parse(require(\"node:fs\").readFileSync(\".audit/result.json\",\"utf8\")))'";
+    const mutated = { id: "decide", run: legal.split(write).join(appended) };
+    const violations = resultJsonReaderViolations([mutated], { root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["decide"]);
+    expect(violations[0].excerpt).toContain('readFileSync(".audit/result.json","utf8")');
+    // 合法的纯读行仍然豁免：写者步的「一次读」额度还在，只是不许被写行搭车。
+    expect(violations.some((v) => v.excerpt.includes("const r = JSON.parse"))).toBe(false);
+  });
+
+  it("缺陷1e：写形态不许由注释提供 —— 尾注释洗白读行必须红", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-comment-write-"));
+    const commented = {
+      id: "reader",
+      run: [
+        "node -e '",
+        'const r = JSON.parse(fs.readFileSync(".audit/result.json", "utf8")); # 上游写者：--out .audit/result.json',
+        "'",
+      ].join("\n"),
+    };
+    // 注释里那句 --out 不是写：这一步不写 result.json，就不配拿「一次读」的额度。
+    expect(resultJsonWriterSteps([commented])).toEqual([]);
+    expect(resultJsonReaderViolations([commented], { root: dir })).toEqual([
+      {
+        step: "reader",
+        where: "run",
+        excerpt: 'const r = JSON.parse(fs.readFileSync(".audit/result.json", "utf8"));',
+      },
+    ]);
+    // 真 workflow 的写者步判定不受影响：--out 与 writeFileSync 都是认真实代码行。
+    const doc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
+    expect(resultJsonWriterSteps(doc.jobs["audit-runner"].steps)).toEqual(["decide", "fallback"]);
+  });
+
+  it("缺陷1f：兜底步读两次 + 写一次 + 整体打印 —— 只有一次读算合法", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-fallback-reads-"));
+    const base = [
+      "node -e '",
+      'const fs = require("node:fs");',
+      'const read = (p) => JSON.parse(fs.readFileSync(p, "utf8"));',
+      'const r = read(".audit/result.json");',
+      'const c = read(".audit/check-run.json");',
+      'if (!r.verdict) fs.writeFileSync(".audit/result.json", JSON.stringify({ verdict: "INFRA" }));',
+      "console.log(r);",
+      "'",
+    ];
+    const step = { id: "fallback", run: base.join("\n") };
+    expect(resultJsonWriterSteps([step])).toEqual(["fallback"]);
+    // 一次真读（纯读行）拿额度；console.log(整个对象) 是第二道防线接住的整体枚举。
+    const violations = resultJsonReaderViolations([step], { root: dir });
+    expect(violations.map((v) => v.excerpt)).toEqual(["console.log(r);"]);
+
+    // 变异：把第二次读塞进写那一行 —— 写行不再让这行免检，读照样计数、照样上报。
+    const mutated = base
+      .join("\n")
+      .split('if (!r.verdict) fs.writeFileSync(".audit/result.json", JSON.stringify({ verdict: "INFRA" }));')
+      .join(
+        'if (!r.verdict) fs.writeFileSync(".audit/result.json", JSON.stringify({ verdict: "INFRA", peek: String(fs.readFileSync(".audit/result.json", "utf8")) }));',
+      );
+    const after = resultJsonReaderViolations([{ id: "fallback", run: mutated }], { root: dir });
+    expect(after.map((v) => v.excerpt.includes("peek"))).toEqual([true, false]);
+    expect(after.map((v) => v.excerpt)).toContain("console.log(r);");
+  });
+
+  it("缺陷2e：container.env 与 container.options 同样是 job 级执行面", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-container-env-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.verdict);\n',
+    );
+    const job = {
+      container: {
+        image: "node:20",
+        env: { NODE_OPTIONS: "--require ./scripts/probe-read.mjs" },
+        options: "--require ./scripts/probe-read.mjs",
+      },
+      steps: [{ id: "ok", run: "echo ok\n" }],
+    };
+    const carriers = jobPayloads(job, {});
+    expect(carriers.map((payload) => payload.carrier)).toEqual([
+      "job.container.env.NODE_OPTIONS",
+      "job.container.options",
+    ]);
+    // container 的注入面对 job 内全部 step 生效，与 job.env 同机制：引用解析得到、读者报得出。
+    expect(referencedScripts(job.steps, { root: dir, jobPayloads: carriers }).files).toEqual([
+      "scripts/probe-read.mjs",
+    ]);
+    const steps = resultJsonReaderViolations(job.steps, { root: dir, jobPayloads: carriers }).map((v) => v.step);
+    expect(steps).toEqual(["job.container.env.NODE_OPTIONS", "job.container.options"]);
+
+    // 变异落在真 workflow 上：给 audit-runner 加一层 container.env 读者，同一根探针必须红。
+    const mutated = mutatedWorkflow((doc) => {
+      doc.jobs["audit-runner"].container = {
+        image: "node:20",
+        env: { NODE_OPTIONS: "--require ./scripts/probe-read.mjs" },
+      };
+    });
+    const mutatedJob = mutated.jobs["audit-runner"];
+    const mutatedCarriers = jobPayloads(mutatedJob, mutated);
+    expect(mutatedCarriers.map((payload) => payload.carrier)).toContain("job.container.env.NODE_OPTIONS");
+    expect(
+      resultJsonReaderViolations(mutatedJob.steps, { root: dir, jobPayloads: mutatedCarriers }).map((v) => v.step),
+    ).toContain("job.container.env.NODE_OPTIONS");
+  });
+
+  it("缺陷3b：--require=./x.cjs 等号形态与空格形态同等对待", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-loader-equals-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(join(dir, "scripts/probe-env.cjs"), 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\n');
+    const run = "node -e 'console.log(1)'\n";
+    for (const flags of [
+      "--require=./scripts/probe-env.cjs",
+      "--require ./scripts/probe-env.cjs",
+      "-r=./scripts/probe-env.cjs",
+      "--import=./scripts/probe-env.cjs",
+    ]) {
+      const step = { id: "eq", env: { NODE_OPTIONS: flags }, run };
+      expect(referencedScripts([step], { root: dir }).files, flags).toEqual(["scripts/probe-env.cjs"]);
+      expect(resultJsonReaderViolations([step], { root: dir }).map((v) => v.where), flags).toEqual([
+        "scripts/probe-env.cjs",
+      ]);
+    }
+    // 取不到具体值时不许静默：落 unfollowable，写进报告而不是假装覆盖。
+    const dyn = referencedScripts([{ id: "dyn", env: { NODE_OPTIONS: "--require=$PRELOAD" }, run }], { root: dir });
+    expect(dyn.files).toEqual([]);
+    expect(dyn.unfollowable.map((item) => item.kind)).toEqual(["loader-dynamic"]);
+    const bare = referencedScripts([{ id: "bare", env: { NODE_OPTIONS: "--require" }, run }], { root: dir });
+    expect(bare.unfollowable.map((item) => item.kind)).toEqual(["loader-no-value"]);
+  });
+
+  it("反例：真 workflow 的两处合法读各算一次，不因为修边界被染红", () => {
+    const doc = YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8"));
+    const steps = doc.jobs["audit-runner"].steps;
+    const pick = (id) => steps.find((step) => step.id === id);
+    for (const id of ["decide", "fallback"]) {
+      const reads = resultJsonReads(pick(id).run);
+      expect(reads.length, id).toBe(1);
+      expect(reads[0].onWriteLine, id).toBe(false);
+    }
+    expect(resultJsonWriterSteps(steps)).toEqual(["decide", "fallback"]);
+    expect(resultJsonReaderViolations(steps, { root: ROOT })).toEqual([]);
   });
 });
 
