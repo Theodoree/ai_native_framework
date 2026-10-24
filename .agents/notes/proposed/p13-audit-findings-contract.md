@@ -160,4 +160,35 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **记一条流程规则**：两位执行器在**同一个工作副本**里做变异时会互相踩（review-a 备份时文件已被 review-b 改成「删掉围栏循环」的状态，期间还出现过别人加的 `jq` 变异）。审查执行器必须复制到隔离副本（`/tmp/...`）再改；这也解释了上面「不同红数」的一种可能成因。
 
-**又一次被写明的边界（经 review-b 实测复核，属实）**：G3 **不要求 `audit` 存在**——把 `audit` 从 checks 里去掉，门照常 `PASS 4/4` `exit 0`。这就是残余③（`audit` 未挂 required）的另一面，本轮没扩大也没修。因此「`audit` 报绿」这件事**本身不能当作「审计已上闸门」汇报**，必须先把它挂进 required 列表。
+**又一次被写明的边界（经 review-b 实测复核，属实）**：G3 **不要求 `audit` 存在**——把 `audit` 从 checks 里去掉，门照常 `PASS 4/4` `exit 0`。这就是残余③（`audit` 未挂 required）的另一面，本轮没扩大也没修。因此「`audit` 报绿」这件事**本身不能当作「审计已上闸门」汇报**，必须先把它挂进 required 列表。## 十一、轮八：七个「认不出的写法被静默跳过」（`fdfa77a` → 本轮提交）
+
+轮八两家执行器（review-a / review-b）在 `fdfa77a` 上共报 7 条，加上我自己复验的，指向**同一个名字**的缺陷：**判据认不出的写法被静默跳过，既不判红也不进 missing**。
+
+**被打出来的形态（全部我亲自变异复现）**：
+
+| 形态 | 插进 run 块后 |
+| --- | --- |
+| `node scripts/probe-bare`（无扩展名 CJS，node 照跑） | 77 全绿 |
+| `node scripts/wrapper.cjs`，内部 `spawnSync(process.execPath,["scripts/probe-read.mjs"])` | 77 全绿 |
+| `printf '%s' ' # '; node scripts/probe-read.mjs`（引号里的 `#`） | 77 全绿 |
+| `node scripts/probe-read.mjs;`（行尾分号） | 77 全绿 |
+| `/usr/bin/node scripts/probe-read.mjs` | 77 全绿 |
+| `bash -c "node scripts/probe-read.mjs"` | 77 全绿 |
+| `NODE_BIN=node; $NODE_BIN scripts/probe-read.mjs` | 77 全绿 |
+| `const key=["execu","tors"].join(""); r[key]`（拆词拼键） | 77 全绿 |
+| `node --require ./scripts/preload.cjs scripts/probe-read.mjs` | **1 红**（不是全绿，见下） |
+
+**修法的原则（比任一条修法都重要）**：**「跟不下去」必须变成响，不能变成静默。** 连续八轮里同一类缺陷反复出现，根因不是某个正则写错，而是「每种我不认识的写法都被默默丢弃」，于是判据越修越像、绕过面永远存在。所以认识不了的形态一律记进会被断言为空的清单（`missing` / `unfollowable`），让未知写法立刻红；**不做静态求值去猜它拼出了什么**。
+
+**落地**（`tests/audit-findings.test.mjs` 单文件，83 例）：`stripShellComment` 引号感知（:874）、`shellWords`/`shellCommands`（:928/:978，标点即命令分隔符）、`NODE_VALUE_FLAGS`（:999）、`NODE_WORD`（:1061，认绝对路径）、`parseNodeCommand`（:1066，未知 flag → `node-flag`）、`resolveScriptRef`（:1134，补全探测，不中落 missing）、`CHILD_PROCESS*`/`DYNAMIC_KEYS`/`unfollowableShapes`（:1257-:1268）、`referencedScripts` 返回 `{files,missing,unfollowable}`（:1282）。行尾标点由「标点即分隔符」根治，不再靠剥尾字符。
+
+**我的复验（不看修复单自述）**：上面九种形态逐个插进 review-a 落盘 step，全部见红（A 2 红 / B 1 / C 1 / D 1 / E 2 / F 2 / G 1 / H 1 / I 2）；反例 `node --experimental-vm-modules scripts/ok-ok.mjs` + `node -e 'console.log(1)'` 同时插入保持 83 全绿；还原后 83 绿；整仓 249 tests / 13 files、oxlint 0/0。
+
+**一处严重度分歧，我按实测记**：review-a 报 `node --require x scripts/y` 是 high「77 全绿」，我实测是 **1 红**——它被「解引用 result.json 字段的读者只有口径层」那条断言接住，只有**专门**那条叫「扫描面含 run 块里被执行的脚本」的用例漏了它。现象对、严重度报高。这暴露的是「用例名字比它的覆盖强」：断言还在，但它承重的那一格已经空了。
+
+**两条流程缺陷记在调度方账上**：
+
+1. **brief 模板字段名错**：我给执行器的模板让 findings 写 `requiredFix`，而口径层要 `suggestion`（`scripts/audit-findings.mjs:129`）。照我模板写的 JSON 会被判 schema 不合格 → **直接计入 INFRA（未判过）**，那一轮的意见等于没进比对。已改模板。
+2. **自验命令写错**：我给的 `AUDIT_FINDINGS_B=… node scripts/audit-slot.mjs` 会回显 INFRA，该脚本只读 `AUDIT_INPUT`（映射在 `audit.yml:140`）。review-b 自己按真实链路纠正了。
+
+**本轮之后仍未覆盖（诚实登记，都是「已知静默面」）**：`npm/pnpm` 间接调 node、`make`/`xtask` 包装、`node -` 读 stdin（记 `node-stdin` 但不追内容）、ESM 动态 `import(表达式)`、裸模块名、import 深度 >3、`worker_threads`、shell 函数/alias/子 shell、`$( )` 内层命令、跨行引号内的注释与命令边界、`npx tsx/bun/deno` 等其它解释器、把读者藏进 `node_modules` 依赖里。**这些不是「已覆盖」，是「已被登记」**——两者的区别在于前者能拦人，后者只能提醒。

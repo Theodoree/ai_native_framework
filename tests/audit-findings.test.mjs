@@ -865,13 +865,35 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // **加上 run 块里被执行到的脚本文件**：一个 step 的 run 只有 `node scripts/x.mjs` 一行时，
   // 字段名在文件里、不在 run 文本里 —— 只扫 run 就等于给读者留了一整类绕道。
   //
-  // 剔除注释是**有意的近似**，不解析 shell 引号（可靠判定要上真的词法器，不值得）：
-  // 只有 `#` 出现在行首或紧邻空白时才算注释起点，其余一律当普通字符。
-  // 因此 `$#`、`${#x}`、`foo#bar` 不会被误切；
-  // 代价是 `echo "a # executors"` 这种引号内的 `#` 会被当成注释起点 —— 已知漏判。
+  // 剔除注释是**引号感知**的：只有引号外的 `#`（行首或紧邻空白）才是注释起点。
+  // 旧实现直接正则找 `#`，于是 `printf '%s' ' # '; node scripts/probe-read.mjs` 整条命令
+  // 被当成注释切掉 —— 命令整个消失比「读不到字段名」严重：那一步在判据里根本不存在。
+  // 一行内引号不配对时整行保留（宁可漏判注释，也不许把真命令当注释删掉）。
+  // `\#` / `$#` / `${#x}` / `foo#bar` 仍然不切。
+  const SHELL_QUOTES = ["'", '"'];
   function stripShellComment(line) {
-    const at = line.search(/(^|\s)#/);
-    return at === -1 ? line : line.slice(0, at);
+    let quote = null;
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i];
+      if (quote) {
+        if (ch === "\\" && quote === '"') {
+          i += 1;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "\\") {
+        i += 1;
+        continue;
+      }
+      if (SHELL_QUOTES.includes(ch)) {
+        quote = ch;
+        continue;
+      }
+      if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+    }
+    return line;
   }
 
   const RESULT_FIELDS = ["executors", "comparison", "counts"];
@@ -897,23 +919,264 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
 
   const SCRIPT_EXT = /\.(?:mjs|cjs|js)$/;
 
-  // run 块里被执行到的脚本，两种形态都算：
-  //   1) `node [--flag ...] <path>`：node 后面允许跟 flag，第一个非 flag 词才算脚本路径。
-  //   2) shebang 直执行 `./scripts/x.mjs`：此前只是观察项，同样是「run 块里被执行到的脚本」。
-  // 不以 .mjs/.cjs/.js 结尾的词不算（`node -e '...'` 的内联块就是这种）。
-  function scriptRefs(runText) {
-    const refs = [];
-    const add = (raw) => {
-      const target = unquote(raw);
-      if (!SCRIPT_EXT.test(target)) return;
-      const rel = target.replace(/^\.\//, "");
-      if (!refs.includes(rel)) refs.push(rel);
+  // ---- shell 词法：只够用来找「被执行的脚本」，不做展开 ----
+  // 引号内整体成词、引号外按空白切、`;&|()<>` 一律当命令分隔。
+  // 把标点当**分隔**而不是当词尾字符，是 `node scripts/x.mjs;`、`node scripts/x.mjs)` 这类
+  // 行尾标点不再被吃进脚本路径的唯一原因（旧实现 (\S+) 把标点一起当路径，整条命令解析不到）。
+  const SHELL_SEPARATORS = new Set([";", "&", "|", "(", ")", "<", ">"]);
+
+  function shellWords(line) {
+    const words = [];
+    let cur = null;
+    const flush = () => {
+      if (cur !== null) words.push(cur);
+      cur = null;
     };
-    for (const line of foldContinuations(runText).split("\n").map(stripShellComment)) {
-      for (const match of line.matchAll(/(?:^|[\s;&|(])node\s+((?:-{1,2}\S+\s+)*)(\S+)/g)) add(match[2]);
-      for (const match of line.matchAll(/(?:^|[\s;&|(])(\.\/[^\s;&|)]+)/g)) add(match[1]);
+    for (let i = 0; i < line.length; ) {
+      const ch = line[i];
+      if (ch === "'" || ch === '"') {
+        const quote = ch;
+        let value = "";
+        let j = i + 1;
+        while (j < line.length && line[j] !== quote) {
+          if (quote === '"' && line[j] === "\\") {
+            value += line[j + 1] ?? "";
+            j += 2;
+            continue;
+          }
+          value += line[j];
+          j += 1;
+        }
+        // 引号不配对：剩下的整段当一个词（宁可留一个解析不到的候选，也不静默丢词）。
+        cur = (cur ?? "") + value;
+        i = j + 1;
+        continue;
+      }
+      if (ch === "\\") {
+        cur = (cur ?? "") + (line[i + 1] ?? "");
+        i += 2;
+        continue;
+      }
+      if (/\s/.test(ch)) {
+        flush();
+        i += 1;
+        continue;
+      }
+      if (SHELL_SEPARATORS.has(ch)) {
+        flush();
+        words.push(ch);
+        i += 1;
+        continue;
+      }
+      cur = (cur ?? "") + ch;
+      i += 1;
     }
-    return refs;
+    flush();
+    return words;
+  }
+
+  function shellCommands(runText) {
+    const commands = [];
+    for (const line of foldContinuations(runText).split("\n").map(stripShellComment)) {
+      let cur = [];
+      for (const word of shellWords(line)) {
+        if (SHELL_SEPARATORS.has(word)) {
+          if (cur.length) commands.push(cur);
+          cur = [];
+          continue;
+        }
+        cur.push(word);
+      }
+      if (cur.length) commands.push(cur);
+    }
+    return commands;
+  }
+
+  // ---- node 的参数分三类 ----
+  // 1) 不带取值的 flag；2) 带取值的 flag —— **取值本身也是 node 执行的模块**
+  //    （--require/--import/--loader 正是读者藏身的地方，必须一起进扫描面）；3) 脚本路径。
+  // 不认识的 flag 绝不猜「它没有取值」：那正是上一轮让 --require 把真脚本吃掉的老路。
+  const NODE_VALUE_FLAGS = new Set([
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--experimental-policy",
+    "--env-file",
+    "--env-file-if-exists",
+    "-C",
+    "--conditions",
+    "--title",
+    "--input-type",
+    "--icu-data-dir",
+    "--openssl-config",
+    "--diagnostic-dir",
+    "--report-dir",
+    "--report-filename",
+    "--security-revert",
+    "--watch-path",
+    "--stack-trace-limit",
+    "--max-http-header-size",
+    "--dns-result-order",
+    "--disable-warning",
+    "--allow-fs-read",
+    "--allow-fs-write",
+    "--allow-addons",
+  ]);
+  const NODE_CODE_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
+  // 认得的「不带取值」flag：写出来只是为了让它们不落进 unfollowable。
+  const NODE_PLAIN_FLAGS = new Set([
+    "-v",
+    "-h",
+    "-c",
+    "--version",
+    "--help",
+    "--check",
+    "--no-warnings",
+    "--no-deprecation",
+    "--no-addons",
+    "--trace-warnings",
+    "--trace-deprecation",
+    "--throw-deprecation",
+    "--pending-deprecation",
+    "--enable-source-maps",
+    "--preserve-symlinks",
+    "--preserve-symlinks-main",
+    "--frozen-intrinsics",
+    "--watch",
+    "--watch-preserve-output",
+    "--test",
+    "--test-only",
+    "--inspect",
+    "--inspect-brk",
+    "--inspect-wait",
+    "--experimental-vm-modules",
+    "--experimental-detect-module",
+    "--experimental-require-module",
+    "--no-experimental-require-module",
+    "--experimental-global-webcrypto",
+    "--experimental-import-meta-resolve",
+  ]);
+  const NODE_WORD = /(?:^|\/)node$/;
+  // 变量当命令头：`$NODE_BIN scripts/x.mjs`、`${NODE} ...`。
+  const DYNAMIC_NODE_WORD = /^\$\{?[A-Za-z_][A-Za-z0-9_]*(?:[:-][^}]*)?\}?$/;
+  const SHELL_C = /^(?:ba|z|da|k)?sh$/;
+
+  function parseNodeCommand(words) {
+    const scripts = [];
+    const unfollowable = [];
+    const at = words.findIndex((word) => NODE_WORD.test(word));
+    if (at === -1) return { scripts, unfollowable };
+    let seenScript = false;
+    let i = at + 1;
+    while (i < words.length) {
+      const token = words[i];
+      // 脚本路径之后的 token 是脚本自己的参数，不是 node 的 flag。
+      if (seenScript) {
+        i += 1;
+        continue;
+      }
+      if (token === "--") {
+        i += 1;
+        continue;
+      }
+      if (token === "-") {
+        unfollowable.push({ kind: "node-stdin", detail: token });
+        i += 1;
+        continue;
+      }
+      if (token.startsWith("-")) {
+        const eq = token.indexOf("=");
+        const name = eq === -1 ? token : token.slice(0, eq);
+        const attached = eq === -1 ? null : token.slice(eq + 1);
+        if (NODE_CODE_FLAGS.has(name)) {
+          // 内联代码就在 run 文本里（含多行 -e 块），字段名由 run 文本扫描面负责。
+          i += attached === null ? 2 : 1;
+          continue;
+        }
+        if (NODE_VALUE_FLAGS.has(name)) {
+          if (attached !== null) {
+            scripts.push(attached);
+            i += 1;
+            continue;
+          }
+          const value = words[i + 1];
+          if (value === undefined) {
+            unfollowable.push({ kind: "node-flag-value", detail: token });
+            i += 1;
+            continue;
+          }
+          scripts.push(value);
+          i += 2;
+          continue;
+        }
+        if (attached !== null || NODE_PLAIN_FLAGS.has(name)) {
+          i += 1;
+          continue;
+        }
+        // 认不出的 flag：它可能吃掉下一个 token（那正是真脚本）。
+        unfollowable.push({ kind: "node-flag", detail: token });
+        i += 1;
+        continue;
+      }
+      if (!seenScript) {
+        scripts.push(token);
+        seenScript = true;
+      }
+      i += 1;
+    }
+    return { scripts, unfollowable };
+  }
+
+  // 引用解析：带扩展名直接用；无扩展名（node 照跑的 CJS）按 .mjs/.cjs/.js 补全探测；
+  // 探测不到**也保留名字进 missing** —— 静默丢弃正是这一批绕过面的共同根因。
+  function resolveScriptRef(root, raw) {
+    const rel = unquote(raw).replace(/^\.\//, "");
+    if (!rel || rel.startsWith("-")) return null;
+    if (SCRIPT_EXT.test(rel)) return rel;
+    const abs = scriptPath(root, rel);
+    if (abs && existsSync(abs)) return rel;
+    for (const ext of SCRIPT_EXTS) {
+      const candidate = rel + ext;
+      const absCandidate = scriptPath(root, candidate);
+      if (absCandidate && existsSync(absCandidate)) return candidate;
+    }
+    return rel;
+  }
+
+  // run 块里被执行到的脚本：node 命令行（含 --require/--import 的取值）+ shebang 直执行的 ./ 形态。
+  // 跟不下去的形态（未知 flag、sh -c 又包一层、变量当 node）进 unfollowable，由形状用例判红。
+  function scanScriptRefs(runText, options = {}) {
+    const root = options.root ?? ROOT;
+    const refs = [];
+    const unfollowable = [];
+    const add = (raw) => {
+      const rel = resolveScriptRef(root, raw);
+      if (rel && !refs.includes(rel)) refs.push(rel);
+    };
+    for (const words of shellCommands(runText)) {
+      const head = words[0] ?? "";
+      if (SHELL_C.test(head) && /^-{1,2}c$/.test(words[1] ?? "")) {
+        const body = words.slice(2).join(" ");
+        // 只处理「看得出在跑 node」的 body：把 bash 跑的任何东西都当 node，判据就变成噪声。
+        if (/(?:^|[\s;"'])(?:\S*\/)?node(?:[\s;"']|$)/.test(body)) unfollowable.push({ kind: "shell-c", detail: body });
+        continue;
+      }
+      const parsed = parseNodeCommand(words);
+      for (const script of parsed.scripts) add(script);
+      unfollowable.push(...parsed.unfollowable);
+      // 变量当命令头（$NODE_BIN scripts/x.mjs）：认得出在跑 node，可执行文件路径静态不可解。
+      if (parsed.scripts.length === 0 && DYNAMIC_NODE_WORD.test(head) && /NODE/i.test(head)) {
+        unfollowable.push({ kind: "dynamic-node", detail: words.join(" ") });
+      }
+      for (const word of words) if (word.startsWith("./")) add(word);
+    }
+    return { refs, unfollowable };
+  }
+
+  function scriptRefs(runText, options = {}) {
+    return scanScriptRefs(runText, options).refs;
   }
 
   function scriptPath(root, rel) {
@@ -924,13 +1187,13 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 生产者必然同时出现这些字段名（它要造出这些字段），把它算成「读者」只会逼出一份手写豁免名单 ——
   // 判据变成名单的一刻就不再是判据。所以从 run 文本里推导，且这条推导本身被断言钉住。
   const RESULT_OUT_FLAG = "--out .audit/result.json";
-  function resultWriters(stepList) {
+  function resultWriters(stepList, options = {}) {
     const writers = [];
     for (const step of stepList) {
       if (typeof step.run !== "string") continue;
       for (const line of step.run.split("\n").map(stripShellComment)) {
         if (!line.includes(RESULT_OUT_FLAG)) continue;
-        for (const rel of scriptRefs(line)) if (!writers.includes(rel)) writers.push(rel);
+        for (const rel of scriptRefs(line, options)) if (!writers.includes(rel)) writers.push(rel);
       }
     }
     return writers;
@@ -986,21 +1249,61 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     return { files, missing };
   }
 
+  // 「跟不下去」的脚本形态：一律记 unfollowable，由形状用例断言为空 —— 看见就喊，不猜。
+  // 1) 进程派生（child_process / spawn / exec / execFile / fork）：node 走了另一条进程，
+  //    静态 import 图上没有这条边，光跟 import 就等于没有读者。
+  // 2) 拼出来的键（[...].join(...)、["a" + "b"]、String.fromCharCode、模板串当键）：
+  //    不做静态求值 —— 猜它拼出了什么，猜错一次绕过面就回来了。
+  const CHILD_PROCESS = /child_process/;
+  const CHILD_PROCESS_CALL = /(?<![.\w])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\s*\(/;
+  const DYNAMIC_KEYS = [
+    /\[\s*(?:["'][^"']*["']\s*,\s*)+["'][^"']*["']\s*\]\s*\.\s*join\s*\(/,
+    // 方括号取键才可能是「拼出来的键」：左侧必须是标识符 / ] / )，
+    // 否则数组字面量里的字符串拼接（`["x" + y]`）会变成误报。
+    /[A-Za-z0-9_\])]\s*\[\s*["'][^"']*["']\s*\+/,
+    /String\.fromCharCode/,
+    /\[\s*`/,
+  ];
+
+  function unfollowableShapes(text) {
+    const found = [];
+    for (const line of text.split("\n")) {
+      let kind = null;
+      if (CHILD_PROCESS.test(line) || CHILD_PROCESS_CALL.test(line)) kind = "child-process";
+      else if (DYNAMIC_KEYS.some((re) => re.test(line))) kind = "dynamic-key";
+      if (kind && !found.some((entry) => entry.kind === kind)) found.push({ kind, excerpt: line.trim() });
+    }
+    return found;
+  }
+
   // 扫描面覆盖到的脚本文件（含 import 跟随后的下一跳，含解析不到的）：
   // 解析不到就是扫描面漏了一格，这件事由形状用例显式断言，不在这里静默吞掉。
+  // 跟不下去的形态同样显式记下来（进 unfollowable），并带上引用它的 step。
   function referencedScripts(stepList, options = {}) {
     const root = options.root ?? ROOT;
     const files = [];
     const missing = [];
+    const unfollowable = [];
+    const note = (entry) => {
+      const clash = unfollowable.some((u) => u.step === entry.step && u.file === entry.file && u.kind === entry.kind);
+      if (!clash) unfollowable.push(entry);
+    };
     for (const step of stepList) {
       if (typeof step.run !== "string") continue;
-      for (const rel of scriptRefs(step.run)) {
+      const stepId = step.id ?? step.name;
+      const scanned = scanScriptRefs(step.run, { root });
+      for (const shape of scanned.unfollowable) note({ step: stepId, file: null, ...shape });
+      for (const rel of scanned.refs) {
         const tree = scriptTree(root, rel);
         for (const file of tree.files) if (!files.includes(file)) files.push(file);
         for (const gone of tree.missing) if (!missing.includes(gone)) missing.push(gone);
+        for (const file of tree.files) {
+          const abs = scriptPath(root, file);
+          for (const shape of unfollowableShapes(readFileSync(abs, "utf8"))) note({ step: stepId, file, ...shape });
+        }
       }
     }
-    return { files, missing };
+    return { files, missing, unfollowable };
   }
 
   // JS 注释刻意**不剥离**（取舍）：要分清 `"http://x"` 里的 // 与注释起点，得上真的 JS 词法器；
@@ -1008,7 +1311,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 所以宁可误报（注释里出现字段名也记一条，改注释即可），不许漏读。
   function fieldReadViolations(stepList, options = {}) {
     const root = options.root ?? ROOT;
-    const writers = resultWriters(stepList);
+    const writers = resultWriters(stepList, { root });
     const violations = [];
     for (const step of stepList) {
       if (typeof step.run !== "string") continue;
@@ -1019,7 +1322,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
         if (hit) violations.push({ step: source, field, excerpt: hit.trim() });
       }
       // 跟随 import：读者可能坐在 run 引用的脚本的下一跳（契约层拆文件就靠这条）。
-      for (const entry of scriptRefs(step.run)) {
+      for (const entry of scriptRefs(step.run, { root })) {
         if (writers.includes(entry)) continue;
         for (const rel of scriptTree(root, entry).files) {
           const text = readFileSync(scriptPath(root, rel), "utf8");
@@ -1118,6 +1421,9 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 那时「没有别的读者」会退化成「没扫到」，必须当成 harness 的错。
     const scripts = referencedScripts(steps);
     expect(scripts.missing, JSON.stringify(scripts.missing)).toEqual([]);
+    // 跟不下去的形态同样必须为零：未知写法被静默跳过，正是这一批绕过面的共同根因。
+    // 口径层与落盘槽都不派生进程、不拼键，这条断言在真仓库上不该有任何豁免。
+    expect(scripts.unfollowable, JSON.stringify(scripts.unfollowable)).toEqual([]);
     expect(scripts.files).toContain("scripts/audit-findings.mjs");
     // 唯一的豁免是 result.json 的生产者，且它必须是从 run 文本里推出来的那一个。
     expect(resultWriters(steps)).toEqual(["scripts/audit-findings.mjs"]);
@@ -1173,8 +1479,13 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(fieldReadViolations([{ id: "c", run: "echo $# ${#x} executors\n" }])).toEqual([
       { step: "c", field: "executors", excerpt: "echo $# ${#x} executors" },
     ]);
-    // 近似边界的另一面（已知漏判）：引号内的 # 也会被当成注释起点。这是近似的代价，不是达成。
-    expect(fieldReadViolations([{ id: "c", run: 'echo "a # executors"\n' }])).toEqual([]);
+    // 引号内的 # 不是注释起点（引号感知）：'echo "a # executors"' 是真会打印出字段名的行，
+    // 旧实现把它当注释整段切掉 —— 读者没被看见，就被当成没有读者。
+    expect(fieldReadViolations([{ id: "c", run: 'echo "a # executors"\n' }])).toEqual([
+      { step: "c", field: "executors", excerpt: 'echo "a # executors"' },
+    ]);
+    // 反面：引号外的 # 仍然是注释起点，不许为这一条把整行注释也读成读者。
+    expect(fieldReadViolations([{ id: "c", run: 'echo "a"; # executors\n' }])).toEqual([]);
   });
 
   it("真读者照样红：r.executors / .[\"executors\"] / 动态键 r[k] 都是同一字段的读法", () => {
@@ -1264,6 +1575,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(referencedScripts([probeStep], { root: dir })).toEqual({
       files: ["scripts/wrapper.mjs", "scripts/probe-read.mjs"],
       missing: [],
+      unfollowable: [],
     });
     const violations = fieldReadViolations([probeStep], { root: dir });
     expect(violations).toEqual([
@@ -1308,6 +1620,233 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(scriptTree(dir, "scripts/gone.mjs")).toEqual({
       files: ["scripts/gone.mjs"],
       missing: ["./nope.mjs"],
+    });
+  });
+
+  it("node 参数三类：带取值的 flag 不吃掉真脚本，--require/--import 的取值本身就是扫描面", () => {
+    // 缺陷形态：node 之后只把「flag 段之后的第一个 token」当脚本，于是
+    // node --require ./scripts/preload.cjs scripts/probe-read.mjs 里真脚本被 flag 的取值吃掉。
+    const dir = mkdtempSync(join(tmpdir(), "audit-node-flags-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length);\n',
+    );
+    writeFileSync(
+      join(dir, "scripts/preload.cjs"),
+      'const r = require("fs").readFileSync(".audit/result.json");\nconsole.log(r.executors);\n',
+    );
+    writeFileSync(join(dir, "scripts/ok.mjs"), "console.log(1);\n");
+
+    const forms = [
+      "node --require ./scripts/preload.cjs scripts/probe-read.mjs",
+      "node --import ./scripts/preload.cjs scripts/probe-read.mjs",
+      "node -r ./scripts/preload.cjs scripts/probe-read.mjs",
+      "node --require=./scripts/preload.cjs scripts/probe-read.mjs",
+    ];
+    for (const run of forms) {
+      // 取值本身也是 node 执行的模块：两个文件都在扫描面上，顺序就是 node 的执行顺序。
+      expect(scriptRefs(run, { root: dir }), run).toEqual(["scripts/preload.cjs", "scripts/probe-read.mjs"]);
+      expect(referencedScripts([{ id: "probe", run }], { root: dir }).missing, run).toEqual([]);
+      expect(referencedScripts([{ id: "probe", run }], { root: dir }).unfollowable, run).toEqual([]);
+      // 两个文件都读了字段：preload 与 probe 各一条，红只能来自被执行的脚本。
+      expect(run).not.toMatch(/executors|comparison|counts/);
+      expect(
+        fieldReadViolations([{ id: "probe", run }], { root: dir }).map((v) => v.file),
+        run,
+      ).toEqual(["scripts/preload.cjs", "scripts/probe-read.mjs"]);
+    }
+
+    // 反例：不带取值的 flag / 内联代码 / 普通调用都不许判红。
+    expect(scriptRefs("node --experimental-vm-modules scripts/ok.mjs", { root: dir })).toEqual(["scripts/ok.mjs"]);
+    expect(scriptRefs("node -e 'console.log(1)'", { root: dir })).toEqual([]);
+    expect(scriptRefs("node scripts/ok.mjs", { root: dir })).toEqual(["scripts/ok.mjs"]);
+    for (const run of [
+      "node --experimental-vm-modules scripts/ok.mjs",
+      "node -e 'console.log(1)'",
+      "node scripts/ok.mjs",
+    ]) {
+      expect(referencedScripts([{ id: "ok", run }], { root: dir }).unfollowable, run).toEqual([]);
+      expect(fieldReadViolations([{ id: "ok", run }], { root: dir }), run).toEqual([]);
+    }
+
+    // 认不出的 flag 不许猜「它没有取值」：它可能吃掉下一个 token，那正是真脚本。
+    const unknown = referencedScripts([{ id: "u", run: "node --unsafe-unknown-flag scripts/ok.mjs" }], { root: dir });
+    expect(unknown.unfollowable).toEqual([
+      { step: "u", file: null, kind: "node-flag", detail: "--unsafe-unknown-flag" },
+    ]);
+    expect(unknown.files).toEqual(["scripts/ok.mjs"]);
+  });
+
+  it("无扩展名脚本不静默丢：按 .mjs/.cjs/.js 补全探测，探测不到进 missing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-noext-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    // node 照跑无扩展名文件（CJS）：它是真读者，旧实现只看扩展名，在解析前就把它丢了。
+    writeFileSync(
+      join(dir, "scripts/probe-bare"),
+      'const r = JSON.parse(require("fs").readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length);\n',
+    );
+    writeFileSync(join(dir, "scripts/ok-bare"), "console.log(1);\n");
+    writeFileSync(join(dir, "scripts/lib.mjs"), "console.log(2);\n");
+    const bare = { id: "probe", run: "node scripts/probe-bare\n" };
+    expect(bare.run).not.toMatch(/executors|comparison|counts/);
+    expect(scriptRefs(bare.run, { root: dir })).toEqual(["scripts/probe-bare"]);
+    expect(fieldReadViolations([bare], { root: dir })).toEqual([
+      { file: "scripts/probe-bare", field: "executors", excerpt: "console.log(r.executors.length);" },
+    ]);
+    expect(referencedScripts([bare], { root: dir })).toEqual({
+      files: ["scripts/probe-bare"],
+      missing: [],
+      unfollowable: [],
+    });
+    // 补全探测：node scripts/lib 落到 scripts/lib.mjs 上。
+    expect(scriptRefs("node scripts/lib", { root: dir })).toEqual(["scripts/lib.mjs"]);
+    // 反例：探测不到的名字不再静默丢，而是进 missing（扫描面漏一格必须喊出来）。
+    expect(referencedScripts([{ id: "gone", run: "node scripts/nowhere\n" }], { root: dir })).toEqual({
+      files: [],
+      missing: ["scripts/nowhere"],
+      unfollowable: [],
+    });
+    // 反例：带扩展名的正常路径仍走同一格，没被新逻辑搅坏。
+    expect(referencedScripts([{ id: "ok", run: "node scripts/lib.mjs\n" }], { root: dir })).toEqual({
+      files: ["scripts/lib.mjs"],
+      missing: [],
+      unfollowable: [],
+    });
+  });
+
+  it("进程派生不静默：脚本里出现 child_process / spawn 就进 unfollowable，并带上引用它的 step", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-spawn-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length);\n',
+    );
+    // node 走了另一条进程：静态 import 图上没有这条边，只跟 import 就等于没有读者。
+    writeFileSync(
+      join(dir, "scripts/wrapper.cjs"),
+      'const { spawnSync } = require("node:child_process");\nspawnSync(process.execPath, ["scripts/probe-read.mjs"], { stdio: "inherit" });\n',
+    );
+    const wrapper = { id: "probe", run: "node scripts/wrapper.cjs\n" };
+    expect(wrapper.run).not.toMatch(/executors|comparison|counts/);
+    // 旧口径下的绿：wrapper 里没有字段名，probe-read 根本没被扫到。
+    expect(fieldReadViolations([wrapper], { root: dir })).toEqual([]);
+    expect(referencedScripts([wrapper], { root: dir }).files).toEqual(["scripts/wrapper.cjs"]);
+    expect(referencedScripts([wrapper], { root: dir }).unfollowable).toEqual([
+      {
+        step: "probe",
+        file: "scripts/wrapper.cjs",
+        kind: "child-process",
+        excerpt: 'const { spawnSync } = require("node:child_process");',
+      },
+    ]);
+    // 反例：正则的 .exec( 不是进程派生，不许被判红。
+    writeFileSync(
+      join(dir, "scripts/regex-exec.mjs"),
+      'const m = /x/.exec("x");\nconst s = "a".exec;\nconsole.log(m, s);\n',
+    );
+    expect(referencedScripts([{ id: "ok", run: "node scripts/regex-exec.mjs" }], { root: dir })).toEqual({
+      files: ["scripts/regex-exec.mjs"],
+      missing: [],
+      unfollowable: [],
+    });
+  });
+
+  it("行尾标点不吃路径：node scripts/x.mjs 后面的 ; ) && & | > 都只是分隔", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-punct-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length);\n',
+    );
+    const forms = [
+      "node scripts/probe-read.mjs;",
+      "node scripts/probe-read.mjs)",
+      "node scripts/probe-read.mjs && exit 0",
+      "node scripts/probe-read.mjs &",
+      "node scripts/probe-read.mjs | tee /dev/null",
+      "node scripts/probe-read.mjs > /dev/null",
+    ];
+    for (const run of forms) {
+      expect(scriptRefs(run, { root: dir }), run).toEqual(["scripts/probe-read.mjs"]);
+      expect(referencedScripts([{ id: "probe", run }], { root: dir }).missing, run).toEqual([]);
+      expect(fieldReadViolations([{ id: "probe", run }], { root: dir }), run).toEqual([
+        { file: "scripts/probe-read.mjs", field: "executors", excerpt: "console.log(r.executors.length);" },
+      ]);
+    }
+    // 反例：同一脚本跑两次只算一个引用，标点不会造出幽灵引用。
+    expect(scriptRefs("node scripts/ok.mjs; node scripts/ok.mjs;", { root: dir })).toEqual(["scripts/ok.mjs"]);
+  });
+
+  it("node 只在裸词位置才算跟得上：bash -c / 变量 / 绝对路径不许静默跳过", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-node-shapes-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-read.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r.executors.length);\n',
+    );
+    // 绝对路径调 node：静态可解，照样跟得到 —— 真读者必须红。
+    expect(scriptRefs("/usr/bin/node scripts/probe-read.mjs", { root: dir })).toEqual(["scripts/probe-read.mjs"]);
+    expect(fieldReadViolations([{ id: "abs", run: "/usr/bin/node scripts/probe-read.mjs" }], { root: dir })).toEqual([
+      { file: "scripts/probe-read.mjs", field: "executors", excerpt: "console.log(r.executors.length);" },
+    ]);
+    // bash -c 里再包一层 shell：静态跟不了，但必须响（旧实现连「看见」都没有）。
+    const shellC = { id: "shellc", run: 'bash -c "node scripts/probe-read.mjs"\n' };
+    expect(shellC.run).not.toMatch(/executors|comparison|counts/);
+    expect(fieldReadViolations([shellC], { root: dir })).toEqual([]);
+    expect(referencedScripts([shellC], { root: dir }).unfollowable).toEqual([
+      { step: "shellc", file: null, kind: "shell-c", detail: "node scripts/probe-read.mjs" },
+    ]);
+    // 变量当命令头：认得出在跑 node，可执行文件路径静态不可解。
+    const dynamic = { id: "dyn", run: "$NODE_BIN scripts/probe-read.mjs\n" };
+    expect(referencedScripts([dynamic], { root: dir }).unfollowable).toEqual([
+      { step: "dyn", file: null, kind: "dynamic-node", detail: "$NODE_BIN scripts/probe-read.mjs" },
+    ]);
+    // 反例：bash 跑的不是 node 就不响（否则这条判据会被噪声埋掉）。
+    expect(referencedScripts([{ id: "npm", run: 'bash -c "npm run check"\n' }], { root: dir }).unfollowable).toEqual(
+      [],
+    );
+    // 反例：裸词 node 的正常写法没有任何 unfollowable。
+    expect(referencedScripts([{ id: "ok", run: "node scripts/probe-read.mjs\n" }], { root: dir }).unfollowable).toEqual(
+      [],
+    );
+  });
+
+  it("拼出来的键不静默：字面量数组 .join / 字符串相加 / fromCharCode 进 unfollowable，正常 join 不算", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-dynkey-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    const shapes = [
+      [
+        "scripts/split-key.mjs",
+        'const key = ["execu", "tors"].join("");\nconst r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r[key]);\n',
+        'const key = ["execu", "tors"].join("");',
+      ],
+      [
+        "scripts/concat-key.mjs",
+        'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(r["execu" + "tors"]);\n',
+        'console.log(r["execu" + "tors"]);',
+      ],
+      [
+        "scripts/char-key.cjs",
+        "const k = String.fromCharCode(101, 120);\nconsole.log(r[k]);\n",
+        "const k = String.fromCharCode(101, 120);",
+      ],
+    ];
+    for (const [rel, text, excerpt] of shapes) {
+      writeFileSync(join(dir, rel), text);
+      const run = "node " + rel;
+      // 先证明字段名判据在这三行上什么也看不见：拆词/拼接正是它看不见的形态。
+      expect(fieldReadViolations([{ id: "probe", run }], { root: dir }), rel).toEqual([]);
+      expect(referencedScripts([{ id: "probe", run }], { root: dir }).unfollowable, rel).toEqual([
+        { step: "probe", file: rel, kind: "dynamic-key", excerpt },
+      ]);
+    }
+    // 反例：正常 join（数组元素不是字面量、键不是拼出来的）不许判红。
+    writeFileSync(join(dir, "scripts/ok.mjs"), 'const lines = [];\nconst s = lines.join("\\n");\nconsole.log(s);\n');
+    expect(referencedScripts([{ id: "ok", run: "node scripts/ok.mjs" }], { root: dir })).toEqual({
+      files: ["scripts/ok.mjs"],
+      missing: [],
+      unfollowable: [],
     });
   });
 
