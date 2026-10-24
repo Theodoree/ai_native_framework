@@ -102,7 +102,7 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 两位执行器审 `adcc6a2` 都判 `needs_revision`。九条复检**两家结论完全一致**：1、2、3、4、5、6、8、9 关闭，第 7 条未关闭。本轮三条：
 
-1. **`pr` 的纯数字收窄守卫零用例（high，两家同报）**——上一轮我补了代码就当修好了：删掉那三行 `case`，55/55 依旧全绿。它承重：`PR_INPUT="2\n::error title=forged::pwned"` 未收窄会把伪造注解原样写进 `$GITHUB_OUTPUT`。修法只补用例（敌意串 + 正例；正例不可省，否则「把 ctx 写死成 ok=0」也能满足敌意那条）。
+1. **`pr` 的纯数字收窄守卫零用例（high，两家同报）**——上一轮我补了代码就当修好了：删掉那三行 `case`，55/55 依旧全绿。它承重：`PR_INPUT="2\n::error title=forged::pwned"` 未收窄会把伪造注解原样写进 `$GITHUB_OUTPUT`。修法只补用例（敌意串 + 正例）。**「正例不可省」是我写错的一句**：两位执行器都测得，删掉正例后敌意那条仍能捕获守卫缺失；把 ctx 的 `echo "ok=1"` 改成 `ok=0` 时 11 条红、两条都红。正例的价值在正向对照与诊断直接（6 行），不在「唯一防线」。
 2. **「服务器上一定有一条 Check Run」是假命题（high）**——见上一节那段更正。
 3. **CI 摘要的围栏可被内容闭合（medium）**——`INFRA 留痕` 把 `result.json` 原样 `cat` 进 `$GITHUB_STEP_SUMMARY`，`outLine()` 只中和 stdout。修法：围栏宽度按内容算（`max(3, 最长连续反引号串 + 1)`），**内容一字不改**——靠改写用户输入来「躲」会让留痕失真。
 
@@ -110,6 +110,19 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **顺手核实掉的一个非 finding**：兜底补写的 `result.json` 缺 `exit_code/executors/comparison`，喂回判定的内联 JS 会 `TypeError`。核实结论是**没有活路径**——解引用这些字段的 run 块只有 `decide` 一处，且排在 `结论兜底` 之前、只跑一次。处理方式是加注释 + 一个形状用例（顺序 + 唯一读者），不是补字段。
 
-**我的独立变异复核（不信转述）**：删 `case` 三行 → 「恶意串被收窄」1 红；删围栏加宽循环 → 2 红（`expected 3 to be greater than 3`）；把 `fromCtx || RUN_SHA` 改成 `fromCtx || ''` → 5 红。三条都 `cp` 还原后 62/62 绿。`npm run check` = 13 files / 228 tests，`npx oxlint scripts tests` = 0 warnings 0 errors。
+**我的独立变异复核（不信转述）**：删 `case` 三行 → 「恶意串被收窄」1 红；删围栏加宽循环 → 2 红（`expected 3 to be greater than 3`）；把 `fromCtx || RUN_SHA` 改成 `fromCtx || ''` → 5 红（我自己在 HEAD 上连测两次都是 5；review-b 报的是 2 红 ×15 次，在隔离副本里，我没能复现，见 §九 的「同一变异不同红数」）。三条都 `cp` 还原后 62/62 绿。`npm run check` = 13 files / 228 tests，`npx oxlint scripts tests` = 0 warnings 0 errors。
 
 **残余（登记不修）**：「判不了」那步用 `node -e` 组 payload，若 node 本身不可用（setup-node 挂了且宿主无 node），该步会红且写不出 Check Run，形态退回「一条都没有」。ubuntu runner 自带 node，概率低；改 curl/纯 shell 收益不抵复杂度。
+
+## 九、轮五复审与两处更正（同一个 PR，`53bddf2`）
+
+复审范围只有上节那三处修复，两位执行器**都确认三条承诺成立**（我给的变异全部复现：删 `case` → 1 红；删围栏加宽 → 2 红；去掉 `sha` 回退 → 多红）。它们另外抓到两条：
+
+1. **形状用例只钉字面拼写（medium）**——「解引用 `executors`/`comparison.counts` 的消费者只有 `decide`」这条担保靠 `/r\.executors|comparison\.counts/` 字面匹配。加一行 `r.executors` 会红，同一语义写成 `jq -r '.["executors"] | length'` 就 62 全绿。于是 §八 那句「没有活路径」的**持续**担保不成立（当下成立，但挡不住将来换个写法）。修法：匹配放宽到字段名本身，只扫 `run` 块（仓库里关于 executors 的注释在 run 块外，不误伤）。
+2. **「落点非空」的硬断言零用例（low）**——`if (!sha) throw` 改成 `if (false) throw` 后 62/62 仍全绿。**这是同一类缺陷第三次出现**（`case` 守卫 → `sha` 回退 → 这条 `throw`）：防御性代码写了，就默认它在保护，没写用例证明它会响。前两次都由外部执行器发现，说明我在这条上不可靠，需要把它变成写代码时的固定动作。
+
+**同一变异不同红数（保留争议，不硬下结论）**：`fromCtx || RUN_SHA` → `fromCtx || ''`，我在真仓库连测两次都是 **5 红**，review-b 在隔离副本里连测 15 次都是 **2 红**，双方都无法复现对方的数。可确定的是**这个变异会让用例红**（这点一致），不确定的是红几条。写进 note 而不是抹平，是因为「同一个改坏动作在不同环境里红数不同」本身就是个信号——可能是测试之间有隐藏耦合或顺序依赖，值得在别处再查。
+
+**记一条流程规则**：两位执行器在**同一个工作副本**里做变异时会互相踩（review-a 备份时文件已被 review-b 改成「删掉围栏循环」的状态，期间还出现过别人加的 `jq` 变异）。审查执行器必须复制到隔离副本（`/tmp/...`）再改；这也解释了上面「不同红数」的一种可能成因。
+
+**又一次被写明的边界**：G3 **不要求 `audit` 存在**——把 `audit` 从 checks 里去掉，门照常 `PASS 4/4` `exit 0`。这就是残余③（`audit` 未挂 required）的另一面，本轮没扩大也没修。因此「`audit` 报绿」这件事**本身不能当作「审计已上闸门」汇报**，必须先把它挂进 required 列表。

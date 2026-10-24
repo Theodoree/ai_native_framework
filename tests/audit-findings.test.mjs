@@ -670,7 +670,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       outputs,
       // 每个带 id 的步骤写进 $GITHUB_OUTPUT 的原文：注解注入面看的是这些行本身。
       raw,
-      calls: readFileSync(join(dir, "calls.log"), "utf8").split("\n").filter(Boolean),
+      // 一次 gh 都没调是完全合法的状态（比如落点为空、步骤红在调用之前）：
+      // 那时没有 calls.log，空清单比 ENOENT 更接近事实，也让「零次调用」可断言。
+      calls: existsSync(join(dir, "calls.log"))
+        ? readFileSync(join(dir, "calls.log"), "utf8").split("\n").filter(Boolean)
+        : [],
       summary: readFileSync(join(dir, "summary.md"), "utf8"),
       payload: (() => {
         try {
@@ -802,6 +806,26 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(fenced.width).toBeGreaterThan(longestInside);
   });
 
+  // 判据是**字段名**，不是某一种拼写：r.executors / .["executors"] /
+  // `jq -r '.["executors"] | length'` 都是同一个字段的同一种读法。
+  // 扫描面只有 run 块（YAML 注释、name、env 都不在里面），run 块内的 shell 注释行不算读。
+  const RESULT_FIELDS = ["executors", "comparison", "counts"];
+  function fieldReadViolations(stepList) {
+    const violations = [];
+    for (const step of stepList) {
+      if (typeof step.run !== "string") continue;
+      const body = step.run
+        .split("\n")
+        .filter((line) => !/^\s*#/.test(line))
+        .join("\n");
+      for (const field of RESULT_FIELDS) {
+        const hit = body.split("\n").find((line) => line.includes(field));
+        if (hit) violations.push({ step: step.id ?? step.name, field, excerpt: hit.trim() });
+      }
+    }
+    return violations;
+  }
+
   it("兜底补的结果不是第二份口径层：解引用 result.json 字段的读者只有口径层，且排在兜底之前", () => {
     const decideIndex = steps.findIndex((s) => s.id === "decide");
     const fallbackIndex = steps.findIndex((s) => s.id === "fallback");
@@ -809,8 +833,44 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(fallbackIndex).toBeGreaterThan(decideIndex);
     // 兜底补出来的 {verdict,conclusion,exit,reason} 缺 executors / comparison；
     // 只要解引用这两个字段的读者只有口径层（在本步之前、只跑一次），它就不是活路径。
-    const readers = steps.filter((s) => typeof s.run === "string" && /r\.executors|comparison\.counts/.test(s.run));
-    expect(readers.map((s) => s.id)).toEqual(["decide"]);
+    // 报错要能直接看出「哪个 step、匹配到哪一行、哪个字段」，不是一个布尔。
+    const violations = fieldReadViolations(steps);
+    const readers = [...new Set(violations.map((v) => v.step))];
+    expect(readers, JSON.stringify(violations, null, 2)).toEqual(["decide"]);
+    // 正向对照：口径层确实读了这几个字段名。少了它，正则哪天扫不中任何东西时，
+    // 「没有别的读者」会退化成「什么都没扫到」而照样绿。
+    for (const field of RESULT_FIELDS) {
+      expect(
+        violations.some((v) => v.step === "decide" && v.field === field),
+        field,
+      ).toBe(true);
+    }
+  });
+
+  it("形状判据认字段名不认拼写：jq 的 .[\"executors\"] 也是读者（逃得过旧正则，逃不过这条）", () => {
+    // 旧写法 /r\.executors|comparison\.counts/ 只钉字面：同一语义换个拼写就能全绿通过。
+    const escape = {
+      id: "writeback",
+      name: "回写 Check Run",
+      run: "gh api repos/$GITHUB_REPOSITORY/check-runs --jq '.[\"executors\"] | length'\n",
+    };
+    expect(/r\.executors|comparison\.counts/.test(escape.run)).toBe(false);
+    expect(fieldReadViolations([escape])).toEqual([
+      { step: "writeback", field: "executors", excerpt: escape.run.trim() },
+    ]);
+  });
+
+  it("扫描面只有 run 块：name / env / run 块里的 shell 注释都不算读者", () => {
+    // audit.yml 在「结论兜底」上方有一句提到 executors 的注释，在 run 块外：误伤它就是假阳性。
+    const outsideRun = [
+      { id: "a", name: "executors 说明", env: { NOTE: "r.executors / comparison.counts" } },
+      { id: "b", run: "# 只有口径层读 r.executors 与 comparison.counts\necho ok\n" },
+    ];
+    expect(fieldReadViolations(outsideRun)).toEqual([]);
+    // 反面：run 块里真出现字段名（哪怕只是 echo 出来）就算读者 —— 判据不许有第二套。
+    expect(fieldReadViolations([{ id: "c", run: "echo executors\n" }])).toEqual([
+      { step: "c", field: "executors", excerpt: "echo executors" },
+    ]);
   });
 
 
@@ -942,6 +1002,32 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 两种都落在同一个非空 sha 上：这条不变式不分来历。
     expect(noSha.payload.head_sha).toBe("f00dfeed");
     expect(noCtx.payload.head_sha).toBe("f00dfeed");
+  });
+
+  it("判不了也要有个落点：ctx 与 github.sha 都空时这一步必须红，且一份 payload 都不许写", () => {
+    // 这条守住「落点非空」这条硬断言本身：ctx 整步被跳过（outputs 全空，ok 是空串），
+    // 连 github.sha 也空 —— 落点的两个来源同时没有来源。
+    // 把 if (!sha) throw 改成 if (false) throw，这里立刻变成 status 0 + 文件存在：
+    // 于是「一定会写出一条 Check Run」的担保会在一个空 head_sha 上悄悄失真。
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      { "github.sha": "" },
+      undefined,
+      { skip: ["解析 PR 上下文"] },
+    );
+    // 这几条是同一个不变式的几面（红了 / 喊出原因 / 没有半份 payload 落地），
+    // 用 soft 让变异实验一次看到全部后果，而不是只看到第一条。
+    expect.soft(out.outputs.ctx).toBeUndefined();
+    const step = out.ran.find((s) => s.name === "判不了：回写 INFRA");
+    expect.soft(step).toBeDefined();
+    // 红，而且红在「落点非空」这条断言上（不是别的错误恰好在同一行附近）。
+    expect.soft(step?.status).not.toBe(0);
+    expect.soft(`${step?.stderr}${step?.stdout}`).toContain("判不了也要有个落点");
+    // 硬断言与落盘是二选一：它响了，就不许有半份 head_sha 为空的 payload 落地。
+    expect.soft(existsSync(join(out.dir, ".audit/check-run.json"))).toBe(false);
+    expect.soft(existsSync(join(out.dir, ".audit/payload.json"))).toBe(false);
+    expect.soft(out.payload).toBeNull();
+    expect.soft(out.calls.filter((c) => c.includes("check-runs"))).toHaveLength(0);
   });
 
   it("-e 作用：留痕回写失败必须让步骤红，不许被后面的 echo 盖成绿", () => {
