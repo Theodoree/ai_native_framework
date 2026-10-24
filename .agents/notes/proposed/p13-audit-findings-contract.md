@@ -192,3 +192,20 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 2. **自验命令写错**：我给的 `AUDIT_FINDINGS_B=… node scripts/audit-slot.mjs` 会回显 INFRA，该脚本只读 `AUDIT_INPUT`（映射在 `audit.yml:140`）。review-b 自己按真实链路纠正了。
 
 **本轮之后仍未覆盖（诚实登记，都是「已知静默面」）**：`npm/pnpm` 间接调 node、`make`/`xtask` 包装、`node -` 读 stdin（记 `node-stdin` 但不追内容）、ESM 动态 `import(表达式)`、裸模块名、import 深度 >3、`worker_threads`、shell 函数/alias/子 shell、`$( )` 内层命令、跨行引号内的注释与命令边界、`npx tsx/bun/deno` 等其它解释器、把读者藏进 `node_modules` 依赖里。**这些不是「已覆盖」，是「已被登记」**——两者的区别在于前者能拦人，后者只能提醒。
+
+### 轮九：判据要盯「谁碰了这个文件」，不是「谁写出了这个字段名」
+
+轮九两家又各打出真绕过，同一个根：**step 的可执行载体只认 `run`**。
+
+- `uses: actions/github-script@v7` + `with: script:`（内联读者）→ 83 全绿
+- `uses: ./.github/actions/x`（composite 内部 run 调 node 读者）→ 83 全绿
+- `env: { NODE_OPTIONS: --require ./probe-env.cjs }`（probe 读字段）→ 83 全绿
+- 更根本的一条：读者**不写出字段名**、用 `Object.entries` 枚举 → 83 全绿（实测真打印出 `executors 2`）
+
+修法（`tests/audit-findings.test.mjs`，87 例）：`payloadLeaves`(:1192) / `stepPayloads`(:1201，run + with.* + env.*，carrier 带来源名) / `LOADER_FLAG_VALUE` + `loaderValueRefs`(:1210-1222，`--require/-r/--import` 的取值本身进扫描面，不靠 `./` 前缀) / `stepScriptRefs`(:1225，三处扫描的唯一入口，删掉 `typeof step.run !== "string" && continue`) / `ALLOWED_USES`(:1238，只放行 checkout 与 setup-node) / 其余 `uses` → `unfollowable{kind:"uses"}`（不解析 composite，未知就红）；追加**行为判据** `RESULT_JSON` / `RESULT_JSON_DATA_READ` / `stepTexts` / `resultJsonReaderViolations`(:1411-1447)：同一段被执行文本里同时出现 `result.json` 路径与解析形态即视为读者，**放行单位是「步」而不是「文件」**（否则口径层自己的 `writeFileSync` 会被判红）；原字段名判据保留作第二道。
+
+我的复验（四次变异，插 YAML 前先 `yaml.safe_load` 验证可解析，避免再出现「坏探针看起来像没红」）：github-script / composite / `NODE_OPTIONS --require` / 无字段名 `Object.entries` 读者，**各 1 红**；还原 87 绿；整仓 253 tests / 13 files、oxlint 0/0。
+
+**止损（我定的）**：载体已扩到 workflow 能执行的每一种 step 形态。剩下的是**包装器里的读**（`bash x.sh`、`npm/pnpm`、`make`、`python3`、`npx tsx`、`node -`/stdin、`worker_threads`、`node_modules` 依赖）——那不属于「判据漏了」，属于「静态分析追不到进程边界」，继续修等于在测试里写半个解释器。这一类**登记为已知盲区**并停止追杀。
+
+**仍然未纳入（诚实）**：`with` 里用表达式拼出的脚本路径；跨载荷（env 只有路径、解析动作在另一个 step）；被拆开的路径字面量；绝对路径调脚本与裸模块名 import；白名单外的官方 action（如 `actions/cache`）会红——这是刻意方向（未知要响），风险由名单处注释说明。

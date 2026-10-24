@@ -1183,6 +1183,61 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     return rel.startsWith("..") || rel.startsWith("/") ? null : join(root, rel);
   }
 
+  // ---- 载体：step 的**一切**可执行载荷 ----
+  // 旧扫描面只认 step.run。可 run 不是唯一的执行面，于是读者坐在别的字段里就全绿：
+  //   * uses + with：github-script 的 `script` 就是一段照跑的内联 JS；
+  //   * uses: ./.github/actions/x：composite，内部还有 run；
+  //   * env 的值：NODE_OPTIONS 的 --require/-r/--import <path> 是 node 启动前就执行的模块。
+  // 载体认不全时，「没有别的读者」会退化成「没扫到」——那正是这一批绕过的共同形状。
+  function payloadLeaves(value, path = []) {
+    if (typeof value === "string") return [{ path: path.join("."), text: value }];
+    if (Array.isArray(value)) return value.flatMap((item, i) => payloadLeaves(item, [...path, String(i)]));
+    if (value && typeof value === "object") {
+      return Object.entries(value).flatMap(([key, inner]) => payloadLeaves(inner, [...path, key]));
+    }
+    return [];
+  }
+
+  function stepPayloads(step) {
+    const payloads = [];
+    if (typeof step.run === "string") payloads.push({ carrier: "run", text: step.run });
+    for (const field of ["with", "env"]) {
+      for (const leaf of payloadLeaves(step[field], [field])) payloads.push({ carrier: leaf.path, text: leaf.text });
+    }
+    return payloads;
+  }
+
+  // NODE_OPTIONS / node 参数里的「模块取值」：--require x、-r x、--import=x、--loader x。
+  // 取值本身在 node 启动前就被加载（它本身就是扫描面），所以不是「看不出来的 flag」。
+  const LOADER_FLAG_VALUE =
+    /(?:^|[\s"'])(?:--require|--import|-r|--loader|--experimental-loader)(?:=|\s+)([^\s"';|&]+)/g;
+
+  function loaderValueRefs(text, options = {}) {
+    const root = options.root ?? ROOT;
+    const refs = [];
+    for (const match of String(text).matchAll(LOADER_FLAG_VALUE)) {
+      const rel = resolveScriptRef(root, match[1]);
+      if (rel && !refs.includes(rel)) refs.push(rel);
+    }
+    return refs;
+  }
+
+  // 一个 step 被执行到的脚本引用：所有载荷的 shell 词法结果 + loader 取值。
+  function stepScriptRefs(step, options = {}) {
+    const refs = [];
+    for (const payload of stepPayloads(step)) {
+      for (const rel of [...scanScriptRefs(payload.text, options).refs, ...loaderValueRefs(payload.text, options)]) {
+        if (!refs.includes(rel)) refs.push(rel);
+      }
+    }
+    return refs;
+  }
+
+  // uses 白名单只装「本仓真正在用、且不执行仓库内容」的官方 action：它们的行为与仓库里的
+  // 文件无关，跟不下去也不构成盲区。其余一律记 unfollowable —— 不去解析 composite 的实现，
+  // 认不出的载体必须响，让它变成一条红断言，而不是一条静默跳过的 continue。
+  const ALLOWED_USES = [/^actions\/checkout(?:@|$)/, /^actions\/setup-node(?:@|$)/];
+
   // result.json 的**写者**：run 块里同一行既用 node 启动某个脚本、又写 `--out .audit/result.json`。
   // 生产者必然同时出现这些字段名（它要造出这些字段），把它算成「读者」只会逼出一份手写豁免名单 ——
   // 判据变成名单的一刻就不再是判据。所以从 run 文本里推导，且这条推导本身被断言钉住。
@@ -1190,10 +1245,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   function resultWriters(stepList, options = {}) {
     const writers = [];
     for (const step of stepList) {
-      if (typeof step.run !== "string") continue;
-      for (const line of step.run.split("\n").map(stripShellComment)) {
-        if (!line.includes(RESULT_OUT_FLAG)) continue;
-        for (const rel of scriptRefs(line, options)) if (!writers.includes(rel)) writers.push(rel);
+      for (const payload of stepPayloads(step)) {
+        for (const line of payload.text.split("\n").map(stripShellComment)) {
+          if (!line.includes(RESULT_OUT_FLAG)) continue;
+          for (const rel of scriptRefs(line, options)) if (!writers.includes(rel)) writers.push(rel);
+        }
       }
     }
     return writers;
@@ -1289,18 +1345,24 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       if (!clash) unfollowable.push(entry);
     };
     for (const step of stepList) {
-      if (typeof step.run !== "string") continue;
       const stepId = step.id ?? step.name;
-      const scanned = scanScriptRefs(step.run, { root });
-      for (const shape of scanned.unfollowable) note({ step: stepId, file: null, ...shape });
-      for (const rel of scanned.refs) {
-        const tree = scriptTree(root, rel);
-        for (const file of tree.files) if (!files.includes(file)) files.push(file);
-        for (const gone of tree.missing) if (!missing.includes(gone)) missing.push(gone);
-        for (const file of tree.files) {
-          const abs = scriptPath(root, file);
-          for (const shape of unfollowableShapes(readFileSync(abs, "utf8"))) note({ step: stepId, file, ...shape });
+      for (const payload of stepPayloads(step)) {
+        const scanned = scanScriptRefs(payload.text, { root });
+        for (const shape of scanned.unfollowable) note({ step: stepId, file: null, ...shape });
+        for (const rel of [...scanned.refs, ...loaderValueRefs(payload.text, { root })]) {
+          const tree = scriptTree(root, rel);
+          for (const file of tree.files) if (!files.includes(file)) files.push(file);
+          for (const gone of tree.missing) if (!missing.includes(gone)) missing.push(gone);
+          for (const file of tree.files) {
+            const abs = scriptPath(root, file);
+            for (const shape of unfollowableShapes(readFileSync(abs, "utf8"))) note({ step: stepId, file, ...shape });
+          }
         }
+      }
+      // uses 是 run 之外的第二类载体：认不出的 action 会执行仓库外（或 composite 里）
+      // 的代码，静态跟不下去 —— 记 unfollowable，让真 YAML 用例当场红。
+      if (typeof step.uses === "string" && !ALLOWED_USES.some((re) => re.test(step.uses))) {
+        note({ step: stepId, file: null, kind: "uses", detail: step.uses });
       }
     }
     return { files, missing, unfollowable };
@@ -1314,15 +1376,20 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const writers = resultWriters(stepList, { root });
     const violations = [];
     for (const step of stepList) {
-      if (typeof step.run !== "string") continue;
       const source = step.id ?? step.name;
-      const lines = step.run.split("\n").map(stripShellComment);
-      for (const { field, re } of FIELD_READERS) {
-        const hit = lines.find((line) => re.test(line));
-        if (hit) violations.push({ step: source, field, excerpt: hit.trim() });
+      // 字段名判据看「被执行到的文本」：run 与被 with 带进来的内联脚本。
+      // env 的值不是脚本本身（它由 --require/--import 带进来的**文件**负责，下面跟随），
+      // 所以 env 只当载体，不在这里展开字段名。
+      for (const payload of stepPayloads(step)) {
+        if (payload.carrier !== "run" && !payload.carrier.startsWith("with")) continue;
+        const lines = payload.text.split("\n").map(stripShellComment);
+        for (const { field, re } of FIELD_READERS) {
+          const hit = lines.find((line) => re.test(line));
+          if (hit) violations.push({ step: source, field, excerpt: hit.trim() });
+        }
       }
-      // 跟随 import：读者可能坐在 run 引用的脚本的下一跳（契约层拆文件就靠这条）。
-      for (const entry of scriptRefs(step.run, { root })) {
+      // 跟随 import：读者可能坐在引用的脚本的下一跳（契约层拆文件就靠这条）。
+      for (const entry of stepScriptRefs(step, { root })) {
         if (writers.includes(entry)) continue;
         for (const rel of scriptTree(root, entry).files) {
           const text = readFileSync(scriptPath(root, rel), "utf8");
@@ -1331,6 +1398,67 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
             if (hit) violations.push({ file: rel, field, excerpt: hit.trim() });
           }
         }
+      }
+    }
+    return violations;
+  }
+
+  // ---- 行为判据：不看字段名，看「谁碰了 result.json 的数据」 ----
+  // 字段名判据的盲区实测过：JSON.parse 之后 Object.entries 遍历，一个字段名都不写，
+  // 照样把 executors / comparison.counts 打印出来，83 条全绿。读者不写字段名就隐身，
+  // 那说明判据盯的是「拼写」而不是「碰没碰这个文件」。所以这里加一道行为判据：
+  // 同一段被执行到的文本里既出现 result.json 路径、又出现把文件内容当数据解析的形态
+  // （JSON.parse / readFile / require / jq / Object.entries），无条件算读者。
+  const RESULT_JSON = /result\.json/;
+  const RESULT_JSON_DATA_READ =
+    /JSON\.parse|readFile|createReadStream|require\s*\(|\bjq\b|--jq|Object\.(?:entries|keys|values)\s*\(/;
+
+  // result.json 的落盘写法：口径层用 --out，兜底步用 writeFileSync 补写。
+  // 它们是**允许的读者/写者**，而且放行单位是「步」不是「文件」：同一份口径层脚本被
+  // 另一个 step 引用时，那个 step 仍然是读者，必须红。所以按步检测「写」，再整步放行。
+  const RESULT_JSON_WRITE = [
+    /--out\s+\.audit\/result\.json/,
+    /writeFileSync\s*\(\s*["']\.audit\/result\.json["']/,
+    /writeFile\s*\(\s*["']\.audit\/result\.json["']/,
+  ];
+
+  function stepTexts(step, options = {}) {
+    const root = options.root ?? ROOT;
+    const texts = stepPayloads(step).map((payload) => ({ where: payload.carrier, text: payload.text }));
+    for (const rel of stepScriptRefs(step, { root })) {
+      for (const file of scriptTree(root, rel).files) {
+        const abs = scriptPath(root, file);
+        if (abs && existsSync(abs)) texts.push({ where: file, text: readFileSync(abs, "utf8") });
+      }
+    }
+    return texts;
+  }
+
+  // 写 result.json 的步（口径层与兜底）：这就是「按步放行」的那个步集合，从文本里推出来，
+  // 不是手写名单 —— 补一个写者、删一个写者，这里立刻跟着变。
+  function resultJsonWriterSteps(stepList, options = {}) {
+    const root = options.root ?? ROOT;
+    return stepList
+      .filter((step) => stepTexts(step, { root }).some(({ text }) => RESULT_JSON_WRITE.some((re) => re.test(text))))
+      .map((step) => step.id ?? step.name);
+  }
+
+  // 行为判据的违规：碰了 result.json 的数据、却不是写它那一步。
+  // 报错带上载体（run / with.script / env.NODE_OPTIONS / 脚本文件），不是一个布尔。
+  function resultJsonReaderViolations(stepList, options = {}) {
+    const root = options.root ?? ROOT;
+    const violations = [];
+    for (const step of stepList) {
+      const source = step.id ?? step.name;
+      const texts = stepTexts(step, { root });
+      if (texts.some(({ text }) => RESULT_JSON_WRITE.some((re) => re.test(text)))) continue;
+      for (const { where, text } of texts) {
+        if (!RESULT_JSON.test(text) || !RESULT_JSON_DATA_READ.test(text)) continue;
+        const excerpt = text
+          .split("\n")
+          .map((line) => line.trim())
+          .find((line) => RESULT_JSON.test(line) && RESULT_JSON_DATA_READ.test(line));
+        violations.push({ step: source, where, excerpt: excerpt ?? text.split("\n").find((l) => l.trim()) ?? "" });
       }
     }
     return violations;
@@ -1427,6 +1555,12 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(scripts.files).toContain("scripts/audit-findings.mjs");
     // 唯一的豁免是 result.json 的生产者，且它必须是从 run 文本里推出来的那一个。
     expect(resultWriters(steps)).toEqual(["scripts/audit-findings.mjs"]);
+    // 行为判据（不认字段名）：任何碰 result.json 数据的步，都必须是写它的那一步。
+    // 只写 Object.entries 枚举、不写任何字段名的读者，在这里没有藏身处。
+    const behaviorReaders = resultJsonReaderViolations(steps);
+    expect(behaviorReaders, JSON.stringify(behaviorReaders, null, 2)).toEqual([]);
+    // 正向对照：确实有步在写 result.json。少了这条，上面那条会退化成「谁都没碰这个文件」。
+    expect(resultJsonWriterSteps(steps)).toEqual(["decide", "fallback"]);
     // 正向对照：口径层确实**解引用**了这几个字段（`.<field>` / `["<field>"]`），
     // 不是「这行出现过这串字」。少了它，正则哪天扫不中任何东西时，
     // 「没有别的读者」会退化成「什么都没扫到」而照样绿。
@@ -2138,5 +2272,141 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(out.payload.conclusion).toBe("action_required");
     expect(out.outputs.decide.verdict).toBe("INFRA");
     expect(out.summary).toContain("INFRA");
+  });
+
+  it("载体不是只有 run：github-script 的 with 脚本 / composite 的 uses / NODE_OPTIONS 的 --require 都上门", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-carrier-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    // 读者不写字段名（Object.entries 枚举），字段名判据在它上面什么也看不见。
+    const readerBody =
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nfor (const [k, v] of Object.entries(r)) console.log(k, v);\n';
+    writeFileSync(join(dir, "scripts/probe-env.cjs"), readerBody);
+
+    // 1) github-script：执行面在 with.script，旧扫描面（只认 run）连看都没看它。
+    const githubScript = { id: "gs", name: "摘要", uses: "actions/github-script@v7", with: { script: readerBody } };
+    expect(githubScript.with.script).not.toMatch(/executors|comparison|counts/);
+    expect(fieldReadViolations([githubScript], { root: dir })).toEqual([]);
+    expect(resultJsonReaderViolations([githubScript], { root: dir })).toEqual([
+      {
+        step: "gs",
+        where: "with.script",
+        excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
+      },
+    ]);
+    // 认不出的 action 也不许静默跳过：它执行的是仓库外的实现。
+    expect(referencedScripts([githubScript], { root: dir }).unfollowable).toEqual([
+      { step: "gs", file: null, kind: "uses", detail: "actions/github-script@v7" },
+    ]);
+
+    // 2) composite action：内部 run 照跑，静态跟不下去 —— 必须响，不去猜它的实现。
+    const composite = { id: "comp", name: "复合", uses: "./.github/actions/summarize" };
+    expect(referencedScripts([composite], { root: dir }).unfollowable).toEqual([
+      { step: "comp", file: null, kind: "uses", detail: "./.github/actions/summarize" },
+    ]);
+
+    // 3) NODE_OPTIONS 的 --require：模块在 node 启动前就执行，读者坐在 env 里、run 里一个字段名都没有。
+    const envStep = {
+      id: "env",
+      name: "带前置模块",
+      env: { NODE_OPTIONS: "--require ./scripts/probe-env.cjs" },
+      run: 'node -e "console.log(1)"\n',
+    };
+    expect(envStep.run).not.toMatch(/executors|comparison|counts/);
+    expect(fieldReadViolations([envStep], { root: dir })).toEqual([]);
+    const envScanned = referencedScripts([envStep], { root: dir });
+    expect(envScanned.files).toEqual(["scripts/probe-env.cjs"]);
+    expect(envScanned.missing).toEqual([]);
+    expect(envScanned.unfollowable).toEqual([]);
+    expect(resultJsonReaderViolations([envStep], { root: dir })).toEqual([
+      {
+        step: "env",
+        where: "scripts/probe-env.cjs",
+        excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
+      },
+    ]);
+
+    // 反例：本仓真在用的官方 action 不是未知载体，不含读 result.json 的普通 step 也不许红。
+    const allowed = [
+      { name: "checkout", uses: "actions/checkout@v4" },
+      { name: "node", uses: "actions/setup-node@v4", with: { "node-version": 20 } },
+      { id: "ok", run: "echo ok\n" },
+    ];
+    expect(referencedScripts(allowed, { root: dir })).toEqual({ files: [], missing: [], unfollowable: [] });
+    expect(resultJsonReaderViolations(allowed, { root: dir })).toEqual([]);
+    expect(fieldReadViolations(allowed, { root: dir })).toEqual([]);
+  });
+
+  it("行为判据不认字段名：JSON.parse 之后 Object.entries 枚举也算读者", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-behavior-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    // 审查实测的绕过：一个字段名都不写，照样把 executors / comparison.counts 打印出来。
+    const body =
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nfor (const [k, v] of Object.entries(r)) console.log(k, JSON.stringify(v));\n';
+    writeFileSync(join(dir, "scripts/probe-pos.mjs"), body);
+    const probe = { id: "probe", run: "node scripts/probe-pos.mjs\n" };
+    expect(probe.run).not.toMatch(/executors|comparison|counts/);
+    expect(body).not.toMatch(/executors|comparison|counts/);
+    // 字段名判据在这条上完全是绿的 —— 这正是它被绕过的方式。
+    expect(fieldReadViolations([probe], { root: dir })).toEqual([]);
+    expect(resultJsonReaderViolations([probe], { root: dir })).toEqual([
+      {
+        step: "probe",
+        where: "scripts/probe-pos.mjs",
+        excerpt: 'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));',
+      },
+    ]);
+    // 反例：解析的是别的文件，不算 result.json 的读者。
+    writeFileSync(
+      join(dir, "scripts/other.mjs"),
+      'const p = JSON.parse(readFileSync(".audit/review-a.json", "utf8"));\nconsole.log(Object.keys(p));\n',
+    );
+    expect(resultJsonReaderViolations([{ id: "other", run: "node scripts/other.mjs" }], { root: dir })).toEqual([]);
+    // 反例：只把文本倒进摘要（CI 里就是 cat/printf 进围栏），不解析成数据，不算数据读者。
+    // 这条不是放宽：字段名判据仍然覆盖 cat ... | jq '.["executors"]' 这类真取字段的写法。
+    expect(resultJsonReaderViolations([{ id: "text", run: "cat .audit/result.json\n" }], { root: dir })).toEqual([]);
+  });
+
+  it("放行单位是步不是文件：另一步再引用口径层脚本去读 result.json，照样是读者", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-step-allow-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/audit-findings.mjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(Object.entries(r).length);\n',
+    );
+    const writer = { id: "decide", run: "node scripts/audit-findings.mjs --out .audit/result.json\n" };
+    const thief = { id: "thief", run: "node scripts/audit-findings.mjs --out /tmp/elsewhere.json\n" };
+    // 同一个文件被两步引用：写 result.json 的那一步放行，另一个不是。
+    expect(resultJsonWriterSteps([writer, thief])).toEqual(["decide"]);
+    expect(resultJsonReaderViolations([writer, thief], { root: dir }).map((v) => v.step)).toEqual(["thief"]);
+  });
+
+  it("env 里的模块取值不靠 ./ 前缀才认：--require / -r / --import= / --loader 的取值都是扫描面", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-loader-env-"));
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(
+      join(dir, "scripts/probe-env.cjs"),
+      'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(Object.entries(r).length);\n',
+    );
+    const forms = [
+      "--require scripts/probe-env.cjs",
+      "-r scripts/probe-env.cjs",
+      "--import=scripts/probe-env.cjs",
+      "--loader scripts/probe-env.cjs",
+    ];
+    for (const value of forms) {
+      // 注意这里**没有 ./ 前缀**：只靠「整词以 ./ 开头」的旧规则认不出它。
+      const step = { id: "env", env: { NODE_OPTIONS: value }, run: 'node -e "console.log(1)"\n' };
+      expect(stepScriptRefs(step, { root: dir }), value).toEqual(["scripts/probe-env.cjs"]);
+      expect(referencedScripts([step], { root: dir }).missing, value).toEqual([]);
+      expect(resultJsonReaderViolations([step], { root: dir }).map((v) => v.where), value).toEqual([
+        "scripts/probe-env.cjs",
+      ]);
+    }
+    // 反例：env 里没有模块取值的普通字符串不造引用，也不进 unfollowable。
+    expect(referencedScripts([{ id: "e", env: { NOTE: "hello" }, run: "echo ok\n" }], { root: dir })).toEqual({
+      files: [],
+      missing: [],
+      unfollowable: [],
+    });
   });
 });
