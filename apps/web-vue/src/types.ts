@@ -24,11 +24,27 @@ export interface BoardConfig {
   transitions: BoardTransition[];
 }
 
+export interface PendingAttempt {
+  attemptId: string | null;
+  from: string | null;
+  to: string | null;
+  status: string | null;
+  requestedAt: string | null;
+  attempts: number | null;
+}
+
 export interface BoardItem {
   id: string | null;
   title: string;
   body: string;
+  // state 就是账本折叠态（后端同时给了 ledgerState 别名，这里保留旧字段给看板列用）。
   state: string | null;
+  // current 是远端 label 推出的当前态，null = 未知/无远端。
+  current: string | null;
+  ledgerState: string | null;
+  // divergence 只照抄后端布尔值：前端不比较 current 与 ledgerState 得出它。
+  divergence: boolean;
+  pending: PendingAttempt | null;
   updatedAt: string | null;
   raw: Loose;
 }
@@ -74,4 +90,96 @@ export function readFlag(source: Loose, key: string): boolean {
 
 export function readList(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+export interface OutboxTarget {
+  repo: string | null;
+  issue: number | null;
+}
+
+export interface OutboxEntry {
+  attemptId: string | null;
+  item: string | null;
+  from: string | null;
+  to: string | null;
+  by: string | null;
+  label: string | null;
+  target: OutboxTarget;
+  requestedAt: string | null;
+  attempts: number | null;
+  status: string | null;
+  reason: string | null;
+  observedAt: string | null;
+  observedLabels: string[];
+  raw: Loose;
+}
+
+export interface OutboxSnapshot {
+  entries: OutboxEntry[];
+  // null = 当前零在途请求（后端只在有下一轮巡检时间时给值）。
+  nextCheckAt: string | null;
+  deadline: string | null;
+  writeEnabled: boolean;
+  // 重试接口额外回的 attemptId 清单；GET /outbox 时为 []。
+  retried: string[];
+}
+
+export interface RemoteIssue {
+  number: number | null;
+  title: string | null;
+  state: string | null;
+  labels: string[];
+  updatedAt: string | null;
+}
+
+export interface RemoteSnapshot {
+  // present=false 是「还没同步过」，不是「空仓库」。
+  present: boolean;
+  etag: string | null;
+  fetchedAt: string | null;
+  repo: string | null;
+  issues: RemoteIssue[];
+}
+
+export interface ReconcileReport {
+  applied: number | null;
+  conflict: number | null;
+  pending: number | null;
+  raw: Loose;
+}
+
+export interface SyncReport {
+  status: string | null;
+  repo: string | null;
+  fetchedAt: string | null;
+  etag: string | null;
+  issues: number | null;
+  reconciled: ReconcileReport;
+}
+
+export interface IndexRebuildReport {
+  ok: boolean;
+  schemaVersion: string | null;
+  path: string | null;
+  items: number | null;
+  events: number | null;
+  remoteIssues: number | null;
+  outbox: number | null;
+}
+
+export function emptyOutbox(): OutboxSnapshot {
+  return { entries: [], nextCheckAt: null, deadline: null, writeEnabled: false, retried: [] };
+}
+
+export function emptyRemote(): RemoteSnapshot {
+  return { present: false, etag: null, fetchedAt: null, repo: null, issues: [] };
+}
+
+export function readNumber(source: Loose, key: string): number | null {
+  const value = source[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function readStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string");
 }
