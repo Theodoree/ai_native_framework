@@ -1,6 +1,6 @@
 # P-13 · 审计 findings 的执行层：schema、归一、比对、Check Run
 
-- **状态**：proposed（M4）
+- **状态**：implemented —— 执行层（`scripts/audit-findings.mjs` + `scripts/audit-slot.mjs` + `.github/workflows/audit.yml`）已落地并经真 PR 跑过；**结论形态最终定为手动触发、不挂 required**（理由见 `p14-audit-manual-gate.md`）。静态判据已按 §二十三 冻结，此后新发现的静态绕过只登记不返修
 - **依据**：`docs/audit-contract.md` 第一至三节
 - **范围**：只做「拿到 findings 之后」的执行层。跑模型的那一层（网关 + 沙盒）不在本轮。
 

@@ -1,7 +1,7 @@
 # P-09 挂 required check 与禁直推
 
 - **日期**：2026-10-20
-- **状态**：proposed
+- **状态**：implemented —— 由仓库 ruleset `main-guard`（id 25521030，enforcement active）落实：`required_status_checks` = `check`、`merge-gate`，另有 `non_fast_forward` 与 `deletion` 两条规则；`strict_required_status_checks_policy` 关（不要求每次更新分支都重跑全绿）
 - **里程碑**：M2 · 门与门牌
 - **依赖**：P-08
 > **需要人工/授权**：分支保护与 required status check 是 GitHub 仓库设置，须由人执行或明确授权。
