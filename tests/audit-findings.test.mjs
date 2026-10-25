@@ -437,10 +437,15 @@ describe("wiring: .github/workflows/audit.yml", () => {
     });
   });
 
-  it("触发面只有手动：注入源就绪前不挂 PR（否则只会 action_required 把每次合并挡死）", () => {
-    // 理由：merge-gate G3 要求非自身 check 全部 success，而本 job 在注入源就绪前只能产
-    // action_required。挂上 pull_request 等于让仓库进入「每次合并都被自己挡」的结构性死锁。
-    expect(Object.keys(doc.on)).toEqual(["workflow_dispatch"]);
+  it("触发面：手动派发 + pull_request_target，PR 只作数据", () => {
+    // 自动触发必须是 pull_request_target：它执行的是**基分支（默认分支）上的** YAML，
+    // PR 分支的脚本不进执行面，PR 号与 head sha 只作为数据进来。
+    // 用 pull_request 是另一回事：被审对象能提供审自己的脚本 —— 删掉自证步、改判据
+    // 都在本文件之外发生，本文件一字未改也「通过」。
+    expect(Object.keys(doc.on)).toEqual(["pull_request_target", "workflow_dispatch"]);
+    expect(doc.on.pull_request_target).toEqual({ types: ["opened", "synchronize", "reopened"] });
+    // 手动派发的输入面不许被顺手删掉：真跑注入（两个 findings 槽 + PR 号）靠它。
+    expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(["pr", "findings_a", "findings_b"]);
   });
 
   it("真的回写 Check Run（不是只发评论）", () => {
@@ -788,21 +793,40 @@ try {
       return String(ctx[key]);
     });
 
-  // if: 只支持两种成分：always() 与 steps.<id>.outputs.<key> (==|!=) 'v'，用 && 连起来。
+  // if: 只支持三种成分，用 && 连起来：always()、steps.<id>.outputs.<key> (==|!=) 'v'，
+  // 以及把若干比较整体取反的 !( ... )（括号里同样是上面那种比较的 && 组合）。
   // 注意本 runner 测不到 always() 的那一半语义（它不模拟「前一步红了就跳过后续步骤」）：
   // 「前一步红了仍然照写」这件事由 YAML 形状断言兜住，见 wiring 形状那条用例。
-  const ifMatches = (expr, outputs) =>
-    String(expr)
+  const compareTerm = (term, outputs) => {
+    const m = /^steps\.(\w+)\.outputs\.(\w+)\s*(==|!=)\s*'([^']*)'$/.exec(term);
+    if (!m) return null;
+    const actual = outputs[m[1]]?.[m[2]];
+    return m[3] === "==" ? actual === m[4] : actual !== m[4];
+  };
+  const ifMatches = (expr, outputs) => {
+    // !( ... ) 先整体摘出来：直接按 && 切分会切进括号里（!(a == '1' && b == '1') 会被
+    // 切成 "!(a == '1'" 与 "b == '1')" 两个都不认得的成分，于是每次调用都抛错）。
+    const negated = [];
+    const rest = String(expr)
       .trim()
-      .split("&&")
-      .map((term) => term.trim())
-      .every((term) => {
-        if (term === "always()") return true;
-        const m = /^steps\.(\w+)\.outputs\.(\w+)\s*(==|!=)\s*'([^']*)'$/.exec(term);
-        if (!m) throw new Error("本 runner 只认 always() 与 steps.<id>.outputs.<key> 'v' 的 && 组合: " + expr);
-        const actual = outputs[m[1]]?.[m[2]];
-        return m[3] === "==" ? actual === m[4] : actual !== m[4];
+      .replace(/!\(([^)]*)\)/g, (_, inner) => {
+        negated.push(inner);
+        return "&&";
       });
+    const conjunct = (terms) =>
+      terms
+        .map((term) => term.trim())
+        .filter(Boolean)
+        .every((term) => {
+          if (term === "always()") return true;
+          const hit = compareTerm(term, outputs);
+          if (hit === null) throw new Error("本 runner 只认 always() 与 steps.<id>.outputs.<key> 'v' 的 && 组合: " + expr);
+          return hit;
+        });
+    if (!conjunct(rest.split("&&"))) return false;
+    // 取反的成分全部不许成立。
+    return negated.every((inner) => !conjunct(inner.split("&&")));
+  };
 
   // 槽位身份是真判据（一个执行器不许占两个槽），所以夹具必须像真执行器那样
   // 各自自报所在槽；要测「冒充」的用例用 raw:true 显式绕过这层改写。
@@ -845,10 +869,16 @@ try {
     if (mutate) mutate(dir);
     const skip = new Set(options.skip ?? []);
     const ctx = {
-      "github.event.pull_request.number": "2",
+      // 默认走**手动派发**那条路（inputs.pr -> gh 问 head sha）：绝大多数用例测的是它，
+      // 事件来源由用例显式给这两个键（轮二十七-3）。
+      "github.event.pull_request.number": "",
       // 事件 sha 故意与假 gh 返回的 headRefOid 不同：两个值相同的话，
       // 「head_sha 来自 gh 而不是事件」这条断言就证明了任何东西。
       "github.event.pull_request.head.sha": "deadbeef",
+      // 受信 ref 的两个来源：手动派发时 execution 面就是 github.ref_name，
+      // 期望值是默认分支（github.event.repository.default_branch）。
+      "github.ref_name": "main",
+      "github.event.repository.default_branch": "main",
       // 本次 workflow 运行的提交（= env GITHUB_SHA）：ctx 被跳过时「判不了」的兜底落点。
       "github.sha": "f00dfeed",
       "secrets.GITHUB_TOKEN": "fake-token",
@@ -5135,6 +5165,74 @@ try {
     // 两种都落在同一个非空 sha 上：这条不变式不分来历。
     expect(noSha.payload.head_sha).toBe("f00dfeed");
     expect(noCtx.payload.head_sha).toBe("f00dfeed");
+  });
+
+  it("轮二十七-1：触发面 = 手动 + pull_request_target（类型钉死），不是 pull_request", () => {
+    // 执行面来自受信 ref 的前提是**事件类型**：pull_request_target 跑的是基分支（默认分支）
+    // 上的 YAML，PR 分支的 YAML 不进执行面；换回 pull_request，被审对象就自带审计脚本了。
+    // 这条用例直接读 YAML：删掉 pull_request_target 立刻红（那等于退回「只能手动派发」，
+    // 自动触发那条路整根消失）。
+    expect(Object.keys(doc.on)).toEqual(["pull_request_target", "workflow_dispatch"]);
+    expect(doc.on.pull_request_target).toEqual({ types: ["opened", "synchronize", "reopened"] });
+    // 手动派发的输入面不许被顺手删掉：真跑注入（两个 findings 槽 + PR 号）靠它。
+    expect(Object.keys(doc.on.workflow_dispatch.inputs)).toEqual(["pr", "findings_a", "findings_b"]);
+  });
+
+  it("轮二十七-2：checkout 钉在受信 ref（默认分支），不许落到 PR head", () => {
+    // pull_request_target 下 checkout 的默认行为确实是基分支，但那是 YAML 之外的约定：
+    // 有人加一个 ref 或换回 pull_request，执行面就跟着事件走。所以写死成显式表达式。
+    const checkout = steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout"));
+    expect(checkout).toBeTruthy();
+    expect(String(checkout.with?.ref)).toBe("${{ github.event.repository.default_branch }}");
+    // 落到 PR head = 让被审对象自带审计脚本：改了 scripts/ 里的判据、删掉自证步，
+    // 本文件一字未改也「通过」。
+    expect(String(checkout.with?.ref)).not.toContain("pull_request");
+  });
+
+  it("轮二十七-3：pull_request_target 路径 —— PR 号与 head sha 只作数据，一次 gh 都不问", () => {
+    // 事件来源的 ctx：pr / sha 都在事件里，trusted 由此恒为 1（执行面由 checkout 的 ref 钉死）。
+    // 假 gh 当然也能答 pr view（它总是回 cafebabe），所以「sha 来自事件」这条要靠
+    // 只给事件键、并断言 pr view 一次都没调来证明。
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      {
+        "github.event.pull_request.number": "7",
+        "github.event.pull_request.head.sha": "1234abcd",
+      },
+    );
+    expect(out.outputs.ctx).toMatchObject({ pr: "7", sha: "1234abcd", ok: "1", trusted: "1" });
+    // 真跑到口径层（不是判不了那条路）：证明这条路径真的判得动。
+    expect(out.outputs.decide).toBeTruthy();
+    // PR 只作数据：回写落点是 PR head 的 sha。
+    expect(out.payload).toMatchObject({ name: "audit", head_sha: "1234abcd" });
+    expect(out.calls.filter((call) => call.includes("pr view"))).toHaveLength(0);
+  });
+
+  it("轮二十七-4：不是从受信 ref 派发 —— 未判过（action_required），点名 ref，且不染红 job", () => {
+    // 从 feat/x 派发：执行面是 feat/x 上的本文件与 scripts/，那正是「被审对象提供判据」。
+    // 所以这一次不是通过，也不是代码不合格 —— 是「未判过」，必须显式回写。
+    const out = runWorkflow(
+      { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
+      { "github.ref_name": "feat/x", "github.event.repository.default_branch": "main" },
+    );
+    // sha 照样解得出（假 gh 给了 cafebabe）：判不了的成因是执行面，不是 PR 上下文。
+    expect(out.outputs.ctx).toMatchObject({ ok: "1", trusted: "0" });
+    // 口径层与写回都不许跑：非受信 ref 上的脚本不许产出结论。
+    expect(out.outputs.decide).toBeUndefined();
+    expect(out.ran.some((step) => step.name === "口径层判定")).toBe(false);
+    expect(out.ran.some((step) => step.name === "回写 Check Run")).toBe(false);
+    expect(out.calls.filter((call) => call.includes("--method POST"))).toHaveLength(1);
+    expect(out.payload).toMatchObject({ name: "audit", conclusion: "action_required" });
+    // 三类原因要分得开：这一类点名实际 ref 与期望 ref，别与「ctx 没跑起来」混成一句话。
+    expect(String(out.payload.output.title)).toContain("feat/x");
+    expect(String(out.payload.output.title)).toContain("main");
+    expect(String(out.payload.output.title)).toContain("受信 ref");
+    expect(String(out.payload.output.summary)).toContain("feat/x");
+    expect(out.summary).toContain("feat/x");
+    expect(out.summary).toContain("main");
+    // 未判过 ≠ 代码不合格：结论的红由 Check Run 承载，job 级 check 不染红。
+    expect(out.ran.at(-1).name).toBe("判定（判不了）");
+    expect(out.ran.at(-1).status).toBe(0);
   });
 
   it("判不了也要有个落点：ctx 与 github.sha 都空时这一步必须红，且一份 payload 都不许写", () => {

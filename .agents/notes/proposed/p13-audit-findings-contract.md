@@ -783,3 +783,30 @@ node scripts/audit-findings.mjs --a /tmp/r26/a.json --b /tmp/r26/b.json --out /t
 
 **A-1 假红（审查者登记、本轮修掉）**：`tests/audit-findings.test.mjs` 的 `auditDirReferenceViolations` 调 `stepTexts` 时没转发 `options.jobPayloads` → job 级 `defaults.run.working-directory` 在这个入口丢失 → 合法脚本被判 `script-missing`，而 workflow 入口对同一份文件是绿的：**同一份代码两个入口结论相反**。修法是转发 `jobPayloads`，并加用例「轮二十六-A1」（job `defaults.run.working-directory: tools` + `tools/scripts/ok.mjs`，断言两个入口都空）。变异验证：去掉转发 → 该用例 1 failed；恢复 → 193 passed。这条的教训不是判据不够严，是**判据的输入在不同入口之间不一致**——假红和假绿都是闸门失效。
 
+
+## 二十五、P-14 全量前置：受信 ref 执行面
+
+**问题（为什么必须改）**：`workflow_dispatch` 的执行面 = **被派发的那个 ref** 上的 YAML 与 `scripts/`。于是「被审对象」能提供「审自己的脚本」：删掉自证步、改口径层判据都在本文件之外发生，本文件一字未改也「通过」。判据再严都不成立 —— 信任根在执行面，不在判据。
+
+**改法（三处，都在 audit.yml）**：
+
+1. 触发面：`on` 加 `pull_request_target: { types: [opened, synchronize, reopened] }`，保留 `workflow_dispatch` 的三个 inputs（pr / findings_a / findings_b）。选 `pull_request_target` 而不是 `pull_request`：它执行的是**基分支（默认分支）上的** YAML，PR 分支的脚本不进执行面；PR 号与 head sha 只作数据进来。
+2. checkout 钉到受信 ref：`ref: ${{ github.event.repository.default_branch }}`。`pull_request_target` 下 checkout 的默认行为本来就是基分支，但那是 YAML 之外的约定；落到 PR head 就等于让被审对象自带审计脚本（改判据、删自证步都在 `scripts/` 里发生）。
+3. `解析 PR 上下文`（id `ctx`）支持两类来源，并新增 `trusted` 输出：事件来源直接读 `github.event.pull_request.number` / `.head.sha`（trusted=1，**一次 gh 都不调**）；手工派发走 `inputs.pr`（纯数字收窄守卫不变）+ `gh pr view --json headRefOid`，`trusted = (github.ref_name == github.event.repository.default_branch)`，不相等时**仍照常解 sha**。注入一律经 `env:` 进 run 块，不新增内联。
+
+**「不是从受信 ref 派发」是一种结论，不是跳过**：判不了的闸门从 `steps.ctx.outputs.ok != '1'` 扩成 `!(ok == '1' && trusted == '1')`；该分支回写的 Check Run（`conclusion: action_required`）与 step summary 分三类原因 —— (a) ctx 根本没跑起来（checkout / node 红）、(b) ctx 跑过但 sha 解不出、(c) **非受信 ref**（点名实际 ref 与期望 ref）。三类都不染红 job（`判定（判不了）` 仍 exit 0）：未判过 ≠ 代码不合格。其余所有「判得动」的步骤（两个落盘 / 口径层判定 / 结论兜底 / 回写 Check Run / 结论自证 / 判定）闸门统一成 `ok == '1' && trusted == '1'`：非受信 ref 上跑出来的结论一律不许落盘、不许回写。`concurrency.group` 改成 `audit-${{ github.event.pull_request.number || inputs.pr }}`，两种来源落在同一个互斥名上。
+
+**新增用例（`wiring: 真跑 YAML 的 run 块`，轮二十七-1..4）**：① 触发面的键与 `pull_request_target.types`（删掉 `pull_request_target` 即红）；② checkout 的 `with.ref` 必须等于那个表达式且不含 `pull_request`；③ 事件路径只给事件键 —— ctx 输出 `{pr:7, sha:1234abcd, ok:1, trusted:1}`、真跑到口径层、`payload.head_sha=1234abcd`、`pr view` 零调用（PR 只作数据）；④ 非受信 ref（`github.ref_name=feat/x`）—— `trusted=0`、口径层与回写都不跑、只 POST 一次且 `conclusion=action_required`、标题与摘要点名 `feat/x` 与 `main`、`判定（判不了）` status 0。
+
+**变异（在工作区做，cp 备份恢复，不用 git checkout）**：
+
+| 变异 | 改了哪一行 | 红 | 哪些用例红 |
+|---|---|---|---|
+| 去掉 checkout ref 钉 | 删掉 `ref:` 那行 | 1 | 轮二十七-2 |
+| trusted 恒置 1 | ctx 里的 `if [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then trusted=1; fi` → `trusted=1` | 1 | 轮二十七-4 |
+| trusted 恒置 0 | ctx 写 outputs 前插 `trusted=0` | 29 | 全 pass、自证 9 条、needs_revision、INFRA、摘要围栏、注入不被求值、一执行器两槽、判不了回写、两种判不了、轮二十七-3、口径层崩溃、POST 失败、上游没注入、轮十八-4/5/6、轮二十二-5 |
+
+**判据面结论（默认拒绝的性格下，这是「判据该放行」而不是放宽）**：新增的 YAML 键只有三类 —— `on.pull_request_target`、`checkout.with.ref`、ctx 的 `trusted` 输出。前两类定义**执行面**（谁来跑），不是判定通道；`trusted` 是 `ctx` 的既有形状多一个输出，闸门因此从 1 个条件变 2 个（更严）。所以改的是**断言本身**（`Object.keys(doc.on)` 由 1 键改 2 键，并补 `types` 断言），不是白名单；`STEP_ALLOWED_KEYS` / `JOB_ALLOWED_KEYS` / 写面 / 端点 / 解引用 / `.audit` 引用等规则一条未动 —— 全绿即证明它们对新执行面同样成立。
+
+**仍开着的那一半（登记，不返修）**：`trusted` 只回答「执行面是不是默认分支」，不回答「默认分支上的 YAML / `scripts/` 有没有被改坏」—— 那是仓库自身的 review 闸门。另外 `pull_request_target` 给的是 base 仓库的写 token：本 workflow 只读 PR 元数据、不 checkout PR 代码，所以 PR 内容不进执行面；这条前提由「checkout 钉 ref」的用例与形状冻结共同守住。
+

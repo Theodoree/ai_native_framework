@@ -58,20 +58,25 @@ name: audit
 # 那种「判不了」的成因是管线自己坏了（不是这个 PR 的问题），与「PR 上下文解不出」必须
 # 分开说：后者去改 PR / 重试，前者去修管线。
 #
-# 触发面刻意只有手动：手动 dispatch 时由 inputs 注入两个执行器的 findings（真跑用），
-# 不注入就落 INFRA。不挂 pull_request 的理由是 merge-gate 的 G3 要求每个非自身 check 都
-# success，于是一个可能产出 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
-# 那是结构性死锁，而且会训练人忽略红灯。等上游真执行器能保证「PR 事件一律有结论」之后再
-# 打开 pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
+# 触发面（P-14 信任根）：两种来源，**执行面只有一个**——默认分支（受信 ref）上的
+# YAML 与 scripts/。
+#   * pull_request_target：执行的是基分支（默认分支）上的 YAML，PR 分支的 YAML 不进执行面；
+#     PR 号与 head sha 只作为数据进来。用 pull_request 是另一回事：被审对象自带审计脚本，
+#     删掉自证步、改判据都在本文件之外发生，本文件一字未改也「通过」。
+#     也正因为如此，checkout 必须显式钉到默认分支（见下面的 ref），不能让它落到 PR head。
+#   * workflow_dispatch：由 inputs 注入两个执行器的 findings（真跑用），不注入就落 INFRA。
+#     手工派发时执行面是**被派发的那个 ref**，所以「是不是默认分支」本身是一种结论：
+#     不是就 trusted=0，按「判不了」回写 action_required，不是静默跳过、也不红 job。
 #
-# 手动触发的硬约束：**从 PR 的 head 分支 dispatch**。dispatch 的 ref 决定 job 的 GITHUB_SHA，
-# 与 PR head 无关。能解出 PR head sha 时，判定落点永远是那个 sha（与 ref 无关）；
-# 解不出来时只能退回 GITHUB_SHA，那时落点才是 dispatch ref 的提交 —— ref 不是 head 分支，
-# 留痕就落在别的提交上，PR head 上上一轮的结论原样保留。
-# 这条不靠注释兜着：「判不了：回写 INFRA」把落点 sha 写进 Check Run 标题，并用 ::error:: 喊出来。
-# 该窗口在 audit 被挂成 required check 之前没有消费者（P-14 全量时才关上）。
+# 手动触发的硬约束：**从默认分支 dispatch，且解得出 PR head sha**。dispatch 的 ref 决定
+# job 的 GITHUB_SHA，与 PR head 无关。能解出 PR head sha 时，判定落点永远是那个 sha
+# （与 ref 无关）；解不出来时只能退回 GITHUB_SHA，那时落点才是 dispatch ref 的提交。
+# 这条不靠注释兜着：「判不了：回写 INFRA」把落点 sha 与成因（管线没跑 / 解不出 / 非受信 ref）
+# 写进 Check Run 标题，并用 ::error:: 喊出来。
 
 on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       pr:
@@ -92,7 +97,9 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: audit-${{ inputs.pr }}
+  # 两种来源要落在同一个互斥名上：同一 PR 的事件触发与手工派发不许并发跑。
+  group: audit-${{ github.event.pull_request.number || inputs.pr }}
+
   cancel-in-progress: true
 
 jobs:
@@ -107,6 +114,12 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          # 执行面只许是默认分支（受信 ref）。pull_request_target 下 checkout 的默认行为是
+          # 基分支，但默认行为是靠 YAML 之外的约定，一旦有人改回 pull_request 或加 ref，
+          # 执行面就跟着事件走 —— 所以写死。落到 PR head 就等于让被审对象自带审计脚本：
+          # 改判据、删自证步都在 scripts/ 里发生，本文件一字未改也「通过」。
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: node
         uses: actions/setup-node@v4
@@ -116,22 +129,47 @@ jobs:
       # 这一步永不失败：解不出 PR 上下文本身就是一种结论（判不了），
       # 而失败的 step 会让后面所有 step 被跳过、连 Check Run 都写不出去——
       # 于是同一个 sha 上上一轮的 success 原样留着，「这次判不了」退化成「上次判过了」。
-      # 所以失败只体现在 ok=0，由后面两步按 ok 分流：要么正常判定，要么回写 INFRA。
+      # 所以失败只体现在 ok=0 / trusted=0，由后面两步按这两个值分流：
+      # 要么正常判定，要么回写 INFRA。
+      #
+      # 两种来源，注入值一律经 env 进 run 块（内联就是一次 shell 拼接）：
+      #   * pull_request_target：PR 号与 head sha 都在事件里，一次 gh 都不用调；
+      #   * workflow_dispatch：PR 号来自 inputs，head sha 要问 gh。
+      # trusted 与 ok 是两个独立事实：ok 回答「有没有对象可判」，trusted 回答
+      # 「执行面是不是受信 ref（默认分支）上的 YAML 与脚本」。手工派发时后者要看
+      # github.ref_name —— 从非默认分支派发，跑的仍是那个分支上的本文件，
+      # 于是「判据由被审对象提供」这个前提又回来了，这一次不算判过。
       - name: 解析 PR 上下文
         id: ctx
         env:
           PR_INPUT: ${{ inputs.pr }}
+          PR_EVENT: ${{ github.event.pull_request.number }}
+          SHA_EVENT: ${{ github.event.pull_request.head.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          pr="$PR_INPUT"
+          pr=""
+          sha=""
+          trusted=0
+          if [ -n "$PR_EVENT" ]; then
+            # 事件来源：head sha 是**数据**，不是执行面（执行面由 checkout 的 ref 钉死）。
+            pr="$PR_EVENT"
+            sha="$SHA_EVENT"
+            trusted=1
+          else
+            # 手工派发：执行面就是被派发的那个 ref。
+            if [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then trusted=1; fi
+            pr="$PR_INPUT"
+          fi
           # PR 号只允许是数字：它要进 $GITHUB_OUTPUT 和注解，一个换行就能伪造一条注解。
           case "$pr" in
             '' | *[!0-9]*) pr="" ;;
           esac
-          sha=""
-          if [ -n "$pr" ]; then
+          if [ -z "$PR_EVENT" ] && [ -n "$pr" ]; then
             sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
           fi
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "trusted=$trusted" >> "$GITHUB_OUTPUT"
           if [ -n "$sha" ]; then
             echo "sha=$sha" >> "$GITHUB_OUTPUT"
             echo "ok=1" >> "$GITHUB_OUTPUT"
@@ -147,15 +185,17 @@ jobs:
       # 绝不在 run 里内联输入（那是一次 shell 拼接）。
       # 「输入自称的执行器」与「它所在的槽」是否一致，由 scripts/audit-slot.mjs 判，
       # 规则不在这两份 run 块里各写一遍。
+      # 下面所有「判得动」的步骤都要求 ok=1 且 trusted=1：判据（本文件的 YAML 与 scripts/）
+      # 只有在受信 ref 上执行才成立。少一个条件，非受信 ref 派发就会跑出一份「看起来判过」的结论。
       - name: 落盘 review-a
-        if: steps.ctx.outputs.ok == '1'
+        if: steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1'
         env:
           AUDIT_FINDINGS_A: ${{ inputs.findings_a }}
         run: |
           AUDIT_INPUT="$AUDIT_FINDINGS_A" node scripts/audit-slot.mjs --slot review-a --executor sandbox --out .audit/review-a.json
 
       - name: 落盘 review-b
-        if: steps.ctx.outputs.ok == '1'
+        if: steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1'
         env:
           AUDIT_FINDINGS_B: ${{ inputs.findings_b }}
         run: |
@@ -167,7 +207,7 @@ jobs:
       # 就会重演「脚本崩了但步骤绿、且没有 conclusion」。
       - name: 口径层判定
         id: decide
-        if: steps.ctx.outputs.ok == '1'
+        if: steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1'
         run: |
           set +e
           node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json
@@ -211,7 +251,7 @@ jobs:
       # 结论的红由 Check Run 承载，同一事实只该有一个写者。
       - name: 结论兜底
         id: fallback
-        if: always() && steps.ctx.outputs.ok == '1'
+        if: always() && steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1'
         env:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
         run: |
@@ -276,7 +316,7 @@ jobs:
       # 一个红步骤把它跳过去，就等于「这次判不了」退化成「上次判过了」。
       - name: 回写 Check Run
         id: post
-        if: always() && steps.ctx.outputs.ok == '1'
+        if: always() && steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1'
         run: |
           id=$(gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id')
           printf '%s\n' "$id"
@@ -301,7 +341,7 @@ jobs:
       # 再比这一条**写着什么**：id 只证明「是谁」，PATCH 改写既有那条不换 id，只比 id 结构上
       # 看不见它（实测 checks.update 全绿）。
       - name: 结论自证：回读 Check Run
-        if: always() && steps.ctx.outputs.ok == '1'
+        if: always() && steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1'
         env:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
         run: |
@@ -466,16 +506,23 @@ jobs:
       # 落点有两个来源，但**一定非空**：ctx 解出的 sha（ctx 自己已经退到 GITHUB_SHA），
       # ctx 整步没跑起来时再退到 github.sha。空 head_sha 会被 GitHub 拒收，那时
       # 服务器上一条 Check Run 都没有 —— 正是这条要防的形态。
-      # 落点仍然是**猜的**（不是 PR head），所以标题与摘要都写明这一点，
+      # 「判不了」有三种来历，责任方向不同，标题与摘要必须分得开：
+      #   (a) ctx 根本没跑起来（checkout / node 先挂了）—— 管线自己的故障，与这个 PR 无关；
+      #   (b) ctx 跑过但解不出 head sha —— 审计没有对象，去改 PR / 重试；
+      #   (c) **不是从受信 ref 派发** —— 执行面是那个 ref 上的 YAML 与 scripts/，判据由
+      #       被审对象提供，这一次**没判过**。点名实际 ref 与期望 ref。
+      # 三类都只是「未判过」：它们不红 job（结论的红由这条 Check Run 承载），也不许被读成通过。
+      # 落点仍然是**猜的**（a / b 两类的落点不是 PR head），所以标题与摘要都写明这一点，
       # 别写成「已经在正确的位置留过痕」。
-      # 「判不了」有两种来历，责任方向相反：ctx 跑过但解不出 PR head 是 PR 侧的事；
-      # ctx 根本没跑起来（checkout / node 先挂了）是管线自己坏了，与这个 PR 无关。
       - name: 判不了：回写 INFRA
-        if: always() && steps.ctx.outputs.ok != '1'
+        if: always() && !(steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1')
         env:
           AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
           RUN_SHA: ${{ github.sha }}
           CTX_OK: ${{ steps.ctx.outputs.ok }}
+          CTX_TRUSTED: ${{ steps.ctx.outputs.trusted }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           mkdir -p .audit
           node -e '
@@ -486,55 +533,82 @@ jobs:
             if (!sha) throw new Error("判不了也要有个落点：ctx 与 github.sha 都是空的");
             // ctx 有没有跑起来，看它有没有写出 ok：空串 = 这一步被跳过（前置步骤先红了）。
             const pipeline = !process.env.CTX_OK;
+            // ok 有了、trusted 不是 1：ctx 跑起来了、sha 也解出来了，只是执行面不来自受信 ref。
+            // 「执行面来自被派发的那个 ref」= 被审对象自带判据，所以这一次**没判过**，
+            // 既不是通过，也不是代码不合格。
+            const untrusted = !pipeline && process.env.CTX_TRUSTED !== "1";
+            const ref = process.env.REF_NAME || "（空）";
+            const expected = process.env.DEFAULT_BRANCH || "（空）";
             const why = pipeline
               ? "解析 PR 上下文的步骤没有跑起来（checkout / node 之类的前置步骤先失败了）：这是管线自己的故障，不是这个 PR 的问题。"
-              : "解析 PR 上下文跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。";
-            const traced = fromCtx
-              ? "落点 " + sha + " 来自 ctx 步（它已退到本次运行的提交）"
-              : "落点 " + sha + " 退到了 github.sha（本次 workflow 运行的提交）";
+              : untrusted
+                ? "本次不是从受信 ref 派发的：执行面是 ref=" + ref + " 上的 YAML 与 scripts/，不是默认分支 " + expected + "，判据由被派发的那个 ref 提供，所以这一次不算判过。"
+                : "解析 PR 上下文跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。";
+            const kind = pipeline
+              ? "管线没跑起来"
+              : untrusted
+                ? "不是从受信 ref 派发：ref=" + ref + "，期望 " + expected
+                : "PR 上下文解不出";
+            const traced = untrusted
+              ? "执行面来自那个 ref，所以这一次没判过：改用 pull_request_target 自动触发（执行面 = 默认分支）或从默认分支手动 dispatch。"
+              : fromCtx
+                ? "落点 " + sha + " 来自 ctx 步（它已退到本次运行的提交）"
+                : "落点 " + sha + " 退到了 github.sha（本次 workflow 运行的提交）";
+            const tail = untrusted
+              ? ""
+              : "，不保证等于 PR head —— dispatch 的 ref 不是 head 分支时，PR head 上的旧结论仍然保留。";
             fs.writeFileSync(".audit/check-run.json", JSON.stringify({
               name: "audit",
               head_sha: sha,
               status: "completed",
               conclusion: "action_required",
               output: {
+                // 第三类（非受信 ref）的落点**就是** PR head，不能再写「不是 PR head」。
                 title:
                   "audit INFRA（" +
-                  (pipeline ? "管线没跑起来" : "PR 上下文解不出") +
+                  kind +
                   "；落点 " +
                   sha +
-                  "：不是 PR head）",
-                summary:
-                  why + " " + traced + "，不保证等于 PR head —— dispatch 的 ref 不是 head 分支时，PR head 上的旧结论仍然保留。",
+                  (untrusted ? "）" : "：不是 PR head）"),
+                summary: why + " " + traced + tail,
               },
             }));
           '
           gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
-          case "${CTX_OK:-}" in
-            '')
-              cause='ctx 步没有跑起来（checkout / node 之类的前置步骤先失败了）：这是管线自己的故障，不是这个 PR 的问题。'
-              ;;
-            *)
-              cause='ctx 步跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。'
-              ;;
-          esac
+          # 摘要分三类原因，与 Check Run 的标题同一套口径：读者不该自己去猜是哪种。
+          if [[ -z "${CTX_OK:-}" ]]; then
+            cause='ctx 步没有跑起来（checkout / node 之类的前置步骤先失败了）：这是管线自己的故障，不是这个 PR 的问题。'
+            landing='**落点不一定是 PR head**：写到的 sha 是本次 workflow 运行的提交。'
+            landing2='dispatch 的 ref 不是这个 PR 的 head 分支时，这条留痕落在别的提交上，'
+            landing3='PR head 上的旧结论原样保留——别把「看见过 audit 的红」当成「这个 PR 判过」。'
+          elif [[ "${CTX_TRUSTED:-}" != '1' ]]; then
+            cause="不是从受信 ref 派发：ref=${REF_NAME:-（空）}，期望 ${DEFAULT_BRANCH:-（空）}。执行面是那个 ref 上的 YAML 与 scripts/，判据由被派发的 ref 提供——这一次没判过，但也不是「代码不合格」。"
+            landing='**这次判不了的成因是执行面，不是 PR 上下文**：PR 号与 head sha 只是数据。'
+            landing2='改法：用 pull_request_target 自动触发（执行面 = 默认分支），或从默认分支手动 dispatch。'
+            landing3=''
+          else
+            cause='ctx 步跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。'
+            landing='**落点不一定是 PR head**：写到的 sha 是本次 workflow 运行的提交。'
+            landing2='dispatch 的 ref 不是这个 PR 的 head 分支时，这条留痕落在别的提交上，'
+            landing3='PR head 上的旧结论原样保留——别把「看见过 audit 的红」当成「这个 PR 判过」。'
+          fi
           {
             echo '## audit: INFRA（判不了 → 按「未判过」留痕）'
             echo ''
             echo "$cause"
             echo ''
-            echo '**落点不一定是 PR head**：写到的 sha 是本次 workflow 运行的提交。'
-            echo 'dispatch 的 ref 不是这个 PR 的 head 分支时，这条留痕落在别的提交上，'
-            echo 'PR head 上的旧结论原样保留——别把「看见过 audit 的红」当成「这个 PR 判过」。'
+            echo "$landing"
+            if [[ -n "$landing2" ]]; then echo "$landing2"; fi
+            if [[ -n "$landing3" ]]; then echo "$landing3"; fi
           } >> "$GITHUB_STEP_SUMMARY"
-          echo '::error title=audit INFRA::判不了：落点是本次运行的提交，不是 PR head'
+          echo "::error title=audit INFRA::判不了：$cause"
 
       # job 级 check 只回答「这个 job 有没有出逻辑故障」：
       # 0 = 跑完了（不论结论是 success 还是 action_required；结论的红由 Check Run 承载）
       # 1 = 结论是 failure（代码不合格，红线一致）
       # 3 = 口径层与兜底都没给出退出码 —— 结论没落地，绝不能绿
       - name: 判定
-        if: always() && steps.ctx.outputs.ok == '1'
+        if: always() && steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1'
         run: |
           code='${{ steps.decide.outputs.exit }}'
           # 口径层被跳过（前一步红了）或崩在写 outputs 之前：退出码由兜底步给。
@@ -552,7 +626,7 @@ jobs:
       # 所以 job 级 check 也是绿的：结论的红由 Check Run 承载。
       # 真出故障（POST 失败）时红的是那一步本身，不是这里补的一刀。
       - name: 判定（判不了）
-        if: always() && steps.ctx.outputs.ok != '1'
+        if: always() && !(steps.ctx.outputs.ok == '1' && steps.ctx.outputs.trusted == '1')
         run: |
           echo '判不了：结论已由「判不了：回写 INFRA」POST 成 action_required；job 级 check 只回答「有没有出逻辑故障」。'
           exit 0
