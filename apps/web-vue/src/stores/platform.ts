@@ -6,19 +6,40 @@ import {
   getBoard,
   getConfig,
   getEvents,
+  getOutbox,
+  getRemote,
+  postIndexRebuild,
   postItem,
+  postOutboxRetry,
+  postSync,
   postVerify,
   postVerdict,
   putConfig,
 } from "../api/client";
-import { parseBoard, parseConfigText, parseEvent, parseEvents, parseVerify } from "../api/parse";
+import {
+  parseBoard,
+  parseConfigText,
+  parseEvent,
+  parseEvents,
+  parseIndexRebuild,
+  parseOutbox,
+  parseRemote,
+  parseSyncReport,
+  parseVerify,
+} from "../api/parse";
 import {
   emptyConfig,
+  emptyOutbox,
+  emptyRemote,
   type ApiFailure,
   type BoardConfig,
   type BoardItem,
   type BoardTransition,
+  type IndexRebuildReport,
+  type OutboxSnapshot,
   type PlatformEvent,
+  type RemoteSnapshot,
+  type SyncReport,
 } from "../types";
 
 export interface BoardColumn {
@@ -43,6 +64,25 @@ interface VerifyPanelState {
   failure: ApiFailure | null;
 }
 
+interface SyncPanelState {
+  running: boolean;
+  failure: ApiFailure | null;
+  report: SyncReport | null;
+}
+
+interface IndexPanelState {
+  running: boolean;
+  failure: ApiFailure | null;
+  report: IndexRebuildReport | null;
+}
+
+interface RetryPanelState {
+  attemptId: string | null;
+  pending: boolean;
+  failure: ApiFailure | null;
+  ok: string | null;
+}
+
 interface PlatformState {
   items: BoardItem[];
   config: BoardConfig;
@@ -63,6 +103,15 @@ interface PlatformState {
   createOk: string | null;
   verdict: VerdictPanelState;
   verify: VerifyPanelState;
+  remote: RemoteSnapshot;
+  remoteLoading: boolean;
+  remoteFailure: ApiFailure | null;
+  outbox: OutboxSnapshot;
+  outboxLoading: boolean;
+  outboxFailure: ApiFailure | null;
+  sync: SyncPanelState;
+  indexRebuild: IndexPanelState;
+  retry: RetryPanelState;
 }
 
 const state = reactive<PlatformState>({
@@ -85,6 +134,15 @@ const state = reactive<PlatformState>({
   createOk: null,
   verdict: { pending: false, failure: null, ok: null },
   verify: { running: false, ranAt: null, exitCode: null, output: "", failure: null },
+  remote: emptyRemote(),
+  remoteLoading: false,
+  remoteFailure: null,
+  outbox: emptyOutbox(),
+  outboxLoading: false,
+  outboxFailure: null,
+  sync: { running: false, failure: null, report: null },
+  indexRebuild: { running: false, failure: null, report: null },
+  retry: { attemptId: null, pending: false, failure: null, ok: null },
 });
 
 const selectedItem = computed<BoardItem | null>(() => {
@@ -173,8 +231,32 @@ async function reloadConfig(): Promise<void> {
   state.configLoading = false;
 }
 
+async function reloadRemote(): Promise<void> {
+  state.remoteLoading = true;
+  const result = await getRemote();
+  if (result.ok) {
+    state.remote = parseRemote(result.data);
+    state.remoteFailure = null;
+  } else {
+    state.remoteFailure = result.failure;
+  }
+  state.remoteLoading = false;
+}
+
+async function reloadOutbox(): Promise<void> {
+  state.outboxLoading = true;
+  const result = await getOutbox();
+  if (result.ok) {
+    state.outbox = parseOutbox(result.data);
+    state.outboxFailure = null;
+  } else {
+    state.outboxFailure = result.failure;
+  }
+  state.outboxLoading = false;
+}
+
 async function reloadAll(): Promise<void> {
-  await Promise.all([reloadBoard(), reloadEvents(), reloadConfig()]);
+  await Promise.all([reloadBoard(), reloadEvents(), reloadConfig(), reloadRemote(), reloadOutbox()]);
 }
 
 function selectItem(id: string | null): void {
@@ -261,6 +343,57 @@ async function runVerify(): Promise<void> {
   state.verify.ranAt = new Date().toISOString();
 }
 
+// 同步一次：结果是后端给的报告，前端只如实展示 status/issues/reconciled，不做二次判断。
+async function runSync(): Promise<void> {
+  state.sync.running = true;
+  state.sync.failure = null;
+  state.sync.report = null;
+  const result = await postSync();
+  state.sync.running = false;
+  if (!result.ok) {
+    state.sync.failure = result.failure;
+    return;
+  }
+  state.sync.report = parseSyncReport(result.data);
+  // 同步会改写缓存与账本态（reconciled），所以看板与在途都要重读。
+  await Promise.all([reloadRemote(), reloadBoard(), reloadOutbox()]);
+}
+
+async function runIndexRebuild(): Promise<void> {
+  state.indexRebuild.running = true;
+  state.indexRebuild.failure = null;
+  state.indexRebuild.report = null;
+  const result = await postIndexRebuild();
+  state.indexRebuild.running = false;
+  if (!result.ok) {
+    state.indexRebuild.failure = result.failure;
+    return;
+  }
+  state.indexRebuild.report = parseIndexRebuild(result.data);
+  await reloadBoard();
+}
+
+// 重试只对 stalled/failed 生效（后端判定）；前端不自己算，也不拦。
+async function retryOutboxEntry(attemptId: string): Promise<void> {
+  state.retry.attemptId = attemptId;
+  state.retry.pending = true;
+  state.retry.failure = null;
+  state.retry.ok = null;
+  const result = await postOutboxRetry(attemptId);
+  state.retry.pending = false;
+  if (!result.ok) {
+    state.retry.failure = result.failure;
+    return;
+  }
+  const snapshot = parseOutbox(result.data);
+  state.outbox = snapshot;
+  state.retry.ok =
+    snapshot.retried.length > 0
+      ? "已重试：" + snapshot.retried.join(", ")
+      : "后端没有重试任何尝试（已不满足重试条件）";
+  await Promise.all([reloadBoard(), reloadOutbox()]);
+}
+
 export function usePlatform() {
   return {
     state,
@@ -271,11 +404,16 @@ export function usePlatform() {
     reloadBoard,
     reloadEvents,
     reloadConfig,
+    reloadRemote,
+    reloadOutbox,
     reloadAll,
     selectItem,
     createItem,
     submitVerdict,
     saveConfig,
     runVerify,
+    runSync,
+    runIndexRebuild,
+    retryOutboxEntry,
   };
 }

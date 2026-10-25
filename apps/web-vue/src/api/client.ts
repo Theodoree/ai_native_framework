@@ -110,3 +110,22 @@ export function postVerdict(input: VerdictInput): Promise<ApiResult<unknown>> {
 export function postVerify(): Promise<ApiResult<unknown>> {
   return request<unknown>("POST", "/verify", {});
 }
+export function getRemote(): Promise<ApiResult<unknown>> {
+  return request<unknown>("GET", "/remote");
+}
+
+export function postSync(): Promise<ApiResult<unknown>> {
+  return request<unknown>("POST", "/sync", {});
+}
+
+export function getOutbox(): Promise<ApiResult<unknown>> {
+  return request<unknown>("GET", "/outbox");
+}
+
+export function postOutboxRetry(attemptId: string): Promise<ApiResult<unknown>> {
+  return request<unknown>("POST", "/outbox/retry", { attemptId });
+}
+
+export function postIndexRebuild(): Promise<ApiResult<unknown>> {
+  return request<unknown>("POST", "/index/rebuild", {});
+}

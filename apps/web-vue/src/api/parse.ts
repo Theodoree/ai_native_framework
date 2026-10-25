@@ -3,12 +3,23 @@ import {
   asLoose,
   readFlag,
   readList,
+  readNumber,
   readString,
+  readStringList,
   type BoardConfig,
   type BoardItem,
   type BoardState,
   type BoardTransition,
+  type IndexRebuildReport,
+  type OutboxEntry,
+  type OutboxSnapshot,
+  type OutboxTarget,
+  type PendingAttempt,
   type PlatformEvent,
+  type ReconcileReport,
+  type RemoteIssue,
+  type RemoteSnapshot,
+  type SyncReport,
 } from "../types";
 
 export interface BoardSnapshot {
@@ -52,14 +63,34 @@ function normalizeConfig(raw: unknown): BoardConfig {
   };
 }
 
+function normalizePending(raw: unknown): PendingAttempt | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const loose = asLoose(raw);
+  return {
+    attemptId: readString(loose, "attemptId"),
+    from: readString(loose, "from"),
+    to: readString(loose, "to"),
+    status: readString(loose, "status"),
+    requestedAt: readString(loose, "requestedAt"),
+    attempts: readNumber(loose, "attempts"),
+  };
+}
+
 function normalizeItem(raw: unknown): BoardItem {
   const loose = asLoose(raw);
+  // 状态字段可能叫 state，也可能只有 to：两种都认，都缺就按「还没有状态」显示。
+  const state = readString(loose, "state") ?? readString(loose, "to");
   return {
     id: readString(loose, "id"),
     title: readString(loose, "title") ?? "(未命名)",
     body: readString(loose, "body") ?? "",
-    // 状态字段可能叫 state，也可能只有 to：两种都认，都缺就按「还没有状态」显示。
-    state: readString(loose, "state") ?? readString(loose, "to"),
+    state,
+    // current 缺失与「远端说 null」在界面上是同一件事：未知/无远端。
+    current: readString(loose, "current"),
+    ledgerState: readString(loose, "ledgerState") ?? state,
+    // 只信后端给的布尔值，不在前端拿 current 与 ledgerState 相比。
+    divergence: readFlag(loose, "divergence"),
+    pending: normalizePending(loose["pending"]),
     updatedAt: readString(loose, "updatedAt") ?? readString(loose, "at"),
     raw: loose,
   };
@@ -109,5 +140,97 @@ export function parseVerify(payload: unknown): VerifySnapshot {
   return {
     exitCode: typeof rawExit === "number" && Number.isFinite(rawExit) ? rawExit : null,
     output: readString(loose, "output") ?? "",
+  };
+}
+function normalizeTarget(raw: unknown): OutboxTarget {
+  const loose = asLoose(raw);
+  return { repo: readString(loose, "repo"), issue: readNumber(loose, "issue") };
+}
+
+function normalizeOutboxEntry(raw: unknown): OutboxEntry {
+  const loose = asLoose(raw);
+  return {
+    attemptId: readString(loose, "attemptId"),
+    item: readString(loose, "item"),
+    from: readString(loose, "from"),
+    to: readString(loose, "to"),
+    by: readString(loose, "by"),
+    label: readString(loose, "label"),
+    target: normalizeTarget(loose["target"]),
+    requestedAt: readString(loose, "requestedAt"),
+    attempts: readNumber(loose, "attempts"),
+    status: readString(loose, "status"),
+    reason: readString(loose, "reason"),
+    observedAt: readString(loose, "observedAt"),
+    observedLabels: readStringList(loose["observedLabels"]),
+    raw: loose,
+  };
+}
+
+export function parseOutbox(payload: unknown): OutboxSnapshot {
+  const loose = asLoose(payload);
+  return {
+    entries: readList(loose["entries"]).map(normalizeOutboxEntry),
+    nextCheckAt: readString(loose, "nextCheckAt"),
+    deadline: readString(loose, "deadline"),
+    writeEnabled: readFlag(loose, "writeEnabled"),
+    retried: readStringList(loose["retried"]),
+  };
+}
+
+function normalizeRemoteIssue(raw: unknown): RemoteIssue {
+  const loose = asLoose(raw);
+  return {
+    number: readNumber(loose, "number"),
+    title: readString(loose, "title"),
+    state: readString(loose, "state"),
+    labels: readStringList(loose["labels"]),
+    updatedAt: readString(loose, "updated_at") ?? readString(loose, "updatedAt"),
+  };
+}
+
+export function parseRemote(payload: unknown): RemoteSnapshot {
+  const loose = asLoose(payload);
+  return {
+    present: readFlag(loose, "present"),
+    etag: readString(loose, "etag"),
+    fetchedAt: readString(loose, "fetchedAt"),
+    repo: readString(loose, "repo"),
+    issues: readList(loose["issues"]).map(normalizeRemoteIssue),
+  };
+}
+
+function normalizeReconciled(raw: unknown): ReconcileReport {
+  const loose = asLoose(raw);
+  return {
+    applied: readNumber(loose, "applied"),
+    conflict: readNumber(loose, "conflict"),
+    pending: readNumber(loose, "pending"),
+    raw: loose,
+  };
+}
+
+export function parseSyncReport(payload: unknown): SyncReport {
+  const loose = asLoose(payload);
+  return {
+    status: readString(loose, "status"),
+    repo: readString(loose, "repo"),
+    fetchedAt: readString(loose, "fetchedAt"),
+    etag: readString(loose, "etag"),
+    issues: readNumber(loose, "issues"),
+    reconciled: normalizeReconciled(loose["reconciled"]),
+  };
+}
+
+export function parseIndexRebuild(payload: unknown): IndexRebuildReport {
+  const loose = asLoose(payload);
+  return {
+    ok: readFlag(loose, "ok"),
+    schemaVersion: readString(loose, "schemaVersion"),
+    path: readString(loose, "path"),
+    items: readNumber(loose, "items"),
+    events: readNumber(loose, "events"),
+    remoteIssues: readNumber(loose, "remoteIssues"),
+    outbox: readNumber(loose, "outbox"),
   };
 }
