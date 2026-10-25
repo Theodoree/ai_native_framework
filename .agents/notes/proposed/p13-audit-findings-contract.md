@@ -558,3 +558,79 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **仍未解决**：信任根（同 §十四/§十五）——`workflow_dispatch` 用被 dispatch 那个 ref 的 YAML 与被审对象自己的 `scripts/`，
 被审 PR 可以整步删掉自证。根治属 P-14 编排层：从受信 ref（main）dispatch + 用受信 ref 的脚本，只把 PR 的 sha 当数据。
 
+
+---
+
+## 十七、轮十九：默认拒绝的反面——判太宽也是假的（`de03c8a` → 下一提交）
+
+轮十八把写面进入条件改成「命令级写意图」之后，两家审查报回的六条我逐条实测，全部成立，而且**分两类**：
+
+| 类型 | 实例（我实测） | 实测 |
+| --- | --- | --- |
+| 仍然漏（绕过） | 引号里的命令替换 `id="$(gh api --method POST --input body.json "$ep")"` | **154 全绿** |
+| 仍然漏（绕过） | 标志位藏进变量 `F="-d @body.json"; curl -sS $F …/check-runs` | **154 全绿** |
+| 判太宽（假红） | `gh api repos/o/r/issues/1/comments -f body=hi`（兄弟 workflow 的合法评论） | **6 红** |
+| 判太宽（假红） | `curl -sS -X POST https://hooks.slack.com/… -d '{…}'`（发告警） | **6 红** |
+| 判太宽（假红） | `xh get https://status.example.com/api/health page==1`（`k==v` 是查询参数） | **6 红** |
+| 判太宽（假红） | `curl -sS -G -d per_page=100 …/check-runs`（`-G` 把体翻成查询串） | **6 红** |
+
+两个根因都不是「拼写还差几种」：
+
+1. **切词层盲**：`shellWords` 的引号分支先于分隔符分支，引号里的 `$(` `;` `|` 都不再是边界 → 整条 http 命令被并成一个词。
+   红绿只差一对引号，而 `id="$(…)"` 恰恰是 shellcheck 推荐写法。
+2. **端点被我整个踢出了进入条件**：换来「变量端点不再漏判」，代价是「写面」不再等于「check-runs 面」——
+   任何 webhook / 评论 / 上传的 POST 都会把 required 的 `npm run check` 染红，且 reason 把它们指成「第二条 Check Run 会盖掉真结论」。
+
+### 修法（只改 `tests/audit-findings.test.mjs`，154 → 162 例）
+
+- **看见引号里的命令替换**：`substitutionBodies`/`collectSubstitutionBodies`/`substitutionExpansion`(:1462-1557)，
+  `MAX_SUBSTITUTION_DEPTH = 3`，超限正文落一条独立 violation（`SUBSTITUTION_DEPTH_REASON`，`:3387-3398`）——跟不下去必须响。
+  `commandWriteIntent`(:2824-2842) 改为对 `[赋值展开后的行, ...命令替换正文]` 逐条走 `shellCommands`。
+- **看见赋值**：`cutAtShellSeparator`:2783 / `simpleAssignments`:2800（单趟、不递归、值含 `$` 不收、先定义先赢、上限 32）/ `expandAssignments`:2816。
+- **端点三态**：`literalEndpoints`:2953 + `checkRunWriteSurface`:2974-2996 —— 字面量命中 `check-runs|graphql` → 写面；
+  端点不可判（变量 / 拼接 / 只在命令替换里）→ 仍默认拒绝；字面量且明确不是 GitHub 写面（host ≠ `api.github.com`，或 `gh api` 路径既无 `check-runs` 也无 `graphql`）→ 不是结论写面。
+- **httpie 的体**：`HTTPIE_BODY_WORD = /^[A-Za-z0-9_.-]+:?=(?!=)/`(:2846) —— `k=v`/`k:=v` 是体，`k==v`、`Header:value`、URL 里的 `?a=1` 不是。
+- **curl `-G/--get`**：:2864-2885 —— `-G` 之后 `-d/--data*` 不再算写意图（写方法判定在它之前，`-G -X POST` 仍红）。
+- **短标志簇按 shell 语义扫**：`SHORT_VALUE_LETTERS = {gh:"fFX", curl:"dFTXmoHuAebc"}`(:2718) + `shortFlagWalk`:2748-2769，
+  遇取值字母把之后当值并**停止扫字母**；`-X`/`--request` 取方法。旧判据让 `-sXPATCH` 靠 PATCH 里的 `T` 命中 curl 体字母（理由错），
+  而 `-sX PATCH`、`--request DELETE` 直接漏成 null。
+
+### 我的独立复核（`/tmp/vrf-r20` 副本，基线 162）
+
+**行为探针**（peer.yml 一行一变，跑完即删）：
+
+| 探针 | 结果 |
+| --- | --- |
+| P1 引号里的命令替换（原绕过） | **8 红** |
+| P2 标志位藏变量（原绕过） | **8 红** |
+| P3 Slack webhook POST（原假红） | 162 全绿 |
+| P4 `gh api …/issues/1/comments -f body=hi`（原假红） | 162 全绿 |
+| P5 `xh get … page==1`（原假红） | 162 全绿 |
+| P6 `curl -G -d per_page=100 …/check-runs`（原假红） | 162 全绿 |
+| P7 `curl -sX PATCH …/check-runs/1`（方法在簇里） | **8 红** |
+| P8 `curl --request DELETE …/check-runs/1` | **8 红** |
+| P9 良性 peer 对照 | 162 全绿 |
+
+**变异**（每组先打印改后行，锚点必须唯一命中）：
+
+| 变异 | 红数 |
+| --- | --- |
+| 命令替换正文不展开（`[expanded]`） | 2 |
+| 端点三态砍掉（`if (!CHECK_RUNS_ENDPOINT.test(text))` → `if (false)`） | 2 |
+| httpie 退回 `text.includes("=")` | 1 |
+| `hasBody && !getFlag` → `hasBody` | 1 |
+| 还原 | 0（162 绿） |
+
+### 有意的边界（写成断言，不是遗漏）
+
+`gh api repos/$GITHUB_REPOSITORY/issues/1/comments -f body=hi` **仍然拒绝**：`$EP` 可能就展开成 `check-runs`，
+剥掉变量换字面量等于开一条 `gh api "repos/o/r/$EP" -f …` 的绕过口子。宁可对「带变量的 gh api 写」保守判红。
+
+### 教训
+
+默认拒绝只解决「方向」，不解决「范围」。**判据错在两个方向都会把闸门弄坏**：漏判让假绿上线，过宽让真红淹没
+（一个 required check 天天为 Slack 告警变红，人就会开始忽略它）。所以每加一条默认拒绝，必须同时回答「什么情况下
+它**不该**响」，并且那条反例要写成用例——这一轮九条探针里有五条就是这种反例。
+
+**仍未解决**：信任根（同 §十四～§十六）——`workflow_dispatch` 用被 dispatch 那个 ref 的 YAML 与被审对象自己的 `scripts/`。
+
