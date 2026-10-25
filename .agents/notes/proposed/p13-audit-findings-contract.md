@@ -683,3 +683,21 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **提交**：`fix(audit): 轮二十一 窄化盲守卫、解释器正文跟进、逐调用豁免`；整仓 13 files / **339 tests**，oxlint 0/0。
 
 **仍未解决**：信任根（同 §十四～§十八）——`workflow_dispatch` 用被 dispatch 那个 ref 的 YAML 与被审对象自己的 `scripts/`，判据再严也拦不住「把判据本身改掉」。
+
+## 二十、轮二十二：命令头一旦能变形，「看得见」就成了条件
+
+轮二十二（审 45dc5dc）两家：review-a needs_revision 三条，review-b pass 但有两条 harness 保真问题。
+
+**三条绕过（review-a）**：① 命令头不是字面量时整条调用消失——`gh$E api …/check-runs/1 -X PATCH -f conclusion=success` 173 全绿，同族 `$(echo gh)`、反引号、`$GH_CLI`、`curl$E`、`bash$E -c '…'` 全 0 红；② workflow 入口扫物理行，`run: >-` 折叠出的单条命令两半各自安全 → 0 红（同一内容按 YAML 解析喂 `auditDirReferenceViolations` 却是 1 条违规——**两个入口对同一份输入结论相反**）；③ 白名单步里夹一条看不见的写，`checkRunSanctioned` 与 `auditDirReferenceViolations` 自相矛盾。
+
+**两条保真（review-b）**：`JOB_ALLOWED_KEYS` 预放行 12 个真 workflow 从未使用的 job 级键（与注释「刻意收窄」相反）；假 gh 的 `--paginate`/`--slurp`/per_page 都是摆设，`audit.yml` 的多页 `flatMap` 从未被两页样本走过。
+
+**修法（只改 `tests/audit-findings.test.mjs`，173 → 178 例）**：命令头识别从「字面量才算」扩到「动态成分按通配算」，认出来就落 `httpCalls.overflow{kind:"dynamic-head"}` 而不是静默跳过（`dynamicHeadSkeleton`:2925 / `dynamicHeadWord`:2936 / `dynamicSubstitutionHeads`:2956，wrapper 与 interpreter 分支同步）；workflow 入口的判定单位从物理行换成 `YAML.parse` 后的载荷文本（`workflowPayloadTexts`:3456，解析失败/无结构/载荷全空回落整份文本）；豁免不再在「看得见写面字样、看不见调用」时成立（`textJudgedWriteSurface`:3257 + `checkRunSanctioned`:3262 的 overflow 守卫）；`JOB_ALLOWED_KEYS`:2614 收窄成 audit.yml 实有的 `["name","runs-on","env","steps"]`；假 gh 支持 `FAKE_GH_PAGES`（`--paginate` 回全部页、`--slurp` 回页数组）。
+
+**我的六条探针（/tmp 副本，基线 178）**：`gh$E … -X PATCH` **9 红**、`run: >-` 折叠 PATCH **9 红**、`run: |` 字面块 PATCH **9 红**；只读回读、`gh$E pr view`、Slack POST、删掉 peer.yml 全绿。
+
+**我的六组变异**：httpCalls 动态头不落 overflow **2 红**、入口退回物理行 **1 红**、`textJudgedWriteSurface` 恒 false **1 红**、`JOB_ALLOWED_KEYS` 放宽 **2 红**、`audit.yml` 的 flatMap 只取首屏 **1 红**；**假 gh 忽略 `FAKE_GH_PAGES`（恒单页）→ 178 全绿**。
+
+**登记为残余而不是继续修**：最后那条绿说明「假 gh 真的会分页」这件事本身没有被钉住——它只能靠「让替身自己证明自己」来钉，写出来是 fake 自带的自测；而生产侧的 `flatMap` 收多页已被「只取首屏 → 1 红」钉死。判据面自轮二十二起**冻结**：此后只接受「可执行绕过且未登记」的 finding，不再为拼写与替身自体加厚——继续加厚的边际收益已经低于它掩盖交付缺口的代价。
+
+**仍未解决**：信任根（同 §十四～§十九）；以及本仓二十轮审查全在防「判据自己骗自己」，交付物本身（Vue 前端 + Go 后端）尚未开工——后者已由用户排在 PR #10 收尾之后（见 `p15-platform-vue-go.md`）。

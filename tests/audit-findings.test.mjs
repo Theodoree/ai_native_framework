@@ -704,9 +704,19 @@ try {
     const runs = page().check_runs || [];
     const filter = query.get("filter") || "latest";
     const kept = filter === "all" ? runs : dedupeLatest(runs);
-    const body = { total_count: kept.length, check_runs: kept };
-    // --paginate --slurp 是页数组：单页也要套一层，否则分页语义与真 CI 不一致。
-    stdout(JSON.stringify(has("--slurp") ? [body] : body));
+    // 页数由夹具声明（FAKE_GH_PAGES，默认单页）：只回一页的假 gh 会让
+    // 「--paginate --slurp 是页数组 + flatMap 收多页」这套逻辑永远不被两页样本验证 ——
+    // 把 flatMap 换成 pages[0].check_runs 照样全绿。真 gh 只有 --paginate 才翻页，
+    // --slurp 把翻到的各页套成数组，两者缺一都回单页。
+    const declared = Number(process.env.FAKE_GH_PAGES || "1");
+    const pageCount = Number.isFinite(declared) && declared > 1 ? Math.floor(declared) : 1;
+    const size = Math.ceil(kept.length / pageCount) || 0;
+    const pages = [];
+    for (let index = 0; index < pageCount; index += 1) {
+      pages.push({ total_count: kept.length, check_runs: kept.slice(index * size, (index + 1) * size) });
+    }
+    const shown = has("--paginate") ? pages : pages.slice(0, 1);
+    stdout(has("--slurp") ? JSON.stringify(shown) : shown.map((body) => JSON.stringify(body)).join(NEWLINE));
     process.exit(0);
   }
   const one = ONE_RUN.exec(rawPath);
@@ -2598,24 +2608,10 @@ try {
   // 判据一律按**白名单**收口：多出来的键就是违规。
   const STEP_ALLOWED_KEYS = ["name", "id", "if", "run", "uses", "with", "env", "shell", "working-directory"];
   // job 级 continue-on-error 与 step 级同义（一步红不算 job 红），同样不在白名单里。
-  const JOB_ALLOWED_KEYS = [
-    "name",
-    "runs-on",
-    "steps",
-    "env",
-    "defaults",
-    "permissions",
-    "if",
-    "concurrency",
-    "timeout-minutes",
-    "needs",
-    "container",
-    "strategy",
-    "outputs",
-    "uses",
-    "with",
-    "secrets",
-  ];
+  // 键集按 audit.yml 里 job **实有**的键收窄（枚举自 YAML.parse 后的 jobs：name / runs-on / env / steps）：
+  // 预放行没人用的键等于给未来的执行面留门（if / permissions / strategy / timeout-minutes / container
+  // 每一个都能让 job 在不该绿的时候绿），而轮十五只断言了 continue-on-error 一个。
+  const JOB_ALLOWED_KEYS = ["name", "runs-on", "env", "steps"];
 
   // fail-closed：白名单外的键一律违规，且点名这个键与该 step。
   function unknownKeyViolations(payload, allowed, options = {}) {
@@ -2911,6 +2907,68 @@ try {
     });
   }
 
+  // ---- 命令头的动态成分：'gh$E' / '$(echo gh)' / '$GH_CLI' ----
+  // 命令头必须是**字面量**才被 HTTP_CLIENTS / SHELL_INTERPRETERS 认出来，于是「把命令头写成
+  // 展开结果」这一族整条命令消失（实测：'gh$E api …/check-runs -X PATCH' 173 条全绿，把 gh$E
+  // 换成 gh 就红 8 条；shell 里 'E=; printf %s gh$E' 输出的正是 gh）。
+  // 静态层解不出展开结果，但没有理由静默跳过：疑似的动态命令头落 overflow（新 kind
+  // dynamic-head）—— checkRunWriteSurface 已有「overflow 非空即判写面」的规则，响而不丢。
+  const DYNAMIC_PART = /[$\x60]/;
+  const WHOLE_DYNAMIC_VAR = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/;
+  // 变量名里的词元：GH_CLI / CURL / GITHUB_API 都是「这个变量装着一个 http 客户端」。
+  // 按词元判而不是按整名枚举，是因为拼写会变；'$GITHUB_REPOSITORY' 解释成词元 GITHUB 但
+  // 它从不出现在命令头位置，所以这条只在段首收。
+  const DYNAMIC_HEAD_NAME_TOKENS = new Set(['GH', 'GITHUB', 'CURL', 'WGET', 'HTTP', 'HTTPS', 'HTTPIE', 'XH', 'CLI']);
+  // 调用实参的样子：api / 短长标志 / URL。后面不跟调用实参的动态词不是调用，不在这里响。
+  const DYNAMIC_CALL_ARGUMENT = /^(?:api\b|-\S|https?:\/\/|\S*\.github)/;
+
+  // 词里的动态成分全删掉后剩下什么：'gh$E' → 'gh'，'$(echo gh)' → ''，
+  // 'repos/$GITHUB_REPOSITORY/check-runs' → 'repos//check-runs'。
+  function dynamicHeadSkeleton(word) {
+    return String(word)
+      .replace(/\x60[^\x60]*\x60/g, "")
+      .replace(/\$\([^)]*\)/g, "")
+      .replace(/\$\{[^}]*\}/g, "")
+      .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, "");
+  }
+
+  // 一个词能不能被认成 names 里的某个客户端（动态成分当通配）：命中返回它，否则 null。
+  function dynamicHeadWord(word, next, names, atSegmentStart) {
+    const head = String(word).replace(/^.*\//, "");
+    if (!DYNAMIC_PART.test(head)) return null;
+    const nextText = String(next ?? "");
+    if (!DYNAMIC_CALL_ARGUMENT.test(nextText)) return null;
+    const skeleton = dynamicHeadSkeleton(head);
+    if (names.has(skeleton)) {
+      // gh 只有 'gh api' 是 http 调用：动态头同样按这条收，'gh$E pr view' 不是调用。
+      if (skeleton !== "gh" || /^api\b/.test(nextText)) return head;
+      return null;
+    }
+    const variable = WHOLE_DYNAMIC_VAR.exec(head);
+    if (!variable || !atSegmentStart) return null;
+    const tokens = variable[1].toUpperCase().split("_");
+    return tokens.some((token) => DYNAMIC_HEAD_NAME_TOKENS.has(token)) ? head : null;
+  }
+
+  // 命令头本身是命令替换 / 反引号：'$(echo gh) api …' / '`echo gh` api …'。
+  // shellWords 把它切成 '$' '(' … ')' 的碎片，客户端名躺在中间那个词上 —— 只看词序列看不见。
+  // 这里在**原文**上认：命令位上的替换，正文里有一个词就是客户端名，后面跟着调用实参。
+  const HEAD_SUBSTITUTION = /(?:^|[;&|\n(]\s*)(?:\$\(([^)]*)\)|\x60([^\x60]*)\x60)/g;
+  function dynamicSubstitutionHeads(text, names) {
+    const hits = [];
+    for (const match of String(text).matchAll(HEAD_SUBSTITUTION)) {
+      const body = match[1] ?? match[2] ?? "";
+      const produced = shellWords(stripShellComment(body)).map((word) => String(word).replace(/^.*\//, ""));
+      if (!produced.some((word) => names.has(word))) continue;
+      const rest = String(text)
+        .slice(match.index + match[0].length)
+        .split("\n")[0]
+        .replace(/^[\s;&|]+/, "");
+      if (!DYNAMIC_CALL_ARGUMENT.test(rest)) continue;
+      hits.push(match[0].trim());
+    }
+    return hits;
+  }
   // ---- 解释器包装：`bash -c '…'` 与 `eval '…'` 的实参还是命令序列 ----
   // 整条命令外面套一层引号程序就能把写面藏起来（旧判据只看外层词：裸写 8 红、bash -c 0 红）。
   // 与命令替换正文同一套处理：递归看，深度上限 3，超限的落 overflow —— 响，不静默丢。
@@ -2922,7 +2980,7 @@ try {
   const NON_SHELL_CODE_FLAGS = new Set(["-c", "-e", "-E", "-r", "-p", "--eval", "--print"]);
 
   // 命令词序列里的「程序字符串」：eval 的全部实参、shell 解释器 -c 之后的那个词。
-  function wrapperCommandBodies(text) {
+  function wrapperCommandBodies(text, overflow) {
     const bodies = [];
     for (const words of shellCommands(text)) {
       for (let i = 0; i < words.length; i += 1) {
@@ -2933,7 +2991,20 @@ try {
           if (body) bodies.push(body);
           continue;
         }
-        if (!SHELL_INTERPRETERS.has(head)) continue;
+        if (!SHELL_INTERPRETERS.has(head)) {
+          // 解释器头是动态的（'bash$E -c …'）：head 认不出，整段正文就消失。
+          // 正文看得见（-c 后面那个词）且它提到结论写面 → 落 overflow，并且正文照旧按
+          // 解释器处理（里面那次调用逐次判，不靠猜拼写）。
+          if (dynamicHeadWord(words[i], words[i + 1], SHELL_INTERPRETERS, i === 0) !== null) {
+            const atBody = rest.findIndex((word) => SHELL_C_FLAG.test(String(word)));
+            const body = atBody === -1 ? "" : rest.slice(atBody + 1).join(" ").trim();
+            if (body && CHECK_RUNS_ENDPOINT.test(body)) {
+              overflow?.push({ kind: "dynamic-head", text: body });
+              bodies.push(body);
+            }
+          }
+          continue;
+        }
         const at = rest.findIndex((word) => SHELL_C_FLAG.test(String(word)));
         if (at === -1) continue;
         const body = rest.slice(at + 1).join(" ").trim();
@@ -2949,7 +3020,10 @@ try {
     for (const words of shellCommands(text)) {
       for (let i = 0; i < words.length; i += 1) {
         const head = String(words[i] ?? "").replace(/^.*\//, "");
-        if (!NON_SHELL_INLINE.has(head)) continue;
+        // 解释器头是动态的（'python$E -c …'）时内联程序照样看得见：不静默跳过，
+        // kind 点明头是动态的，理由才不会指向「读不懂的语言」。
+        const dynamic = dynamicHeadWord(words[i], words[i + 1], NON_SHELL_INLINE, i === 0) !== null;
+        if (!dynamic && !NON_SHELL_INLINE.has(head)) continue;
         let at = -1;
         let inline = "";
         for (let k = i + 1; k < words.length; k += 1) {
@@ -2963,7 +3037,7 @@ try {
         if (at === -1) continue;
         const program = [inline, ...words.slice(at + 1)].join(" ").trim();
         if (!CHECK_RUNS_ENDPOINT.test(program)) continue;
-        gaps.push({ kind: "non-shell-inline", text: program });
+        gaps.push({ kind: dynamic ? "dynamic-head" : "non-shell-inline", text: program });
       }
     }
     return gaps;
@@ -2990,17 +3064,30 @@ try {
         // `- run: |` 的正文）与赋值前缀（`id=$(gh api …)`）。按词扫，别按位置猜。
         for (let start = 0; start < words.length; start += 1) {
           const head = String(words[start] ?? "").replace(/^.*\//, "");
-          if (!HTTP_CLIENTS.has(head)) continue;
+          if (!HTTP_CLIENTS.has(head)) {
+            // 命令头不是字面量（'gh$E api …' / '$GH_CLI api …'）：静态层解不出展开结果，
+            // 但也没有理由静默跳过 —— 落 overflow，由写面判据响（F1）。
+            if (dynamicHeadWord(words[start], words[start + 1], HTTP_CLIENTS, start === 0) !== null) {
+              calls.overflow.push({ kind: "dynamic-head", text: words.join(" ") });
+            }
+            continue;
+          }
           // gh 只有 `gh api` 是 http 调用（gh pr view --json 是读，不在这条面上）。
           if (head === "gh" && String(words[start + 1] ?? "") !== "api") continue;
           calls.push({ head, words, start, map });
+        }
+      }
+      // 命令头本身是命令替换 / 反引号时词序列里只剩碎片，得回原文认（F1 同族）。
+      for (const names of [HTTP_CLIENTS, SHELL_INTERPRETERS]) {
+        for (const hit of dynamicSubstitutionHeads(expanded, names)) {
+          calls.overflow.push({ kind: "dynamic-head", text: hit });
         }
       }
       // 正文里的简单赋值同样要看得见：`x="$( F="…"; gh api … $F )"`（review-a r20-a-4 实测）。
       for (const body of substitutionBodies(expanded)) {
         visit(body, mergeAssignmentMaps(outer, simpleAssignments(body)), depth + 1);
       }
-      for (const body of wrapperCommandBodies(expanded)) {
+      for (const body of wrapperCommandBodies(expanded, calls.overflow)) {
         visit(body, mergeAssignmentMaps(map, simpleAssignments(body)), depth + 1);
       }
       for (const gap of interpreterGaps(expanded)) calls.overflow.push(gap);
@@ -3163,13 +3250,26 @@ try {
   //   2) 自证步的 head_sha 回读（只读，不带写形态）。
   // 豁免的判定单位是**这一次调用**：同一行里追一条 check-runs 写不共享前一条的豁免
   // （按整行判时，放行的 POST 后面再追加一条写，detector 0 红）。
+  // 「看不见调用，但这段文字自己被判成写面」：states 空不等于没有写面。
+  // 白名单步里追加一条 '&& gh$E api …/check-runs -X PATCH -f conclusion=success' 时，
+  // shellCommands 看不见这次调用 → states 空 → 老的 sanctionedText 直接放行，于是同一文件
+  // 两个判据自相矛盾（auditDirReferenceViolations 0 违规，checkRunWriteSurface 却答 'check-runs'）。
+  function textJudgedWriteSurface(text, assignments) {
+    if (checkRunWriteSurface(text, assignments) !== null) return true;
+    return CHECK_RUNS_ENDPOINT.test(text) && commandWriteIntent(text, assignments);
+  }
+
   function checkRunSanctioned(name, line, assignments) {
     const text = String(line);
     const map = assignments ?? simpleAssignments(text);
-    const states = httpCalls(text, map)
-      .map((call) => callState(call))
-      .filter((state) => callOnCheckRunSurface(state));
-    if (states.length === 0) return sanctionedText(name, text, map);
+    const calls = httpCalls(text, map);
+    const states = calls.map((call) => callState(call)).filter((state) => callOnCheckRunSurface(state));
+    // 跟不下去的正文（动态命令头 / 深度上限 / 别的语言内联程序）里可能有调用 —— 看不见就不豁免。
+    if (calls.overflow.length > 0) return false;
+    if (states.length === 0) {
+      if (textJudgedWriteSurface(text, map)) return false;
+      return sanctionedText(name, text, map);
+    }
     return states.every((state) => callSanctioned(name, state));
   }
 
@@ -3348,18 +3448,49 @@ try {
       .sort();
   }
 
+  // workflow 入口的判定单位是**解析出来的载荷文本**，不是物理行（F2）。
+  // 物理行只是排版：YAML 折叠标量 'run: >-' 交给 shell 的是**一条**命令，'|' 块正文的字节
+  // 就是脚本，'with'/'env' 的叶子也是执行面。按物理行判时端点行没有写形态、写形态行没有
+  // 端点，两半都放过（实测 0 红），而按解析出的 steps 判的 auditDirReferenceViolations 对
+  // 同一文件报 1 条 —— 两个入口对同一份文件自相矛盾。
+  function workflowPayloadTexts(file, root) {
+    const source = readFileSync(join(root, WORKFLOW_DIR, file), "utf8");
+    let doc = null;
+    try {
+      doc = YAML.parse(source);
+    } catch {
+      doc = null;
+    }
+    const structured = doc && typeof doc === "object" && doc.jobs && typeof doc.jobs === "object";
+    // 解析不了就没有结构可判：回落到整份文本 —— 判不了不等于没有写面。
+    if (!structured) return [source];
+    const texts = [];
+    for (const job of Object.values(doc.jobs)) {
+      if (!job || typeof job !== "object") continue;
+      const payloads = [...jobPayloads(job, doc)];
+      for (const step of Array.isArray(job.steps) ? job.steps : []) payloads.push(...stepPayloads(step));
+      for (const payload of payloads) texts.push(payload.text);
+    }
+    // 一份 workflow 的载荷全空（结构里没有可判文本）时同样回落整份文本，避免「没载荷 = 没写面」。
+    return texts.length > 0 ? texts : [source];
+  }
+
+  // 载荷文本按行剔掉 shell 注释：'|' 块里的 # 是 shell 注释，YAML 层面的注释解析时已经被 YAML 摘掉了。
+  function payloadSurfaceText(text) {
+    return foldContinuations(text)
+      .split("\n")
+      .map((line) => stripShellComment(line))
+      .join("\n");
+  }
+
   // 命中结论写面的文件清单（含 audit.yml）。用它断言「只有 audit.yml」。
   function workflowWriteSurfaceFiles(options = {}) {
     const root = options.root ?? ROOT;
-    // 先折续行再逐行判：shell 把「反斜杠 + 换行」原样删除，所以
-    // `gh api repos/o/r/check-runs/1 \` + 换行 + `  --method PATCH \` + 换行 + `  -f conclusion=success`
-    // 是**一条**命令。逐物理行判时，端点行没有写形态、写形态行没有端点 —— 两半都放过（实测 0 红）。
     return workflowFiles({ root }).filter((file) => {
-      const text = foldContinuations(readFileSync(join(root, WORKFLOW_DIR, file), "utf8"));
-      const assignments = simpleAssignments(text);
-      return text
-        .split("\n")
-        .some((line) => checkRunWriteSurface(stripShellComment(line), assignments) !== null);
+      const assignments = simpleAssignments(readFileSync(join(root, WORKFLOW_DIR, file), "utf8"));
+      return workflowPayloadTexts(file, root).some(
+        (text) => checkRunWriteSurface(payloadSurfaceText(text), assignments) !== null,
+      );
     });
   }
 
@@ -3369,23 +3500,30 @@ try {
     const root = options.root ?? ROOT;
     const files = options.files ?? workflowFiles({ root });
     const violations = [];
+    const seen = new Set();
     for (const file of files) {
       if (file === "audit.yml") continue;
-      // 折续行：逻辑命令流里端点与写形态才在同一行（见 workflowWriteSurfaceFiles 上的实测）。
-      const text = foldContinuations(readFileSync(join(root, WORKFLOW_DIR, file), "utf8"));
-      const assignments = simpleAssignments(text);
-      for (const rawLine of text.split("\n")) {
-        const line = stripShellComment(rawLine);
-        const surface = checkRunWriteSurface(line, assignments);
-        if (!surface) continue;
-        violations.push({
-          step: file,
-          where: surface,
-          excerpt: line.trim(),
-          reason:
-            blindAssignmentReason(line, assignments) ??
-            "结论写面只允许 audit.yml：同名的第二条 Check Run 会盖掉真结论（" + file + "）",
-        });
+      const assignments = simpleAssignments(readFileSync(join(root, WORKFLOW_DIR, file), "utf8"));
+      // 逐个载荷判（run / shell / working-directory / with.* / env.* / job 级载体），
+      // 与 auditDirReferenceViolations 用同一个单位：解析后的那一份文本。
+      for (const text of workflowPayloadTexts(file, root)) {
+        const payload = payloadSurfaceText(text);
+        for (const rawLine of payload.split("\n")) {
+          const line = rawLine;
+          const surface = checkRunWriteSurface(line, assignments);
+          if (!surface) continue;
+          const key = file + "\u0000" + surface + "\u0000" + line.trim();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          violations.push({
+            step: file,
+            where: surface,
+            excerpt: line.trim(),
+            reason:
+              blindAssignmentReason(line, assignments) ??
+              "结论写面只允许 audit.yml：同名的第二条 Check Run 会盖掉真结论（" + file + "）",
+          });
+        }
       }
     }
     return violations;
@@ -5664,9 +5802,11 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     const mutated = { ...job, "continue-on-error": true };
     expect(jobKeyViolations(mutated).map((v) => v.where)).toEqual(["continue-on-error"]);
     expect(jobKeyViolations(mutated)[0].reason).toContain("continue-on-error");
-    // 白名单不收新的执行面键：permissions/timeout-minutes 等在 job 上也不在白名单内是刻意的收窄，
-    // 一旦真需要就显式加进 JOB_ALLOWED_KEYS 并在这里同步 —— 于是「加了键」永远是一次可见的改动。
+    // 白名单只有 audit.yml 里 job 实有的四个键：job 级 permissions / timeout-minutes / if / strategy /
+    // container 一律会被拒（见轮二十二-4），一旦真需要就显式加进 JOB_ALLOWED_KEYS 并在这里同步 ——
+    // 于是「加了键」永远是一次可见的改动。
     expect(JOB_ALLOWED_KEYS).not.toContain("continue-on-error");
+    expect(JOB_ALLOWED_KEYS).toEqual(["name", "runs-on", "env", "steps"]);
   });
 
   it("轮十五-3：step 级 env 不许覆写落点与凭据 —— 禁止覆写集合与键交叉都要红", () => {
@@ -6822,5 +6962,207 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     expect(checkRunWriteSurface("gh api repos/o/r/check-runs/1 --jq .conclusion")).toBeNull();
   });
 });
+  it("轮二十二-1：命令头不是字面量时不静默消失 —— 落 overflow，写面照响（F1）", () => {
+    const SH = String.fromCharCode(10);
+    const dir = mkdtempSync(join(tmpdir(), "audit-dynamic-head-"));
+    // 六种动态头：shell 里展开出来都是 gh / curl / bash，静态层解不出展开结果。
+    // 修前它们全部「看不见这次调用」，于是整条命令消失（实测 173 条全绿；把 gh$E 换成 gh 就红 8 条）。
+    const write = "api repos/o/r/check-runs/1 -X PATCH -f conclusion=success";
+    const forms = [
+      ["前缀变量头 gh$E", "E=; gh$E " + write],
+      ["命令替换头 $(echo gh)", "$(echo gh) " + write],
+      ["反引号头", "\x60echo gh\x60 " + write],
+      ["变量头 $GH_CLI", "$GH_CLI " + write],
+      ["curl 前缀变量头 curl$E", "curl$E -X POST https://api.github.com/repos/o/r/check-runs"],
+      ["shell 包装动态头 bash$E -c", "bash$E -c 'gh " + write + "'"],
+    ];
+    for (const [label, line] of forms) {
+      // 静态层看不见这次调用，但必须响：overflow 非空即判写面。
+      expect(checkRunWriteSurface(line), label).toBe("check-runs");
+      expect(
+        auditDirReferenceViolations([{ name: "插一步", run: line + SH }], { root: dir }).length,
+        label,
+      ).toBeGreaterThan(0);
+    }
+    // 良性反面对照 1：命令头是 gh 字面量的**只读**回读，动态头修法不许把它弄红。
+    expect(checkRunWriteSurface("gh api repos/o/r/check-runs/1 --jq .conclusion")).toBeNull();
+    expect(checkRunWriteSurface("gh api repos/o/r/commits/abc/check-runs --paginate --slurp")).toBeNull();
+    // 良性反面对照 2：带 $ 的词不是「命令头 + 调用实参」，不制造假红。
+    for (const [label, line] of [
+      ["不是调用（gh pr view）", "gh$E pr view --json number"],
+      ["只是打印这个变量", "echo gh$E"],
+      ["变量在实参位置", "gh api repos/$GITHUB_REPOSITORY/check-runs/1 --jq .conclusion"],
+      ["别的变量名不像客户端", "$OUT_DIR -X POST https://hooks.slack.com/x"],
+    ]) {
+      expect(checkRunWriteSurface(line), label).toBeNull();
+    }
+  });
+
+  it("轮二十二-2：折叠标量也是命令边界 —— >- 与 | 的载荷整体判（F2）", () => {
+    const SH = String.fromCharCode(10);
+    const dir = mkdtempSync(join(tmpdir(), "audit-folded-scalar-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    const peer = (head, body) =>
+      [
+        "name: peer",
+        "on: pull_request",
+        "jobs:",
+        "  peer:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: " + head,
+        ...body.map((line) => "          " + line),
+        "",
+      ].join(SH);
+    const writeLines = ["gh api repos/$GITHUB_REPOSITORY/check-runs/1", "-X PATCH -f conclusion=success"];
+    // (a) 折叠标量：端点与写形态分在两个物理行，YAML 把两行折成**一条**命令。
+    // 同一份文件、按解析出的 steps 判的 auditDirReferenceViolations 早就报 1 条，
+    // 而按物理行判的入口一条都看不见 —— 判据的单位必须是命令，不是源码排版。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer.yml"), peer(">-", writeLines));
+    expect(
+      YAML.parse(readFileSync(join(dir, WORKFLOW_DIR, "peer.yml"), "utf8")).jobs.peer.steps[0].run.trim(),
+    ).toBe("gh api repos/$GITHUB_REPOSITORY/check-runs/1 -X PATCH -f conclusion=success");
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.step)).toEqual(["peer.yml"]);
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml", "peer.yml"]);
+    // (b) 字面块保换行：整条命令写在块里的**一行**上（回归对照，换判据后仍然看得见）。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer.yml"),
+      peer("|", ["gh api repos/$GITHUB_REPOSITORY/check-runs/1 -X PATCH -f conclusion=success"]),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.step)).toEqual(["peer.yml"]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml", "peer.yml"]);
+    // 良性反面对照 1：同形状的只读回读，折叠成一条也不写面。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer.yml"),
+      peer(">-", ["gh api repos/$GITHUB_REPOSITORY/commits/abc/check-runs", "--paginate --slurp > runs.json"]),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+    // 良性反面对照 2：字面块里两行是**两条**命令（只读回读 + 分页读），不是一次写。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer.yml"),
+      peer("|", ["gh api repos/$GITHUB_REPOSITORY/commits/abc/check-runs", "--paginate --slurp > runs.json"]),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    // 良性反面对照 3：真仓库零违规（改入口不是把整个目录变成红色）。
+    expect(workflowWriteSurfaceViolations()).toEqual([]);
+    expect(workflowWriteSurfaceFiles()).toEqual(["audit.yml"]);
+  });
+
+  it("轮二十二-3：白名单步里夹一条看不见的写 —— 看不见调用就不发豁免（F3）", () => {
+    const SH = String.fromCharCode(10);
+    const step = steps.find((item) => item.name === "回写 Check Run");
+    expect(step).toBeTruthy();
+    // 良性反面对照：真的那一步（POST + --input 载体）仍旧零违规。
+    expect(auditDirReferenceViolations([step], { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
+    const WHO = "回写 Check Run";
+    const injection = " && gh$E api repos/o/r/check-runs/1 -X PATCH -f conclusion=success";
+    const realLines = step.run.trimEnd().split(SH);
+    const postIndex = realLines.findIndex((line) => line.includes("--input"));
+    expect(postIndex).toBeGreaterThanOrEqual(0);
+    // 反面：真的那一行（POST + --input 载体）是**看得见调用**的豁免 —— states 非空、逐调用判。
+    expect(checkRunSanctioned(WHO, realLines[postIndex], simpleAssignments(step.run))).toBe(true);
+    // 注入 A：写在真实最后一行后面（豁免不得覆盖别的行上的写）。
+    const tailRun = step.run.replace(/\n+$/, "") + injection + SH;
+    // 注入 B：写在**那一行**上 —— 看得见的 POST 与看不见的 PATCH 同处一个命令序列，
+    // 老的豁免按「看得见的调用逐个判」就会让整行通过（这正是 F3 的攻法）。
+    const postLines = [...realLines];
+    postLines[postIndex] = postLines[postIndex] + injection;
+    const postRun = postLines.join(SH) + SH;
+    for (const [label, run, needle] of [
+      ["行尾追加", tailRun, CHECK_RUNS_REASON_UNKNOWN],
+      ["挂在 POST 行上", postRun, CHECK_RUNS_REASON_WRITE],
+    ]) {
+      const assignments = simpleAssignments(run);
+      const planted = run.trimEnd().split(SH).find((line) => line.includes("gh$E"));
+      expect(planted, label).toBeTruthy();
+      expect(checkRunWriteSurface(planted, assignments), label).toBe("check-runs");
+      // 同一行两个判据必须一致：不是「写面」与「已豁免」同时成立。
+      expect(checkRunSanctioned(WHO, planted, assignments), label).toBe(false);
+      const violations = auditDirReferenceViolations([{ ...step, run }], { root: ROOT, jobPayloads: carrierPayloads });
+      expect(violations.length, label).toBeGreaterThan(0);
+      expect(violations.map((v) => v.reason), label).toContain(needle);
+      expect(violations.some((v) => v.where === "run"), label).toBe(true);
+    }
+    // 第三种：正文里看得见写面字样、看得见的调用却不在这个面上 —— states 为空不等于没有写面。
+    // 老口径只按文本放行（POST + --input 就够），于是同一行里的 check-runs 字样被忽略。
+    const offSurface =
+      "gh api repos/o/r/issues --method POST --input .audit/check-run.json && echo repos/o/r/check-runs";
+    const offAssignments = simpleAssignments(offSurface);
+    expect(httpCalls(offSurface, offAssignments).overflow).toEqual([]);
+    expect(checkRunWriteSurface(offSurface, offAssignments)).toBeNull();
+    expect(checkRunSanctioned(WHO, offSurface, offAssignments)).toBe(false);
+  });
+
+  it("轮二十二-4：job 级键按白名单收窄 —— if / permissions / strategy / timeout-minutes / container 都点名拒", () => {
+    // 白名单必须与真文件 job 实有的键一致：预放行的键没人用，就等于给未来的执行面留门。
+    const realJobKeys = [...new Set(Object.values(doc.jobs).flatMap((item) => Object.keys(item)))].sort();
+    expect([...JOB_ALLOWED_KEYS].sort()).toEqual(realJobKeys);
+    expect(Object.keys(doc.jobs)).toEqual(["audit-runner"]);
+    // 良性反面对照：真 audit.yml 的 job 零违规。
+    expect(jobKeyViolations(job)).toEqual([]);
+    // 五种 job 级执行面键：每一个都能让 job 在不该绿的时候绿，白名单外就一律拒并点名。
+    const mutations = {
+      if: "false",
+      permissions: { contents: "read" },
+      strategy: { matrix: { shard: [1, 2] } },
+      "timeout-minutes": 1,
+      container: "node:22-bookworm",
+    };
+    for (const [key, value] of Object.entries(mutations)) {
+      const violations = jobKeyViolations({ ...job, [key]: value });
+      expect(violations.map((v) => v.where), key).toEqual([key]);
+      expect(violations[0].step, key).toBe(job.name);
+      expect(violations[0].reason, key).toContain(key);
+      expect(violations[0].excerpt, key).toContain("job." + key);
+    }
+    // 一次塞两个要逐一点名，不是只报第一个。
+    expect(jobKeyViolations({ ...job, if: "false", permissions: {} }).map((v) => v.where)).toEqual([
+      "if",
+      "permissions",
+    ]);
+  });
+
+  it("轮二十二-5：--paginate --slurp 是页数组 —— 只读第一页会漏判（B2）", () => {
+    const run = (id, conclusion) => ({
+      id,
+      name: "audit",
+      status: "completed",
+      conclusion,
+      app: { slug: "github-actions" },
+    });
+    const fixture = (...pages) =>
+      JSON.stringify({ total_count: pages.flat().length, check_runs: pages.flat() });
+    // 本次那条（4242）与全页最大 id 都在**第二页**：只读 pages[0] 就看不到它们。
+    const selfCheck = (out) => out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    const ok = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_PAGES: "2",
+      FAKE_GH_CHECK_RUNS_JSON: fixture([run(1111, "failure"), run(2222, "failure")], [run(3333, "failure"), run(4242, "success")]),
+    });
+    expect(selfCheck(ok).status, String(selfCheck(ok).stdout) + String(selfCheck(ok).stderr)).toBe(0);
+    expect(ok.summary).toBe("");
+    // 第二页里有一条比本次更大的 id —— 只有真的把两页都收进来才看得见（盖过 → 必须红）。
+    const covered = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_PAGES: "2",
+      FAKE_GH_CHECK_RUNS_JSON: fixture([run(1111, "failure"), run(2222, "failure")], [run(4242, "success"), run(9999, "failure")]),
+    });
+    expect(selfCheck(covered).status).not.toBe(0);
+    expect(covered.summary).toContain("## audit 自证失败：被更新的结论盖过");
+    expect(covered.summary).toContain("9999");
+    // 良性反面对照：不声明页数时同一份夹具仍是单页（新开关不改既有形态）。
+    const single = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_CHECK_RUNS_JSON: fixture([run(1111, "failure"), run(2222, "failure")], [run(3333, "failure"), run(4242, "success")]),
+    });
+    expect(selfCheck(single).status, String(selfCheck(single).stdout)).toBe(0);
+    expect(single.summary).toBe("");
+  });
 
 });
