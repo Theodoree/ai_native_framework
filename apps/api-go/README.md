@@ -1,10 +1,10 @@
 # apps/api-go · 平台后端（Go 标准库）
 
-**状态**：active —— 本轮在 §feat/p15-platform§ 内实现；§scripts/server.mjs§ 仍是旧原型，替换是下一步。
+**状态**：active —— 自 P-15 起是平台唯一的后端实现；旧原型（`web/` + `scripts/server.mjs`）已删除。
 
 ## 做什么
 
-- 用 Go 标准库 §net/http§ 复刻 §scripts/server.mjs§ 的 JSON API（行为等价，不照抄实现）
+- 用 Go 标准库 §net/http§ 提供平台 JSON API（P-15 之前的那份脚本原型已删，行为以本文件与测试为准）
 - 多一条事件时间线：§GET /api/events§
 - 单二进制：构建期把 §apps/web-vue/dist§ 复制进 §apps/api-go/dist§，用 §//go:embed all:dist§ 内嵌；运行期不依赖磁盘 dist
 - 远端同步：§POST /api/sync§ 只读拉 issue 列表（number/title/state/labels/updated_at），条件请求只靠 §If-None-Match§ + ETag，304 一个字节都不写盘
