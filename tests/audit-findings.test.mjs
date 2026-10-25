@@ -2780,7 +2780,12 @@ try {
   // 单趟、不递归、上限 32 个。值里带 `$` 或反引号的（下一跳还要展开）不收：
   // 收下来就是假的可判形态，而这张判据宁可落回「端点不可判 → 默认拒绝」。
   const MAX_ASSIGNMENTS = 32;
-  const ASSIGNMENT_LINE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+  // 赋值前缀不止 export：readonly / declare / typeset / local 是同一个「写进变量」的语义；
+  // declare -x / readonly -a 的短标志要跳过去；段首的 `(` 与 `{` 是子 shell / 命令组，剥掉再看。
+  const ASSIGNMENT_PREFIX = /^\s*[({]?\s*(?:export|readonly|declare|typeset|local)\s+(?:-[A-Za-z]+\s+)*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+  const ASSIGNMENT_PLAIN = /^\s*[({]?\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+  // `printf -v NAME FORMAT VALUE` 是第三个写变量的门，值取最后一个词。
+  const ASSIGNMENT_PRINTF = /^\s*[({]?\s*printf\s+(?:-[A-Za-z]+\s+)*-v\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s|$)/;
 
   // 同一行里的 `F="-d @body.json"; curl $F …`：shell 语义下未加引号的 `;` 就是命令结尾，
   // 所以赋值的值在第一个裸 `;` 处切断 —— 这既不让值被后半行污染，也不放宽任何东西。
@@ -2836,6 +2841,21 @@ try {
     return segments;
   }
 
+  // 一个命令段里的赋值记录：前缀赋值（export/readonly/declare/typeset/local）、裸赋值、
+  // 以及 printf -v NAME FMT VALUE。认不出返回 null —— 不猜。
+  function assignmentRecord(segment) {
+    const prefixed = ASSIGNMENT_PREFIX.exec(segment);
+    if (prefixed) return { name: prefixed[1], raw: prefixed[2] };
+    const plain = ASSIGNMENT_PLAIN.exec(segment);
+    if (plain) return { name: plain[1], raw: plain[2] };
+    const printed = ASSIGNMENT_PRINTF.exec(segment);
+    if (printed) {
+      const words = shellWords(segment);
+      return { name: printed[1], raw: words.length > 0 ? String(words[words.length - 1]) : "" };
+    }
+    return null;
+  }
+
   function simpleAssignments(text) {
     const map = new Map();
     // 表里收不下的名字要**响**，不能当成没有赋值：
@@ -2847,16 +2867,17 @@ try {
     map.truncated = false;
     for (const raw of foldContinuations(String(text)).split("\n").map(stripShellComment)) {
       for (const segment of shellSegments(raw)) {
-        const match = ASSIGNMENT_LINE.exec(segment);
-        if (!match) continue;
-        const name = match[1];
+        const record = assignmentRecord(segment);
+        if (!record) continue;
+        const name = record.name;
         // 先定义先赢：同一个名字多处赋值时不猜后一处覆盖了谁（歧义就往「看得见」的那侧留）。
         if (map.has(name) || map.unresolved.has(name)) continue;
         if (map.size >= MAX_ASSIGNMENTS) {
           map.truncated = true;
           continue;
         }
-        const value = unquote(cutAtShellSeparator(match[2]).trim());
+        // 段尾的 `)` / `}` 是命令组的收尾，不是取值的一部分（`( F=… )` 的右括号）。
+        const value = unquote(cutAtShellSeparator(record.raw).trim().replace(/[\s)}]+$/, ""));
         if (!value) continue;
         const alias = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value);
         if (alias) {
@@ -2890,21 +2911,80 @@ try {
     });
   }
 
+  // ---- 解释器包装：`bash -c '…'` 与 `eval '…'` 的实参还是命令序列 ----
+  // 整条命令外面套一层引号程序就能把写面藏起来（旧判据只看外层词：裸写 8 红、bash -c 0 红）。
+  // 与命令替换正文同一套处理：递归看，深度上限 3，超限的落 overflow —— 响，不静默丢。
+  const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "ash"]);
+  const SHELL_C_FLAG = /^-[A-Za-z]*c$/;
+  // 别的语言的 -c / -e 内联正文：静态层不解别的语言，但「里面提到结论写面」必须响，
+  // 不能因为读不懂就当成没写。
+  const NON_SHELL_INLINE = new Set(["python", "python2", "python3", "perl", "ruby", "php", "node", "nodejs", "deno"]);
+  const NON_SHELL_CODE_FLAGS = new Set(["-c", "-e", "-E", "-r", "-p", "--eval", "--print"]);
+
+  // 命令词序列里的「程序字符串」：eval 的全部实参、shell 解释器 -c 之后的那个词。
+  function wrapperCommandBodies(text) {
+    const bodies = [];
+    for (const words of shellCommands(text)) {
+      for (let i = 0; i < words.length; i += 1) {
+        const head = String(words[i] ?? "").replace(/^.*\//, "");
+        const rest = words.slice(i + 1);
+        if (head === "eval") {
+          const body = rest.join(" ").trim();
+          if (body) bodies.push(body);
+          continue;
+        }
+        if (!SHELL_INTERPRETERS.has(head)) continue;
+        const at = rest.findIndex((word) => SHELL_C_FLAG.test(String(word)));
+        if (at === -1) continue;
+        const body = rest.slice(at + 1).join(" ").trim();
+        if (body) bodies.push(body);
+      }
+    }
+    return bodies;
+  }
+
+  // 非 shell 解释器的内联正文里出现结论写面字样：读不懂的语言也是写面，落 gap。
+  function interpreterGaps(text) {
+    const gaps = [];
+    for (const words of shellCommands(text)) {
+      for (let i = 0; i < words.length; i += 1) {
+        const head = String(words[i] ?? "").replace(/^.*\//, "");
+        if (!NON_SHELL_INLINE.has(head)) continue;
+        let at = -1;
+        let inline = "";
+        for (let k = i + 1; k < words.length; k += 1) {
+          const word = String(words[k]);
+          const name = word.split("=")[0];
+          if (!NON_SHELL_CODE_FLAGS.has(name)) continue;
+          at = k;
+          inline = word.includes("=") ? word.slice(word.indexOf("=") + 1) : "";
+          break;
+        }
+        if (at === -1) continue;
+        const program = [inline, ...words.slice(at + 1)].join(" ").trim();
+        if (!CHECK_RUNS_ENDPOINT.test(program)) continue;
+        gaps.push({ kind: "non-shell-inline", text: program });
+      }
+    }
+    return gaps;
+  }
+
   // 一次 http 客户端调用：head 是客户端名，words 是（赋值展开后的）词序列，map 是**那一层**
   // 的赋值表。端点判定必须以「这次调用」为单位，否则同行另一个良性 URL 就能把不可判的
   // 端点洗白（review-b 实测：`curl … https://hooks.slack.com/x "$EP"` 全绿）。
   function httpCalls(line, assignments) {
     const outer = assignments ?? new Map();
-    // 要看见的东西：赋值展开后的同一行 + 它里面所有命令替换的正文（递归到 3 层）。
-    const sources = [{ text: expandAssignments(String(line), outer), map: outer }];
-    for (const body of substitutionExpansion(sources[0].text).bodies) {
-      // 正文里的简单赋值同样要看得见：`x="$( F="…"; gh api … $F )"`（review-a r20-a-4 实测）。
-      const inner = mergeAssignmentMaps(outer, simpleAssignments(body));
-      sources.push({ text: expandAssignments(body, inner), map: inner });
-    }
     const calls = [];
-    for (const source of sources) {
-      for (const words of shellCommands(source.text)) {
+    // 跟不下去的正文（命令替换 / 解释器包装超过深度上限、别的语言里的内联程序）不静默丢。
+    calls.overflow = [];
+    // 递归：赋值展开后的正文 → 命令替换正文 → 解释器包装正文，三者同一套深度上限。
+    const visit = (text, map, depth) => {
+      if (depth > MAX_SUBSTITUTION_DEPTH) {
+        calls.overflow.push({ kind: "depth", text: String(text) });
+        return;
+      }
+      const expanded = expandAssignments(String(text), map);
+      for (const words of shellCommands(expanded)) {
         if (words.length === 0) continue;
         // 客户端不一定在第 0 个词：workflow 里的行常带 YAML 前缀（`- run: gh api …`、
         // `- run: |` 的正文）与赋值前缀（`id=$(gh api …)`）。按词扫，别按位置猜。
@@ -2913,10 +2993,19 @@ try {
           if (!HTTP_CLIENTS.has(head)) continue;
           // gh 只有 `gh api` 是 http 调用（gh pr view --json 是读，不在这条面上）。
           if (head === "gh" && String(words[start + 1] ?? "") !== "api") continue;
-          calls.push({ head, words, start, map: source.map });
+          calls.push({ head, words, start, map });
         }
       }
-    }
+      // 正文里的简单赋值同样要看得见：`x="$( F="…"; gh api … $F )"`（review-a r20-a-4 实测）。
+      for (const body of substitutionBodies(expanded)) {
+        visit(body, mergeAssignmentMaps(outer, simpleAssignments(body)), depth + 1);
+      }
+      for (const body of wrapperCommandBodies(expanded)) {
+        visit(body, mergeAssignmentMaps(map, simpleAssignments(body)), depth + 1);
+      }
+      for (const gap of interpreterGaps(expanded)) calls.overflow.push(gap);
+    };
+    visit(String(line), outer, 0);
     return calls;
   }
 
@@ -3011,20 +3100,77 @@ try {
     return CHECK_RUNS_ENDPOINT.test(String(line)) ? CHECK_RUNS_REASON_WRITE : CHECK_RUNS_REASON_WRITE_BLIND;
   }
 
-  // check-runs 端点在 audit.yml 内的合法形态只有两种：
-  //   1) 那两步的 --input .audit/check-run.json POST；
-  //   2) 自证步的 head_sha 回读（只读，不带写形态）。
-  function checkRunSanctioned(name, line, assignments) {
-    const text = String(line);
+  // 这一次调用的事实：端点词、解析结果、写意图。写面判据与豁免判据共用一份，
+  // 免得「端点在哪」被两处各读一遍、各读出一个答案。
+  function callState(call) {
+    const words = callEndpointWords(call);
+    return {
+      call,
+      words,
+      endpoints: words.map((word) => resolveEndpoint(word, call.head === "gh")),
+      writeIntent: commandWriteIntentAt(call.head, call.words, call.start),
+    };
+  }
+
+  // 端点解析成功且落在结论写面上（字面量、可判的那种）。
+  function onCheckRunSurface(endpoint) {
+    return endpoint !== null && endpoint.host === GITHUB_API_HOST && CHECK_RUNS_IN_PATH.test(endpoint.path);
+  }
+
+  // 这一次调用的端点词本身带着「只读回读」形态（计数回读 / 单条回读）—— 可证明的读。
+  function isReadBackWord(word) {
+    const text = String(word).replace(/["']/g, "");
+    return CHECK_RUNS_READ_LIST.test(text) || CHECK_RUNS_READ_ONE.test(text);
+  }
+
+  // 这一次调用摸到结论写面了吗？「端点不可判」也算摸到：不可判是「不能证明它没写」。
+  function callOnCheckRunSurface(state) {
+    if (state.writeIntent && (state.endpoints.length === 0 || state.endpoints.some((endpoint) => endpoint === null))) {
+      return true;
+    }
+    if (state.endpoints.some(onCheckRunSurface)) return true;
+    return state.words.some((word, index) => state.endpoints[index] === null && CHECK_RUNS_ENDPOINT.test(String(word)));
+  }
+
+  // 白名单只覆盖**它自己那一次调用**：法方法与载体必须是这一次调用自己带着的。
+  function callSanctioned(name, state) {
+    const call = state.call;
+    const text = call.words.slice(call.start).join(" ");
     // 唯一放行的写形态：POST + --input 载体（那两步）。方法按归一化后判，
     // `--method post` 与 `--method POST` 是同一个方法。
-    if (CHECK_RUNS_POST_STEPS.includes(name)) return ghApiMethod(text) === "POST" && CHECK_RUNS_INPUT.test(text);
+    if (CHECK_RUNS_POST_STEPS.includes(name)) {
+      return call.head === "gh" && ghApiMethod(text) === "POST" && CHECK_RUNS_INPUT.test(text);
+    }
+    if (!CHECK_RUNS_READ_STEPS.includes(name)) return false;
     // 自证步：两个只读回读形态。写形态一律默认拒绝（不枚举拼写）。
+    if (state.writeIntent) return false;
+    return state.words.some(isReadBackWord);
+  }
+
+  // 文本级白名单：没有任何一次 http 调用摸到这个面时（提示文案、说明行）没有「这一次调用」
+  // 可以逐次判，沿用老口径 —— 换单位不是把文案行变成违规。
+  function sanctionedText(name, text, assignments) {
+    if (CHECK_RUNS_POST_STEPS.includes(name)) return ghApiMethod(text) === "POST" && CHECK_RUNS_INPUT.test(text);
     return (
       CHECK_RUNS_READ_STEPS.includes(name) &&
       (CHECK_RUNS_READ_LIST.test(text) || CHECK_RUNS_READ_ONE.test(text)) &&
       isReadOnlyApiCall(text, assignments)
     );
+  }
+
+  // check-runs 端点在 audit.yml 内的合法形态只有两种：
+  //   1) 那两步的 --input .audit/check-run.json POST；
+  //   2) 自证步的 head_sha 回读（只读，不带写形态）。
+  // 豁免的判定单位是**这一次调用**：同一行里追一条 check-runs 写不共享前一条的豁免
+  // （按整行判时，放行的 POST 后面再追加一条写，detector 0 红）。
+  function checkRunSanctioned(name, line, assignments) {
+    const text = String(line);
+    const map = assignments ?? simpleAssignments(text);
+    const states = httpCalls(text, map)
+      .map((call) => callState(call))
+      .filter((state) => callOnCheckRunSurface(state));
+    if (states.length === 0) return sanctionedText(name, text, map);
+    return states.every((state) => callSanctioned(name, state));
   }
 
   // ---- 端点三态：结论写面是「端点 + 写形态」，不是「任意端点上的任意 http 写」 ----
@@ -3088,7 +3234,9 @@ try {
 
   // 端点解析：不可判（变量 / 命令替换 / 空 host）返回 null —— null 是「不可判」，不是「不是写面」。
   function resolveEndpoint(word, ghPath) {
-    const text = String(word);
+    // 相邻的引号段在 shell 里是**一个**词：`"…/check-""runs"` 就是 `…/check-runs`。
+    // 端点词里剩下引号时先去掉再判路径 —— 否则端点看得见、判据看不见（reviewer 实测 0 红）。
+    const text = String(word).replace(/["']/g, "");
     if (/[$\x60]/.test(text)) return null;
     const at = text.indexOf("://");
     if (at >= 0) {
@@ -3121,6 +3269,30 @@ try {
     return null;
   }
 
+  // 窄化守卫用的同一件事，但跳过重定向目标：`gh api …/check-runs > "$runs_file"` 里的
+  // `$runs_file` 是文件，不是实参。
+  function blindArgumentWord(call) {
+    const map = call.map;
+    if (!map) return null;
+    let redirect = false;
+    for (let i = call.start + 1; i < call.words.length; i += 1) {
+      const word = String(call.words[i]);
+      if (redirect) {
+        redirect = false;
+        continue;
+      }
+      if (/^[0-9]?>>?$/.test(word) || word === "<") {
+        redirect = true;
+        continue;
+      }
+      const match = WHOLE_VAR.exec(word);
+      if (!match) continue;
+      if (map.unresolved?.has(match[1])) return word;
+      if (map.truncated && !map.has(match[1])) return word;
+    }
+    return null;
+  }
+
   function blindAssignmentReason(line, assignments) {
     for (const call of httpCalls(line, assignments ?? simpleAssignments(String(line)))) {
       const blind = blindAssignmentArg(call);
@@ -3140,17 +3312,29 @@ try {
     // gh api graphql 与 https://api.github.com/graphql 是同一个端点，写法不同不改面。
     if (/\bgraphql\b/.test(text)) return "/graphql";
     // 判定单位是**这一次 http 调用**：同行另一个良性 URL 洗不白这次调用的未知端点（review-b 实测）。
-    for (const call of httpCalls(raw, map)) {
-      // 实参里的变量跟不下去由 blindAssignmentReason 判；这里是同一件事的第二处守卫，删掉它
-      // 不是放水：判据过宽同样会把闸门弄坏（字面量良性端点不该因为一个跟不下去的实参就变红）。
-      if (!commandWriteIntentAt(call.head, call.words, call.start)) continue;
-      // 端点不可判（变量 / 拼接 / 命令替换 / 根本没有端点词）→ 默认拒绝。
-      const endpoints = callEndpointWords(call).map((word) => resolveEndpoint(word, call.head === "gh"));
-      if (endpoints.length === 0 || endpoints.some((endpoint) => endpoint === null)) return "check-runs";
-      // 字面量端点且明确不是结论写面（别的 host，或 gh api 的别条路径）→ 这一次调用不是写面。
-      if (endpoints.some((endpoint) => endpoint.host === GITHUB_API_HOST && CHECK_RUNS_IN_PATH.test(endpoint.path))) {
-        return "check-runs";
+    const calls = httpCalls(raw, map);
+    // 跟不下去的正文（命令替换 / 解释器包装超过深度上限、别的语言里的内联程序）：响，不静默丢。
+    if (calls.overflow.length > 0) return "check-runs";
+    for (const call of calls) {
+      const state = callState(call);
+      if (!state.writeIntent) {
+        // 窄化守卫：端点**看得见**并且在写面上，实参里又有跟不下去的赋值 ——
+        // 「这一次是只读回读」证明不了，按命令级默认拒绝。
+        // 只装在「端点可判 + 落在面上」这一档里，不是装回函数顶部：良性字面量端点
+        // （别的 host / 别的路径）与容器里的回读形态都还在放行。
+        if (
+          state.endpoints.some(onCheckRunSurface) &&
+          !state.words.some(isReadBackWord) &&
+          blindArgumentWord(call) !== null
+        ) {
+          return "check-runs";
+        }
+        continue;
       }
+      // 端点不可判（变量 / 拼接 / 命令替换 / 根本没有端点词）→ 默认拒绝。
+      if (state.endpoints.length === 0 || state.endpoints.some((endpoint) => endpoint === null)) return "check-runs";
+      // 字面量端点且明确不是结论写面（别的 host，或 gh api 的别条路径）→ 这一次调用不是写面。
+      if (state.endpoints.some(onCheckRunSurface)) return "check-runs";
     }
     return null;
   }
@@ -6505,6 +6689,137 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       "",
     ].join(SH);
     expect(auditDirReferenceViolations([{ name: "告警", run: benign }], { root: dir })).toEqual([]);
+  });
+
+
+  it("轮二十一-1：端点词看得见而实参跟不下去 → 这一次调用不可判，默认拒绝", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-spliced-endpoint-"));
+    // 相邻引号段在 shell 里是**一个**词，端点解析先去掉词里的引号再判路径。
+    // （shellWords 已经合并相邻引号段，这是第二道；这里直接把解析出来的路径钉住。）
+    expect(resolveEndpoint('repos/o/r/check-"runs', true)).toEqual({ host: "api.github.com", path: "repos/o/r/check-runs" });
+    expect(resolveEndpoint("repos/o/r/check-'runs", true).path).toBe("repos/o/r/check-runs");
+    // 同一个端点，实参是一层跟不下去的赋值：端点看得见、写意图看不见 → 默认拒绝。
+    const spliced = 'EP="repos/o/r/check-""runs"; FLAGS=$GH_FLAGS; gh api "$EP" $FLAGS';
+    expect(checkRunWriteSurface(spliced)).toBe("check-runs");
+    expect(
+      auditDirReferenceViolations([{ name: "插一步", run: spliced + SH }], { root: dir }).map((v) => v.reason),
+    ).toEqual([ASSIGNMENT_UNRESOLVED_REASON]);
+    // 对照 1：同一个跟不下去的实参挂在别的 GitHub 端点上（不是结论写面）→ 仍然放行。
+    // 窄化守卫只装在「端点解析成功且落在写面上」这一档，不是装回函数顶部。
+    expect(checkRunWriteSurface("FLAGS=$GH_FLAGS; gh api repos/o/r/issues/1 $FLAGS")).toBeNull();
+    // 对照 2：可证明的只读回读（check-runs/<id>）没有盲实参 → 仍然放行。
+    expect(checkRunWriteSurface("gh api repos/o/r/check-runs/1 --jq .conclusion")).toBeNull();
+    // 对照 3：字面量良性端点上的写调用照旧放行（curl -X POST 打 Slack）。
+    expect(checkRunWriteSurface("curl -sS -X POST https://hooks.slack.com/x -d @body.json")).toBeNull();
+    // 对照 4：gh api 的别条路径（评论）。
+    expect(checkRunWriteSurface("gh api repos/o/r/issues/1/comments -f body=hi")).toBeNull();
+  });
+
+  it("轮二十一-2：解释器包装里的程序字符串继续被扫描 —— 套一层引号不算藏起来", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-interpreter-wrapper-"));
+    const program = "gh api repos/o/r/check-runs --method POST -f name=audit -f conclusion=success";
+    // 裸写与三种包装必须同红：整条命令外面套一层引号程序不改变它做了什么。
+    expect(checkRunWriteSurface(program)).toBe("check-runs");
+    for (const wrapped of ["bash -c '" + program + "'", 'sh -c "' + program + '"', 'eval "' + program + '"']) {
+      expect(checkRunWriteSurface(wrapped)).toBe("check-runs");
+    }
+    expect(
+      auditDirReferenceViolations([{ name: "插一步", run: "bash -c '" + program + "'" + SH }], { root: dir }).map(
+        (v) => v.reason,
+      ),
+    ).toEqual([CHECK_RUNS_REASON_WRITE]);
+    // 包装叠到深度上限之外：落 overflow —— 响，不许静默丢。
+    let deep = "gh api repos/o/r/check-runs --method POST -f conclusion=success";
+    for (let i = 0; i < 4; i += 1) deep = "bash -c " + JSON.stringify(deep);
+    expect(httpCalls(deep).overflow.map((gap) => gap.kind)).toContain("depth");
+    expect(checkRunWriteSurface(deep)).toBe("check-runs");
+    // 非 shell 解释器的内联程序：读不懂别的语言，但正文提到结论写面就必须响。
+    const python =
+      "python3 -c \"import requests; requests.post('https://api.github.com/repos/o/r/check-runs', json={})\"";
+    expect(httpCalls(python).overflow.map((gap) => gap.kind)).toContain("non-shell-inline");
+    expect(checkRunWriteSurface(python)).toBe("check-runs");
+    // 反面对照 1：包装里的良性程序。
+    expect(checkRunWriteSurface('bash -c "echo hi"')).toBeNull();
+    expect(checkRunWriteSurface('eval "echo hi"')).toBeNull();
+    // 反面对照 2：别的语言里没有结论写面字样，不制造假红（audit.yml 自己有 4 处 node -e）。
+    expect(checkRunWriteSurface('node -e "console.log(1)"')).toBeNull();
+    expect(checkRunWriteSurface('python3 -c "print(1)"')).toBeNull();
+    // 反面对照 3：包装里的只读回读同样放行。
+    expect(checkRunWriteSurface("bash -c 'gh api repos/o/r/check-runs/1 --jq .conclusion'")).toBeNull();
+  });
+
+  it("轮二十一-3：豁免只覆盖它自己那一次调用 —— 同一行追第二条 check-runs 写就是违规", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-sanction-unit-"));
+    const postStep = "回写 Check Run";
+    const post = "gh api repos/o/r/check-runs --method POST --input .audit/check-run.json --jq '.id'";
+    // 既有形状：这一步的那一条 POST 调用 → 放行（整行判与逐次判在这里同答案）。
+    expect(checkRunSanctioned(postStep, post, simpleAssignments(post))).toBe(true);
+    // 同一行追第二条 check-runs 写：整行看仍「有 POST + 有 --input」，逐次调用看第二条不在白名单里。
+    const doubled = post + " ; gh api repos/o/r/check-runs/1 --method PATCH -f conclusion=success";
+    expect(checkRunSanctioned(postStep, doubled, simpleAssignments(doubled))).toBe(false);
+    expect(
+      auditDirReferenceViolations([{ name: postStep, run: doubled + SH }], { root: dir }).map((v) => v.reason),
+    ).toEqual([CHECK_RUNS_REASON_WRITE]);
+    // 对照 1：自证步的两条只读回读，逐次判仍然各自放行。
+    const readStep = "结论自证：回读 Check Run";
+    const readList =
+      'gh api "repos/o/r/commits/abc/check-runs?filter=all&per_page=100" --paginate --slurp > "$runs_file"';
+    const readOne = 'gh api "repos/o/r/check-runs/123" --jq ".conclusion"';
+    const readText = [readList, readOne, ""].join(SH);
+    expect(checkRunSanctioned(readStep, readList, simpleAssignments(readText))).toBe(true);
+    expect(checkRunSanctioned(readStep, readOne, simpleAssignments(readText))).toBe(true);
+    // 对照 2：同一行里第二条是写，即使第一条是回读也违规（豁免不按「这一行有回读」发）。
+    const readThenWrite = readOne + " ; gh api repos/o/r/check-runs/1 --method POST -f conclusion=success";
+    expect(checkRunSanctioned(readStep, readThenWrite, simpleAssignments(readThenWrite))).toBe(false);
+    // 对照 3：文案行里提到 check-runs、但没有一次 http 调用 → 沿用文本级白名单（不是新的红）。
+    const prose = 'fail("拿不到", "按 id 回读单条（GET repos/{owner}/{repo}/check-runs/<id>）非 0")';
+    expect(httpCalls(prose).length).toBe(0);
+    expect(checkRunSanctioned(readStep, prose, simpleAssignments(prose))).toBe(true);
+  });
+
+  it("轮二十一-4：赋值的门不止段首 NAME= —— readonly/declare/printf -v 与子 shell 都看得见", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-assignment-forms-"));
+    const value = "-X POST -f name=audit -f conclusion=success";
+    const forms = [
+      'readonly FLAGS="' + value + '"; gh api "repos/o/r/check-runs" $FLAGS',
+      'declare -x FLAGS="' + value + '"; gh api "repos/o/r/check-runs" $FLAGS',
+      'typeset FLAGS="' + value + '"; gh api "repos/o/r/check-runs" $FLAGS',
+      'local FLAGS="' + value + '"; gh api "repos/o/r/check-runs" $FLAGS',
+      '( FLAGS="' + value + '" ); gh api "repos/o/r/check-runs" $FLAGS',
+      '{ FLAGS="' + value + '"; } ; gh api "repos/o/r/check-runs" $FLAGS',
+      'printf -v FLAGS "%s" "' + value + '"; gh api "repos/o/r/check-runs" $FLAGS',
+    ];
+    for (const form of forms) {
+      expect(simpleAssignments(form).get("FLAGS")).toBe(value);
+      expect(
+        auditDirReferenceViolations([{ name: "插一步", run: form + SH }], { root: dir }).map((v) => v.reason),
+      ).toEqual([CHECK_RUNS_REASON_WRITE]);
+    }
+    // 对照 1：命令前缀赋值不记成赋值记录（`A=1 gh api` 这种前缀在 shell 下不参与实参展开）—— 保持现状。
+    expect(simpleAssignments("A=1 gh api repos/o/r/check-runs $A").has("A")).toBe(false);
+    // 对照 2：不是段首的 `readonly F=` 不是赋值（引号里的字面量）。
+    expect(simpleAssignments("echo 'readonly FLAGS=-X POST'").has("FLAGS")).toBe(false);
+    // 对照 3：良性形态不制造假红。
+    const benign = 'declare -x U="https://hooks.slack.com/x"; curl -sS -X POST "$U" -d \'{"text":"ok"}\'';
+    expect(auditDirReferenceViolations([{ name: "告警", run: benign + SH }], { root: dir })).toEqual([]);
+  });
+
+  it("轮二十一-5：值带 $ 的赋值不落表 —— 由「端点可见 + 意图不可见」兜住", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-value-dollar-"));
+    const line = 'FLAGS="$(cat flags)"; gh api "repos/o/r/check-runs" $FLAGS';
+    // 值带 $ / 反引号的赋值**不落表**，也不进 unresolved：这是赋值层的已知静默，
+    // 方向是「不许把良性 Slack 调用因为一个跟不下去的实参弄红」，所以不在这里加响。
+    // 它不是靠赋值层兜住的：端点看得见、写意图看不见 → 不可判形态默认拒绝。
+    expect(simpleAssignments(line).has("FLAGS")).toBe(false);
+    expect(simpleAssignments(line).unresolved.has("FLAGS")).toBe(false);
+    expect(checkRunWriteSurface(line)).toBeNull();
+    expect(
+      auditDirReferenceViolations([{ name: "插一步", run: line + SH }], { root: dir }).map((v) => v.reason),
+    ).toEqual([CHECK_RUNS_REASON_UNKNOWN]);
+    // 反面对照 1：同一个跟不下去的实参挂在别的 host 上（只读）→ 仍然放行。
+    expect(checkRunWriteSurface('FLAGS="$(cat flags)"; curl -sS https://hooks.slack.com/x $FLAGS')).toBeNull();
+    // 反面对照 2：可证明的只读回读不因为一个跟不下去的实参就变写。
+    expect(checkRunWriteSurface("gh api repos/o/r/check-runs/1 --jq .conclusion")).toBeNull();
   });
 });
 

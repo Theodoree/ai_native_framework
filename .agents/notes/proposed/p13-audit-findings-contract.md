@@ -640,16 +640,46 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 | # | 绕过/误判 | 变异前 | 变异后 |
 | --- | --- | --- | --- |
-| a | 引号拼接 URL：\`gh api "https://api.github.com/repos/o/r/check-"runs -f conclusion=success\` | 8 红→按词看后绿 | 8 红 |
-| b | 同行另一个良性 URL 洗白未知端点：\`gh api -H "X-Url: https://hooks.slack.com/x" --method POST --input body.json "$EP"\` | 8 红→绿 | 8 红 |
-| c | 双引号里的撇号被当单引号起始，后面的 \`$(gh api …)\` 整段跳过 | 8 红→绿 | 8 红 |
-| d | 值里含 \`$\` 的赋值被静默丢弃：\`A="-X POST -f conclusion=success"; B=$A; gh api … $B\` | 8 红→绿 | 8 红 |
-| e | 赋值只认物理行首：\`echo hi; B="-X POST -f conclusion=success"; gh api … $B\` | 8 红→绿 | 8 红 |
+| a | 引号拼接 URL：`gh api "https://api.github.com/repos/o/r/check-"runs -f conclusion=success` | 8 红→按词看后绿 | 8 红 |
+| b | 同行另一个良性 URL 洗白未知端点：`gh api -H "X-Url: https://hooks.slack.com/x" --method POST --input body.json "$EP"` | 8 红→绿 | 8 红 |
+| c | 双引号里的撇号被当单引号起始，后面的 `$(gh api …)` 整段跳过 | 8 红→绿 | 8 红 |
+| d | 值里含 `$` 的赋值被静默丢弃：`A="-X POST -f conclusion=success"; B=$A; gh api … $B` | 8 红→绿 | 8 红 |
+| e | 赋值只认物理行首：`echo hi; B="-X POST -f conclusion=success"; gh api … $B` | 8 红→绿 | 8 红 |
 
-**修法**：命令替换体在双引号里也要看（单引号里 shell 不展开，这边也不展开，见 \`substitutionBodies\`）；端点判定单位从「整行」收到「这一次 http 调用」（\`httpCalls\` / \`callEndpointWords\` / \`resolveEndpoint\`），同行另一条调用洗不白；赋值看见层下到命令行段（\`shellSegments\` 按未加引号的 \`;\` \`&&\` \`||\` 切），且 \`B=$A\` 一跳跟过去，跟不动就进 \`unresolved\`、表满进 \`truncated\`——两档都默认拒绝并各自点名（\`ASSIGNMENT_UNRESOLVED_REASON\` / \`ASSIGNMENT_TRUNCATED_REASON\`），不再静默丢弃。
+**修法**：命令替换体在双引号里也要看（单引号里 shell 不展开，这边也不展开，见 `substitutionBodies`）；端点判定单位从「整行」收到「这一次 http 调用」（`httpCalls` / `callEndpointWords` / `resolveEndpoint`），同行另一条调用洗不白；赋值看见层下到命令行段（`shellSegments` 按未加引号的 `;` `&&` `||` 切），且 `B=$A` 一跳跟过去，跟不动就进 `unresolved`、表满进 `truncated`——两档都默认拒绝并各自点名（`ASSIGNMENT_UNRESOLVED_REASON` / `ASSIGNMENT_TRUNCATED_REASON`）。**这句「不再静默丢弃」写宽了**（轮二十一 review-a 抓到）：值里含 `$` 或反引号的赋值既不落表也不进 `unresolved`，那一档靠「端点可见 + 写意图不可见」兜住，见 §十九。
 
-**我的十探针（/tmp 副本，基线 168）**：a/b/c/d/e 各 **8 红**；对照组 \`curl -X POST https://hooks.slack.com/…\`、\`gh api …/issues/1/comments -f body=hi\`、\`xh get … page==1\`、\`curl -G -d per_page=100\`、良性 peer（echo + 只读 gh api）**全绿**。六组变异里五组见红（撇号 1、按段切 1、一跳跟不动就丢 1、端点不可判改跳过 8、不展开赋值 4）。
+**我的十探针（/tmp 副本，基线 168）**：a/b/c/d/e 各 **8 红**；对照组 `curl -X POST https://hooks.slack.com/…`、`gh api …/issues/1/comments -f body=hi`、`xh get … page==1`、`curl -G -d per_page=100`、良性 peer（echo + 只读 gh api）**全绿**。六组变异里五组见红（撇号 1、按段切 1、一跳跟不动就丢 1、端点不可判改跳过 8、不展开赋值 4）。
 
-**第六组变异暴露的东西（比六条 finding 更值钱）**：把 \`checkRunWriteSurface\` 里那句 \`if (blindAssignmentArg(call)) return "check-runs"\` 停用 → **168 全绿**，说明它是死守卫；但把 \`blindAssignmentReason\` 停用 → 2 红，说明「赋值跟不下去要响」这件事真正的家在那条 reason 通道里。同一个事实两处守卫是重复（第二处还会在**字面量良性端点**上误响：\`curl … https://hooks.slack.com/x -d $B\` 本该放行），删掉后 168 仍绿。教训：变异测试不只用来找「漏判」，也用来找「多余的守卫」——多出来的那处只有误判风险，没有覆盖收益。
+**第六组变异暴露的东西（比六条 finding 更值钱）**：把 `checkRunWriteSurface` 里那句 `if (blindAssignmentArg(call)) return "check-runs"` 停用 → **168 全绿**，说明它是死守卫；但把 `blindAssignmentReason` 停用 → 2 红，说明「赋值跟不下去要响」这件事真正的家在那条 reason 通道里。同一个事实两处守卫是重复（第二处还会在**字面量良性端点**上误响：`curl … https://hooks.slack.com/x -d $B` 本该放行），删掉后 168 仍绿。教训：变异测试不只用来找「漏判」，也用来找「多余的守卫」——多出来的那处只有误判风险，没有覆盖收益。
 
-**提交**：\`fix(audit): 轮二十 端点判定收到单次调用、赋值看见层下到命令段\`；整仓 13 files / **334 tests**，oxlint 0/0。
+**提交**：`fix(audit): 轮二十 端点判定收到单次调用、赋值看见层下到命令段`；整仓 13 files / **334 tests**，oxlint 0/0。
+
+## 十九、轮二十一：同一个事实有两个入口，只有一个入口成立
+
+**六条（两家各出一半，我逐条实测复现后才动手）**
+
+| # | 绕过 / 误判 | 现象 |
+| --- | --- | --- |
+| A1 | 轮二十我删掉的那处 blind 守卫确实是放水：`EP="repos/o/r/check-""runs"; FLAGS=$GH_FLAGS; gh api "$EP" $FLAGS` | 恢复窄化守卫前 0 违规 |
+| A2 | 值含 `$` 或反引号的赋值既不落表也不进 `unresolved` | 与 §十八 那句「不再静默丢弃」矛盾 |
+| A3 | `checkRunSanctioned` 收**整行**：sanctioned 步同一行再追一条 check-runs 写，detector 0 违规 | 另起一行则 1 违规 |
+| A4 | 赋值只认段首 `(export )?NAME=`：`readonly` / `declare` / `printf -v` 各 0 违规 | — |
+| B1 | 引号包裹的解释器实参零覆盖：`bash -c '…gh api …/check-runs --method POST -f conclusion=success'` | 兄弟 workflow 里 **0 红**（裸写同一句 8 红） |
+
+**B1 暴露的结构问题（这一轮最值钱的东西）**：同一个事实在两条入口上结论不同——直接调判据时 `bash -c '…'` 是有违规的（理由退化成「不可判形态」，因为步骤级判据另有 `CHECK_RUNS_ENDPOINT.test(line)` 兜底），端到端 peer.yml 却是 0 红（兄弟 workflow 扫描只走 `checkRunWriteSurface`）。**一个事实两个入口、只在一个入口成立** = 缺单一判定单位；这和「测试看着在盯、其实放行」是同一类病，只是发生在判据内部。
+
+**修法**：`resolveEndpoint` 端点词先剥引号再判路径（相邻引号段在 shell 里本就是一个词）；`checkRunWriteSurface` 逐调用加**窄化**盲守卫（这一次调用无写意图 + 端点可见且落在 check-runs/graphql 面 + 实参里有跟不下去的整词 + 不是回读形态 → 拒绝；`blindArgumentWord` 跳过重定向目标），**没有**装回函数顶部（那会在良性字面量端点上误响）；`httpCalls` 改递归 `visit`，`wrapperCommandBodies`（`eval` 的全部实参 + shell 解释器 `-c` 之后的程序词）当正文继续扫，深度超限落 `overflow{kind:"depth"}`，非 shell 解释器（python/perl/ruby/php/node/deno + `-c/-e`）内联正文含写面字样落 `overflow{kind:"non-shell-inline"}`，`overflow` 非空即判写面（**响，不静默丢**）；`checkRunSanctioned` 改逐调用（`states.every(callSanctioned)`，states 为空才回退文本级，保住 `fail(...)` 这类纯文案行）；`ASSIGNMENT_PREFIX` 收 `export|readonly|declare|typeset|local`、`ASSIGNMENT_PRINTF` 认 `printf -v`、`ASSIGNMENT_PLAIN` 兜裸赋值。
+
+**我的七组变异（/tmp 副本，基线 173）**：窄化守卫改 `if (false && …)` **1 红**、删 wrapper 递归 **1 红**、删 overflow 判写面 **1 红**、sanctioned 退回整行 **1 红**、赋值前缀缩成 `(?:export)` **1 红**、关掉 `printf -v` **1 红**；**去掉引号剥离 → 173 全绿**。
+
+**那条绿不是漏，是「不可观测」**：`shellWords` 本就把相邻引号段并成一个词，引号在判据看到之前已经没了，所以剥引号这段是第二道防线，**任何形态都无法区分它在与不在**。留着（无成本），但按「零覆盖」如实登记，不假装它被钉住。
+
+**我的六条端到端探针（peer.yml 一行一变，跑完即删）**：拼接端点 + 参数变量 **8 红**、`readonly` 端点 **8 红**、`declare -x` 端点 **8 红**、`printf -v` 端点 **8 红**、端点可见 + 跟不下去的实参 **8 红**；良性对照（`echo hi` + `gh api …/check-runs/1 --jq .conclusion`）与删掉 peer.yml **173 全绿**。
+
+**探针第五次坏**：`printf -v` 那条变异我第一次只替换了正则前缀，留下尾部 `\s+(?:…)-v…` 在正则字面量之外 → 语法错 → vitest 只报 `no tests`（不是绿，是没跑）。规则再确认：**改正则要整行替换**，输出里没有 `Tests` 汇总行就先怀疑探针。
+
+**还有一次不是探针，是我自己**：改这段记录时用 `String.prototype.replace` 传字符串当替换值，替换串里正好有 `$` 紧跟反引号 —— 那是 `$\``（插入匹配位置之前的整段前缀）的语义，于是整份 note 被复制粘贴成 1303 行。`git checkout` 回到 655 行重写。规则：**往文件里写含 `$` 的文本，用 split/join 或 append，不要用 replace 的字符串替换值**。
+
+**提交**：`fix(audit): 轮二十一 窄化盲守卫、解释器正文跟进、逐调用豁免`；整仓 13 files / **339 tests**，oxlint 0/0。
+
+**仍未解决**：信任根（同 §十四～§十八）——`workflow_dispatch` 用被 dispatch 那个 ref 的 YAML 与被审对象自己的 `scripts/`，判据再严也拦不住「把判据本身改掉」。
