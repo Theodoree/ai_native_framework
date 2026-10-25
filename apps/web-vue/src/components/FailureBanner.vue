@@ -18,17 +18,23 @@ const extraText = computed<string>(() => {
 </script>
 
 <template>
-  <div v-if="failure" class="failure" role="alert">
-    <div class="failure-head">
-      <span class="failure-title">{{ title }}</span>
-      <span class="chip chip-danger">kind={{ failure.kind }}</span>
-      <span class="chip chip-danger">code={{ failure.code }}</span>
-      <span v-if="failure.status !== null" class="chip">HTTP {{ failure.status }}</span>
-    </div>
-    <pre class="failure-message">{{ failure.message }}</pre>
-    <details class="failure-extra">
-      <summary>extra（原样）</summary>
-      <pre>{{ extraText }}</pre>
-    </details>
+  <div v-if="failure" class="mb-3">
+    <v-alert type="error" variant="tonal" density="compact" role="alert" class="failure">
+      <template #title>
+        <span class="me-2">{{ title }}</span>
+        <v-chip size="x-small" color="error" variant="flat">kind={{ failure.kind }}</v-chip>
+        <v-chip size="x-small" color="error" variant="flat" class="ms-1">
+          code={{ failure.code }}
+        </v-chip>
+        <v-chip v-if="failure.status !== null" size="x-small" variant="outlined" class="ms-1">
+          HTTP {{ failure.status }}
+        </v-chip>
+      </template>
+      <pre class="failure-message">{{ failure.message }}</pre>
+      <details class="failure-extra">
+        <summary>extra（原样）</summary>
+        <pre>{{ extraText }}</pre>
+      </details>
+    </v-alert>
   </div>
 </template>

@@ -20,7 +20,9 @@ const targets = computed<string[]>(() => {
   }
   return list;
 });
-const chosenHints = computed(() => candidates.value.filter((transition) => transition.to === target.value));
+const chosenHints = computed(() =>
+  candidates.value.filter((transition) => transition.to === target.value),
+);
 
 watch(
   targets,
@@ -30,7 +32,7 @@ watch(
   { immediate: true },
 );
 
-// 角色是可手填的（datalist 只给建议）：合法的角色集合属于后端知识，前端不锁死。
+// 角色框可手填（v-combobox 的 items 只是建议）：合法角色集合属于后端知识，前端不锁死。
 watch(
   roles,
   (list) => {
@@ -53,44 +55,40 @@ async function submit(): Promise<void> {
 </script>
 
 <template>
-  <section class="transition">
-    <h3>流转</h3>
-    <p class="muted hint">
+  <div class="transition">
+    <h3 class="text-body-2 font-weight-bold mb-1">流转</h3>
+    <p class="text-caption text-medium-emphasis mb-2">
       目标状态取自声明的 transitions（含通配 *）。是否允许、为什么不允许，全部由后端回答。
     </p>
-    <label class="field">
-      <span>目标状态</span>
-      <select v-model="target">
-        <option v-for="to in targets" :key="to" :value="to">{{ to }}</option>
-      </select>
-    </label>
-    <label class="field">
-      <span>actor_role（可手填）</span>
-      <input v-model="actorRole" list="role-options" placeholder="ci / platform / owner / proposer / agent" />
-      <datalist id="role-options">
-        <option v-for="role in roles" :key="role" :value="role"></option>
-      </datalist>
-    </label>
-    <label class="field">
-      <span>comment</span>
-      <textarea v-model="comment" rows="3" placeholder="说明（声明要求时也别在本地拦，交给后端）"></textarea>
-    </label>
+    <v-select v-model="target" :items="targets" label="目标状态" />
+    <v-combobox
+      v-model="actorRole"
+      :items="roles"
+      label="actor_role（可手填）"
+      placeholder="形如 ci / platform / owner / agent"
+    />
+    <v-textarea v-model="comment" label="comment" rows="3" placeholder="说明（声明要求时也别在本地拦，交给后端）" />
     <ul v-if="chosenHints.length > 0" class="hints">
       <li v-for="(hint, index) in chosenHints" :key="index">
         {{ hint.from }} → {{ hint.to }} · by {{ hint.by === "" ? "(未声明)" : hint.by }}
         <span v-if="hint.event !== ''"> · {{ hint.event }}</span>
-        <span v-if="hint.commentRequired" class="chip chip-warn">声明要求 comment</span>
+        <v-chip v-if="hint.commentRequired" size="x-small" color="warning" variant="tonal" class="ms-1">
+          声明要求 comment
+        </v-chip>
       </li>
     </ul>
-    <button
-      type="button"
-      class="btn btn-primary"
-      :disabled="state.verdict.pending || item.id === null || target === ''"
+    <v-btn
+      color="primary"
+      class="mt-2"
+      :loading="state.verdict.pending"
+      :disabled="item.id === null || target === ''"
       @click="submit"
     >
-      {{ state.verdict.pending ? "提交中…" : "提交流转" }}
-    </button>
-    <p v-if="state.verdict.ok" class="ok">已写入：{{ state.verdict.ok }}</p>
+      提交流转
+    </v-btn>
+    <v-alert v-if="state.verdict.ok" type="success" variant="tonal" density="compact" class="mt-2">
+      已写入：{{ state.verdict.ok }}
+    </v-alert>
     <FailureBanner :failure="state.verdict.failure" title="流转被拒绝（原样）" />
-  </section>
+  </div>
 </template>

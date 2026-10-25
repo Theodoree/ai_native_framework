@@ -32,28 +32,29 @@ function save(): void {
 </script>
 
 <template>
-  <section class="panel config">
-    <header class="panel-head">
-      <h2>声明编辑（state-machine.yml）</h2>
-      <div class="row">
-        <button type="button" class="btn btn-ghost" @click="reset">重新拉取</button>
-        <button type="button" class="btn btn-primary" :disabled="state.configSaving" @click="save">
-          {{ state.configSaving ? "保存中…" : "保存" }}
-        </button>
-      </div>
-    </header>
-    <p class="muted">
-      前端不解析 YAML、不判断合法性；保存=交给后端自检，失败时 code / message 原样显示。
-    </p>
-    <FailureBanner :failure="state.configFailure" title="声明加载失败" />
-    <FailureBanner :failure="state.configSaveFailure" title="保存被拒绝（原样）" />
-    <p v-if="state.configSaveOk" class="ok">{{ state.configSaveOk }}</p>
-    <textarea
-      class="input code"
-      spellcheck="false"
-      rows="18"
-      :value="draft"
-      @input="edit(($event.target as HTMLTextAreaElement).value)"
-    ></textarea>
-  </section>
+  <v-card variant="flat" class="config">
+    <v-card-title class="d-flex align-center text-body-2 py-2">
+      <span class="font-weight-bold">声明编辑（state-machine.yml）</span>
+      <v-spacer />
+      <v-btn size="small" variant="text" class="me-1" @click="reset">重新拉取</v-btn>
+      <v-btn size="small" color="primary" :loading="state.configSaving" @click="save">保存</v-btn>
+    </v-card-title>
+    <v-card-text class="pa-3 pt-0">
+      <p class="text-caption text-medium-emphasis mb-2">
+        前端不解析 YAML、不判断合法性；保存=交给后端自检，失败时 code / message 原样显示。
+      </p>
+      <FailureBanner :failure="state.configFailure" title="声明加载失败" />
+      <FailureBanner :failure="state.configSaveFailure" title="保存被拒绝（原样）" />
+      <v-alert v-if="state.configSaveOk" type="success" variant="tonal" density="compact" class="mb-2">
+        {{ state.configSaveOk }}
+      </v-alert>
+      <v-textarea
+        class="config-code"
+        spellcheck="false"
+        rows="18"
+        :model-value="draft"
+        @update:model-value="edit"
+      />
+    </v-card-text>
+  </v-card>
 </template>

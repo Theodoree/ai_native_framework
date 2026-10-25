@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import BoardView from "./views/BoardView.vue";
 import MachineView from "./views/MachineView.vue";
 import TimelineView from "./views/TimelineView.vue";
@@ -16,6 +16,10 @@ const tabs: { key: ViewKey; label: string }[] = [
 const { state, reloadAll } = usePlatform();
 const view = ref<ViewKey>("board");
 
+const loading = computed<boolean>(
+  () => state.boardLoading || state.eventsLoading || state.configLoading,
+);
+
 function refresh(): void {
   void reloadAll();
 }
@@ -26,36 +30,29 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="app">
-    <header class="topbar">
-      <div class="brand">
-        <span class="brand-title">需求状态与证据</span>
-        <span class="brand-sub">state:* 是唯一状态；前端只呈现，不判定</span>
-      </div>
-      <nav class="tabs" aria-label="视图">
-        <button
-          v-for="tab in tabs"
-          :key="tab.key"
-          type="button"
-          class="tab"
-          :class="{ active: view === tab.key }"
-          :aria-current="view === tab.key ? 'page' : undefined"
-          @click="view = tab.key"
-        >
-          {{ tab.label }}
-        </button>
-      </nav>
-      <div class="toolbar">
-        <span v-if="state.boardLoading || state.eventsLoading || state.configLoading" class="muted">
-          加载中…
+  <!-- 三视图是同级平铺，没有层级：用 app-bar + tabs，不用 navigation-drawer
+       （抽屉要占一列宽度，看板本来就要横向空间，且只有三个入口，抽屉是浪费）。 -->
+  <v-app>
+    <v-app-bar flat density="compact" color="surface" class="px-2">
+      <div class="d-flex align-baseline me-4">
+        <span class="text-body-2 font-weight-bold">需求状态与证据</span>
+        <span class="text-caption text-medium-emphasis ms-3 d-none d-md-inline">
+          state:* 是唯一状态；前端只呈现，不判定
         </span>
-        <button type="button" class="btn" @click="refresh">刷新全部</button>
       </div>
-    </header>
-    <main class="content">
+      <v-tabs v-model="view" color="primary" density="compact" aria-label="视图">
+        <v-tab v-for="tab in tabs" :key="tab.key" :value="tab.key">{{ tab.label }}</v-tab>
+      </v-tabs>
+      <v-spacer />
+      <span v-if="loading" class="text-caption text-medium-emphasis me-3">加载中…</span>
+      <v-btn variant="tonal" size="small" class="me-2" :disabled="loading" @click="refresh">
+        刷新全部
+      </v-btn>
+    </v-app-bar>
+    <v-main>
       <BoardView v-if="view === 'board'" />
       <MachineView v-else-if="view === 'machine'" />
       <TimelineView v-else />
-    </main>
-  </div>
+    </v-main>
+  </v-app>
 </template>
