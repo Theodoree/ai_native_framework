@@ -28,6 +28,13 @@ name: audit
 # 「结论兜底」补一条 action_required —— 缺结论绝不等于通过（P-13 的 schema 不合格、
 # 脚本崩溃都落在这条路径上）。
 #
+# 上面三条（口径层判定 / 结论兜底 / 判不了：回写 INFRA）都是**静态判据**：它们列举的是
+# 已知的执行形态（哪一步、哪种命令行、哪个 YAML 键）。静态判据只能收口它认得出来的形态——
+# 换一个载体（github-script 的 with.script、兄弟 workflow、解包后改文件）就能在同一 sha 上
+# 再发一条同名结论，而本文件一字未改。所以「结论唯一」由运行时**自证**兜底：
+# 「结论自证：回读 Check Run」回读这个 sha 上所有 name=audit 的 Check Run，要求恰好一条、
+# 且 id 就是刚 POST 出去的那条。静态判据管已知形态，回读直接观测事实；两者不互相替代。
+#
 # 上面那句的前提是 payload 的 head_sha 非空：空 sha 会被 GitHub 拒收，于是**一条
 # Check Run 都没有**，「一定有一条」当场不成立。三条写 payload 的路径各自兜住这一点：
 # 判定 / 兜底只在 ctx 解析成功（ok=1）时跑，落点由 ctx 给出；「判不了」用 ctx 给出的 sha，
@@ -253,9 +260,60 @@ jobs:
       # 前置步骤红了也要照跑（always()）：Check Run 才是结论的唯一载体，
       # 一个红步骤把它跳过去，就等于「这次判不了」退化成「上次判过了」。
       - name: 回写 Check Run
+        id: post
         if: always() && steps.ctx.outputs.ok == '1'
         run: |
-          gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
+          id=$(gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id')
+          printf '%s\n' "$id"
+          # id 要进 $GITHUB_OUTPUT：一个换行就能多写一个 output，所以只收纯数字。
+          case "$id" in
+            '' | *[!0-9]*)
+              echo '::error title=audit 回写::Check Run 的 id 不是数字'
+              exit 1
+              ;;
+          esac
+          echo "check_run_id=$id" >> "$GITHUB_OUTPUT"
+
+      # 静态判据只能列举**已知的执行形态**：github-script 的 with.script、兄弟 workflow、
+      # 解包后改文件，都能在同一 sha 上再发一条同名结论，而本文件一字未改
+      # （实测：peer.yml 用 actions/github-script@v7 发一条 name=audit / conclusion=success，
+      # 静态判据全绿）。回读直接观测事实，不猜形态。
+      # 只读：不碰任何 .audit 载体，不产生结论；只数条数、比 id。
+      - name: 结论自证：回读 Check Run
+        if: always() && steps.ctx.outputs.ok == '1'
+        env:
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
+        run: |
+          expected='${{ steps.post.outputs.check_run_id }}'
+          # --slurp：分页时 gh 把每一页单独喂给 --jq，不 slurp 会拼成多个 JSON 数组（解析即崩）。
+          # 这里只取 id 列表：条数与「是不是同一条」是两个独立事实，分开判。
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/check-runs?head_sha=$AUDIT_SHA" --paginate --slurp --jq 'map(.check_runs) | add | map(select(.name=="audit") | .id)')
+          RUNS="$runs" EXPECTED="$expected" node -e '
+            const runs = JSON.parse(process.env.RUNS || "[]");
+            const expected = String(process.env.EXPECTED || "");
+            // 回读给的是 id 列表；对象形态也认（同一条判据不绑 jq 的写法）。
+            const ids = runs.map((entry) => String(entry && entry.id !== undefined ? entry.id : entry));
+            // 恰好一条、且就是刚 POST 出去的那条：两条里有一条是对的也不叫唯一。
+            if (expected && ids.length === 1 && ids[0] === expected) process.exit(0);
+            const fs = require("node:fs");
+            fs.appendFileSync(
+              process.env.GITHUB_STEP_SUMMARY,
+              [
+                "## audit 自证失败：本 sha 上有 " + ids.length + " 条 name=audit 的 Check Run",
+                "",
+                "回读到 id：" + (ids.length ? ids.join("、") : "（无）") + "；本步 POST 出去的 id：" + (expected || "（空）"),
+                "",
+                "恰好一条、且 id 就是刚 POST 的那条，才叫「结论唯一」。",
+                "多出来的那条说明有第二个写者在同一 sha 上发结论：静态判据只能列举已知形态，",
+                "github-script 的 with 脚本 / 兄弟 workflow / 解包改文件这类写形态由这一条兜住。",
+                "",
+              ].join("\n"),
+            );
+            console.log(
+              "::error title=audit 自证失败::本 sha 上出现了 " + ids.length + " 条 name=audit 的 Check Run（期望恰好 1 条、id=" + (expected || "空") + "）",
+            );
+            process.exit(1);
+          '
 
       - name: INFRA 留痕
         if: steps.decide.outputs.conclusion == 'action_required'
