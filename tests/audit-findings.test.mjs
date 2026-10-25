@@ -536,47 +536,190 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 根账本于是「存在但 0 行」—— 「账本在、0 行 = 零调用」这条担保被空过。
     const LEDGER = join(dir, "calls.log");
     const PAYLOAD = join(dir, "payload.json");
-    const CHECK_RUNS = join(dir, "check-runs.json");
-    const gh = [
-      "#!/usr/bin/env bash",
-      // 账本**无条件创建**：这样「账本不存在」就只有一个来历 —— 假 gh 压根没跑起来
-      // （PATH / shebang / 权限 / 记账被改坏），而不是「零次调用」的正常形态。
-      // 否则读不到账本返回的 [] 与真的零调用是同一个值，一批 toHaveLength(0) 的断言
-      // 会因为 harness 断开而空过。
-      `touch "${LEDGER}"`,
-      // harness 自检探针：跑得起来就说明账本路径与 PATH 是通的，但它自己不进账本。
-      "if [[ \"$1\" == \"--audit-harness-canary\" ]]; then exit 0; fi",
-      `echo "$*" >> "${LEDGER}"`,
-      "if [[ \"$*\" == *\"pr view\"* && \"$*\" == *\"headRefOid\"* ]]; then",
-      "  printf 'cafebabe\\n'",
-      "  exit 0",
-      "fi",
-      "if [[ \"$*\" == *\"pr view\"* ]]; then",
-      "  printf 'scripts/merge-gate.mjs\\nscripts/audit-findings.mjs\\n'",
-      "  exit 0",
-      "fi",
-      // 同一个端点两种形态：--method POST 是回写（收 payload、回 id），其余是回读
-      // （自证步的 check-runs?head_sha=…）。沙箱里没有 jq，所以回读直接返回**已按
-      // name=audit 过滤**的列表：这条判据测的是「拿到几条、id 对不对」，不是 jq 的写法。
-      "if [[ \"$*\" == *\"check-runs\"* && \"$*\" == *\"--method POST\"* ]]; then",
-      "  if [[ -n \"$FAKE_GH_POST_FAILS\" ]]; then echo 'gh: 422' >&2; exit 1; fi",
-      "  while [[ $# -gt 0 ]]; do",
-      `    if [[ "$1" == "--input" ]]; then cp "$2" "${PAYLOAD}"; fi`,
-      "    shift",
-      "  done",
-      "  echo 4242",
-      "  exit 0",
-      "fi",
-      "if [[ \"$*\" == *\"check-runs\"* ]]; then",
-      `  if [[ -n "\${FAKE_GH_CHECK_RUNS_JSON+x}" ]]; then printf '%s\\n' "$FAKE_GH_CHECK_RUNS_JSON"; else cat "${CHECK_RUNS}"; fi`,
-      "  exit 0",
-      "fi",
-      "exit 0",
-    ].join("\n");
-    writeFileSync(join(bin, "gh"), gh);
-    // 回读的默认答案：这个 sha 上恰好一条 name=audit，id 就是 POST 回的 4242。
-    // 「恰好一条」是默认值的语义 —— 想造第二条得显式写（FAKE_GH_CHECK_RUNS_JSON）。
-    writeFileSync(join(dir, "check-runs.json"), JSON.stringify([{ id: 4242, name: "audit" }]));
+    // 假 gh 是**行为仿真**，不是「已经过滤好的答案」：
+    //   * --slurp 与 --jq 同现时真 gh 直接拒绝（请求都不发），假 gh 必须照样拒绝；
+    //   * 未登记的 (method, path) 一律 404 + 非 0 —— 端点拼错必须响，不能被 exit 0 吞掉；
+    //   * 列表端点回**原始页形状** {total_count, check_runs}，--paginate --slurp 回页数组；
+    //     按 name 过滤是步骤自己的事，假 gh 不代劳（否则「过滤条件写错」不可观测）；
+    //   * filter 语义照 GitHub：缺省 / filter=latest 是按 name 去重后的视图，只有 filter=all 才全给；
+    //   * GET check-runs/<id> 回单条对象（含 app.slug）；PATCH 不登记 —— 那条路本来就该 404。
+    // 用 node 实现：沙箱里没有 jq，而 --jq 的表达式必须真的被求值，否则「jq 写错」也不可观测。
+    const ghScript = `#!/usr/bin/env node
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const NEWLINE = String.fromCharCode(10);
+const TICK = String.fromCharCode(96);
+const DIR = ${JSON.stringify(dir)};
+const LEDGER = path.join(DIR, "calls.log");
+const PAYLOAD = path.join(DIR, "payload.json");
+const STATE = path.join(DIR, "runs-state.json");
+
+const argv = process.argv.slice(2);
+// 账本**无条件创建**：这样「账本不存在」就只有一个来历 —— 假 gh 压根没跑起来
+// （PATH / shebang / 权限 / 记账被改坏），而不是「零次调用」的正常形态。
+fs.closeSync(fs.openSync(LEDGER, "a"));
+// harness 自检探针：跑得起来就说明账本路径与 PATH 是通的，但它自己不进账本。
+if (argv[0] === "--audit-harness-canary") process.exit(0);
+fs.appendFileSync(LEDGER, argv.join(" ") + NEWLINE);
+
+const WITH_VALUE = ["--jq", "--method", "-X", "--input", "-f", "-F", "--field", "--raw-field", "--template", "--json"];
+const valueOf = (flag) => {
+  const at = argv.indexOf(flag);
+  return at >= 0 ? argv[at + 1] : undefined;
+};
+const has = (flag) => argv.includes(flag);
+const positional = argv.filter((arg, i) => !arg.startsWith("-") && !WITH_VALUE.includes(argv[i - 1]));
+const jq = valueOf("--jq");
+const method = String(valueOf("--method") || valueOf("-X") || "GET").toUpperCase();
+const stderr = (text) => process.stderr.write(text + NEWLINE);
+const stdout = (text) => process.stdout.write(text + NEWLINE);
+
+// 真 gh：--slurp 与 --jq/--template 互斥，请求根本不发。
+if (has("--slurp") && jq !== undefined) {
+  stderr("the " + TICK + "--slurp" + TICK + " option is not supported with " + TICK + "--jq" + TICK + " or " + TICK + "--template" + TICK);
+  process.exit(1);
+}
+
+// --jq 只实现最小真集：字符串字面量、.path、(.path // 默认值)，用 + 连接。
+// 超出这个集合就报错退出 —— 静默回一个「看着对」的值正是这批漏洞的根因。
+const lookup = (object, expr) => {
+  let current = object;
+  for (const key of String(expr).trim().split(".").filter(Boolean)) {
+    if (current === null || current === undefined) return undefined;
+    current = current[key];
+  }
+  return current;
+};
+const splitTerms = (text) => {
+  const terms = [];
+  let depth = 0;
+  let quote = null;
+  let current = "";
+  for (const ch of text) {
+    if (quote) {
+      current += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === "(") depth += 1;
+    if (ch === ")") depth -= 1;
+    if (ch === "+" && depth === 0) {
+      terms.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  terms.push(current.trim());
+  return terms;
+};
+const jqValue = (object, expr) => {
+  const parts = splitTerms(String(expr).trim()).map((term) => {
+    if (term.startsWith("(") && term.endsWith(")")) return jqValue(object, term.slice(1, -1));
+    if (term.charAt(0) === '"' || term.charAt(0) === "'") return term.slice(1, -1);
+    const alternatives = term.split("//");
+    const got = lookup(object, alternatives[0]);
+    if (alternatives.length > 1) {
+      const fallback = alternatives.slice(1).join("//").trim();
+      if (got !== undefined && got !== null) return got;
+      return fallback.charAt(0) === '"' || fallback.charAt(0) === "'" ? fallback.slice(1, -1) : lookup(object, fallback);
+    }
+    if (got === undefined || got === null) throw new Error("jq: 取不到字段 " + term);
+    return got;
+  });
+  return parts.join("");
+};
+const emit = (object) => stdout(jq === undefined ? JSON.stringify(object) : String(jqValue(object, jq)));
+
+const page = () => {
+  if (Object.prototype.hasOwnProperty.call(process.env, "FAKE_GH_CHECK_RUNS_JSON")) {
+    const parsed = JSON.parse(process.env.FAKE_GH_CHECK_RUNS_JSON);
+    if (!parsed || !Array.isArray(parsed.check_runs)) throw new Error("夹具必须是原始页形状 {total_count, check_runs}");
+    return parsed;
+  }
+  if (fs.existsSync(STATE)) return JSON.parse(fs.readFileSync(STATE, "utf8"));
+  return { total_count: 0, check_runs: [] };
+};
+// GitHub 的默认视图是按 name 去重后的最新一条；只有 filter=all 才把同名的都给出来。
+const dedupeLatest = (runs) => {
+  const latest = new Map();
+  for (const run of runs) if (run && run.name) latest.set(run.name, run);
+  return runs.filter((run) => run && latest.get(run.name) === run);
+};
+const notFound = () => {
+  stdout(JSON.stringify({ message: "Not Found" }));
+  process.exit(1);
+};
+
+try {
+  if (positional[0] === "pr" && positional[1] === "view") {
+    if (has("--json") && String(valueOf("--json")).includes("headRefOid")) {
+      stdout("cafebabe");
+      process.exit(0);
+    }
+    stdout(["scripts/merge-gate.mjs", "scripts/audit-findings.mjs"].join(NEWLINE));
+    process.exit(0);
+  }
+  if (positional[0] !== "api") notFound();
+  const parts = String(positional[1] || "").split("?");
+  const rawPath = parts[0];
+  const query = new URLSearchParams(parts[1] || "");
+  const POST_RUNS = new RegExp("^repos/[^/]+/[^/]+/check-runs$");
+  const LIST_RUNS = new RegExp("^repos/[^/]+/[^/]+/commits/[^/]+/check-runs$");
+  const ONE_RUN = new RegExp("^repos/[^/]+/[^/]+/check-runs/([0-9]+)$");
+
+  if (method === "POST" && POST_RUNS.test(rawPath)) {
+    if (process.env.FAKE_GH_POST_FAILS) {
+      stderr("gh: 422");
+      process.exit(1);
+    }
+    const input = valueOf("--input");
+    if (!input) notFound();
+    fs.copyFileSync(input, PAYLOAD);
+    const payload = JSON.parse(fs.readFileSync(input, "utf8"));
+    // 服务端状态由 payload 长出来：app 恒为 github-actions（POST 用的是 GITHUB_TOKEN）。
+    const run = {
+      id: 4242,
+      name: payload.name,
+      status: payload.status,
+      conclusion: payload.conclusion,
+      head_sha: payload.head_sha,
+      app: { slug: "github-actions" },
+    };
+    fs.writeFileSync(STATE, JSON.stringify({ total_count: 1, check_runs: [run] }));
+    emit({ id: 4242 });
+    process.exit(0);
+  }
+  if (method === "GET" && LIST_RUNS.test(rawPath)) {
+    const runs = page().check_runs || [];
+    const filter = query.get("filter") || "latest";
+    const kept = filter === "all" ? runs : dedupeLatest(runs);
+    const body = { total_count: kept.length, check_runs: kept };
+    // --paginate --slurp 是页数组：单页也要套一层，否则分页语义与真 CI 不一致。
+    stdout(JSON.stringify(has("--slurp") ? [body] : body));
+    process.exit(0);
+  }
+  const one = ONE_RUN.exec(rawPath);
+  if (method === "GET" && one) {
+    const wanted = String(one[1]);
+    const run = (page().check_runs || []).find((candidate) => String(candidate.id) === wanted);
+    if (!run) notFound();
+    emit(run);
+    process.exit(0);
+  }
+  notFound();
+} catch (error) {
+  stderr("gh: " + String((error && error.message) || error));
+  process.exit(1);
+}
+`;
+    writeFileSync(join(bin, "gh"), ghScript);
     chmodSync(join(bin, "gh"), 0o755);
     // harness 自检：账本由假 gh 自己创建，所以先证明它真的跑得起来。
     // 少了这一步，「账本不在」既可能是 harness 坏了、也可能是这一步合法地一次没调 ——
@@ -768,8 +911,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
 
   it("全 pass：POST check-runs，conclusion=success，判定步骤退出 0", () => {
     const out = runWorkflow({ AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass });
-    // 一次 POST 回写 + 一次自证回读（回读是只读，不产生结论）。
-    expect(out.calls.filter((c) => c.includes("check-runs"))).toHaveLength(2);
+    // 一次 POST 回写 + 自证的两段只读回读（计数回读 + 内容回读，都不产生结论）。
+    expect(out.calls.filter((c) => c.includes("check-runs"))).toHaveLength(3);
     expect(out.calls.filter((c) => c.includes("--method POST"))).toHaveLength(1);
     expect(out.payload).toMatchObject({ name: "audit", status: "completed", conclusion: "success" });
     expect(out.payload.head_sha).toBe("cafebabe");
@@ -784,8 +927,13 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
     expect(self).toBeTruthy();
     expect(self.status).toBe(0);
-    // 回读带 sha 过滤：读的是这个 sha 上的结论，不是全仓库的。
-    expect(out.calls.filter((call) => call.includes("check-runs?head_sha=cafebabe"))).toHaveLength(1);
+    // 计数回读只认 commits/<sha>/check-runs 形态，且显式带 filter=all&per_page=：
+    // 默认 filter=latest 是按 name 去重的视图，「恰好一条」不许建在去重上。
+    expect(
+      out.calls.filter((call) => call.includes("commits/cafebabe/check-runs?filter=all&per_page=100")),
+    ).toHaveLength(1);
+    // 内容回读按 id 打单条 —— 这是「写着什么」唯一的观测面。
+    expect(out.calls.filter((call) => call.includes("check-runs/4242"))).toHaveLength(1);
     expect(out.summary).toBe("");
   });
 
@@ -794,10 +942,14 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       AUDIT_FINDINGS_A: pass,
       AUDIT_FINDINGS_B: pass,
       // 第二个写者：同一个 sha 上又一条 name=audit（id 不是刚 POST 的 4242）。
-      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify([
-        { id: 4242, name: "audit" },
-        { id: 9999, name: "audit" },
-      ]),
+      // 夹具是**原始页形状**：按 name 过滤是步骤自己的事，假 gh 不代劳。
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 2,
+        check_runs: [
+          { id: 4242, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+          { id: 9999, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+        ],
+      }),
     });
     const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
     expect(self.status).not.toBe(0);
@@ -812,12 +964,86 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     const out = runWorkflow({
       AUDIT_FINDINGS_A: pass,
       AUDIT_FINDINGS_B: pass,
-      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify([{ id: 1234, name: "audit" }]),
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 1,
+        check_runs: [
+          { id: 1234, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+        ],
+      }),
     });
     const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
     expect(self.status).not.toBe(0);
     expect(String(self.stdout)).toContain("::error title=audit 自证失败");
     expect(String(self.stdout)).toContain("id=4242");
+  });
+
+  it("自证：同一个 sha 上还有别名的 Check Run —— 只数 name=audit 的那一条", () => {
+    // 假 gh 回的是原始页（不预先筛 name）：过滤条件写坏时，别人那条会被一起数进来。
+    const out = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 2,
+        check_runs: [
+          { id: 8888, name: "render", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+          { id: 4242, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+        ],
+      }),
+    });
+    const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self.status, String(self.stderr)).toBe(0);
+    expect(out.summary).toBe("");
+  });
+
+  it("自证：内容被改 —— 单条回读的 conclusion 与本次 payload 不符，非 0 且点名期望/实得", () => {
+    // PATCH 改写既有那条：条数不变、id 不变，只有 content 变了。只比「是谁」结构上看不见它。
+    const out = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: JSON.stringify(result({ verdict: "needs_revision" })),
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 1,
+        check_runs: [
+          { id: 4242, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+        ],
+      }),
+    });
+    expect(out.payload.conclusion).toBe("failure");
+    const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self.status).not.toBe(0);
+    expect(String(self.stdout)).toContain("::error title=audit 自证失败");
+    expect(out.summary).toContain("内容被改");
+    expect(out.summary).toContain("failure");
+    expect(out.summary).toContain("success");
+  });
+
+  it("自证：换了 app 就是别人发的 —— app.slug 不是 github-actions 也进「内容被改」", () => {
+    const out = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 1,
+        check_runs: [
+          { id: 4242, name: "audit", status: "completed", conclusion: "success", app: { slug: "third-party" } },
+        ],
+      }),
+    });
+    const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self.status).not.toBe(0);
+    expect(out.summary).toContain("内容被改");
+    expect(out.summary).toContain("app.slug");
+    expect(out.summary).toContain("third-party");
+  });
+
+  it("自证：POST 步没交出 check_run_id —— fail-closed，非 0 且点名缺 expected", () => {
+    // expected 落空时，「条数恰好一条」这种巧合不许把它读成通过。
+    const out = runWorkflow({ AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass }, {}, undefined, {
+      skip: ["回写 Check Run"],
+    });
+    const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self).toBeTruthy();
+    expect(self.status).not.toBe(0);
+    expect(String(self.stdout)).toContain("::error title=audit 自证失败");
+    expect(out.summary).toContain("POST 步没有交出 check_run_id");
   });
 
   it("行为兜底：全 pass 时 check-run.json 的 summary 同时含「申报=」与「agreed=」", () => {
@@ -2078,7 +2304,8 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     ".audit/review-a.json": ["落盘 review-a", "口径层判定"],
     ".audit/review-b.json": ["落盘 review-b", "口径层判定"],
     ".audit/result.json": ["口径层判定", "结论兜底", "INFRA 留痕"],
-    ".audit/check-run.json": ["口径层判定", "结论兜底", "判不了：回写 INFRA", "回写 Check Run"],
+    // 自证步读 check-run.json 是为了「内容比什么」：读的是本次 payload 的 conclusion，只读。
+    ".audit/check-run.json": ["口径层判定", "结论兜底", "判不了：回写 INFRA", "回写 Check Run", "结论自证：回读 Check Run"],
   };
   // POST 面收口。check-runs 这个端点在真 workflow 里只有一种合法写法：
   //   gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq .id
@@ -2095,9 +2322,14 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   const CHECK_RUNS_POST = /(?:--method[=\s]+POST\b|-X\s*POST\b)/;
   const CHECK_RUNS_INPUT = /--input[=\s]+["']?\.audit\/check-run\.json["']?/;
   const CHECK_RUNS_POST_STEPS = ["回写 Check Run", "判不了：回写 INFRA"];
-  // 自证步的回读形态：按 sha 过滤，且没有任何写形态。
+  // 自证步有**两段**只读回读，两种形态都要认：
+  //   1) 计数回读：commits/<ref>/check-runs?filter=all&per_page=… —— 端点只认这一形态
+  //      （/check-runs?head_sha= 不存在，实测 404）；filter=all 必须显式写，默认 latest 是去重视图，
+  //      「恰好一条」不许建在去重上；
+  //   2) 内容回读：check-runs/<id> —— 单条对象，回答「写着什么」（id 只回答「是谁」）。
   const CHECK_RUNS_READ_STEPS = ["结论自证：回读 Check Run"];
-  const CHECK_RUNS_READ = /check-runs\?head_sha=/;
+  const CHECK_RUNS_READ_LIST = /commits\/[^\s"']+\/check-runs\?[^\s"']*\bfilter=all\b[^\s"']*\bper_page=[0-9]+/;
+  const CHECK_RUNS_READ_ONE = /check-runs\/[^\s"'*]{1,}/;
 
   // ---- 轮十五：run 文本之外的四个面（YAML 的键 / env / 目录 / 命令词）----
   // 上面全部判据都建立在 run 文本上。下面四类东西**不在 run 文本里**，因此全部绿（审查实测）：
@@ -2194,11 +2426,16 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 只认**写**：第二条同名 Check Run 必须写出来才会盖掉真结论；读 checks 列表（merge-gate.yml
   // 这类就绪轮询）不产生结论。判据因此是「端点 + 写形态」，不是「端点」。
   const WORKFLOW_DIR = ".github/workflows";
-  const CHECK_RUNS_WRITE_HINT = /(?:--method[=\s]+POST\b|-X\s*POST\b|--input[=\s]|\s-f\s|\s--field[=\s]|\s-F\s)/;
+  // 写形态不止 POST：PATCH 改写**既有那条**（checks.update / PATCH check-runs/{id}）不新增记录、
+  // 不换 id，条数与 id 都看不出来，但内容变了 —— 它同样是结论写面。
+  const CHECK_RUNS_WRITE_HINT =
+    /(?:--method[=\s]+(?:POST|PATCH)\b|-X\s*(?:POST|PATCH)\b|--input[=\s]|\s-f\s|\s--field[=\s]|\s-F\s|\bPATCH\b)/;
 
   // REST 的 checks.create（octokit / github-script 的 github.rest.checks.create）与 REST 的
   // createCheckRun 是同一个写面，只是拼写藏在 `with: script:` 里。
-  const CHECKS_CREATE_CALL = /(?:\bchecks\s*\.\s*create|\bcreateCheckRun\b|\[\s*["']checks["']\s*\])/;
+  // checks.update / updateCheckRun / PATCH check-runs/{id} 是同一个写面的改写形态。
+  const CHECKS_CREATE_CALL =
+    /(?:\bchecks\s*\.\s*(?:create|update)|\b(?:create|update)CheckRun\b|\[\s*["']checks["']\s*\]|check-runs\s*\/\s*\{)/;
 
   // check-runs 端点在 audit.yml 内的合法形态只有两种：
   //   1) 那两步的 --input .audit/check-run.json POST；
@@ -2208,7 +2445,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     if (CHECK_RUNS_POST_STEPS.includes(name) && CHECK_RUNS_POST.test(text) && CHECK_RUNS_INPUT.test(text)) return true;
     return (
       CHECK_RUNS_READ_STEPS.includes(name) &&
-      CHECK_RUNS_READ.test(text) &&
+      (CHECK_RUNS_READ_LIST.test(text) || CHECK_RUNS_READ_ONE.test(text)) &&
       !CHECK_RUNS_WRITE_HINT.test(text) &&
       !CHECK_RUNS_INPUT.test(text)
     );
@@ -2609,7 +2846,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
             step: name,
             where,
             excerpt: line.trim(),
-            reason: "check-runs 只能是那两步的 --input POST，或自证步的 head_sha 回读",
+            reason: "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
           });
         }
         // 复制/替换写载体：写通道只能是产出那一行 —— 写者可以产出，但不能**替换**。
@@ -3480,7 +3717,7 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     expect(readGhLedger(dir)).toEqual([]);
     const spawned = spawnSync(
       "bash",
-      ["--noprofile", "--norc", "-eo", "pipefail", "-c", "cd sub && gh api repos/o/r/check-runs --method POST"],
+      ["--noprofile", "--norc", "-eo", "pipefail", "-c", "cd sub && gh api 'repos/o/r/commits/cafebabe/check-runs?filter=all'"],
       { cwd: dir, env: { PATH: bin + ":" + process.env.PATH, HOME: dir }, encoding: "utf8" },
     );
     expect(spawned.status, String(spawned.stderr)).toBe(0);
@@ -4213,7 +4450,7 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       run: "gh api repos/o/r/check-runs --method POST -f name=audit -f conclusion=success -f head_sha=deadbeef\n",
     };
     expect(auditDirReferenceViolations([direct], { root: dir }).map((v) => v.reason)).toEqual([
-      "check-runs 只能是那两步的 --input POST，或自证步的 head_sha 回读",
+      "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
     ]);
     // payload 先落到别的文件名再 --input 它：既碰未认领的 .audit 路径，也没绑 check-run.json。
     const aliased = {
@@ -4221,7 +4458,7 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       run: "gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/second.json\n",
     };
     expect(auditDirReferenceViolations([aliased], { root: dir }).map((v) => v.reason)).toEqual([
-      "check-runs 只能是那两步的 --input POST，或自证步的 head_sha 回读",
+      "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
       "未认领的 .audit 引用",
     ]);
     // 只读查询没有放行条件：这个端点在真 workflow 里只有回写一种用途，读它等于拿到产出面。
@@ -4265,6 +4502,8 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       "口径层判定",
       "结论兜底",
       "回写 Check Run",
+      // 自证步读它只为「内容比什么」：读的是本次 payload 的 conclusion，只读、不写。
+      "结论自证：回读 Check Run",
       "判不了：回写 INFRA",
     ]);
     expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
@@ -4396,14 +4635,14 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     const dir = mkdtempSync(join(tmpdir(), "audit-graphql-"));
     const gql = `curl -sS -X POST https://api.github.com/graphql -d '{"query":"mutation{createCheckRun(input:{conclusion:SUCCESS})}"}'\n`;
     expect(auditDirReferenceViolations([{ name: "插一步", run: gql }], { root: dir }).map((v) => v.reason)).toEqual([
-      "check-runs 只能是那两步的 --input POST，或自证步的 head_sha 回读",
+      "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
     ]);
     // gh api graphql 的等价写法同样命中：判据不认拼写，认面。
     expect(
       auditDirReferenceViolations([{ name: "插一步", run: "gh api graphql -f query='mutation{createCheckRun}'\n" }], {
         root: dir,
       }).map((v) => v.reason),
-    ).toEqual(["check-runs 只能是那两步的 --input POST，或自证步的 head_sha 回读"]);
+    ).toEqual(["check-runs 只能是那两步的 --input POST，或自证步的两次只读回读"]);
     // 面收了，sanctioned 规则没变：那两步的 --input POST 仍然放行。
     const sanctioned = steps.find((step) => step.name === "回写 Check Run");
     expect(sanctioned).toBeTruthy();
@@ -4826,21 +5065,114 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     // 判不了 / 管线挂了那一轮不许自证：那时没有「本步 POST 出去的那条」可比。
     expect(String(self.if)).toContain("always()");
     expect(String(self.if)).toContain("ok == '1'");
-    // 回读的是这个 sha 上的结论，比的是刚 POST 出去的 id（不是重新猜一条）。
-    expect(String(self.run)).toContain("check-runs?head_sha=");
+    // 回读的是这个 sha 上的结论（commits/<sha>/check-runs 形态 + 显式 filter=all&per_page=），
+    // 比的是刚 POST 出去的 id（不是重新猜一条），再比这一条的内容。
+    expect(String(self.run)).toContain('"repos/$GITHUB_REPOSITORY/commits/$AUDIT_SHA/check-runs?filter=all&per_page=100"');
     expect(String(self.run)).toContain("steps.post.outputs.check_run_id");
+    expect(String(self.run)).toContain('"repos/$GITHUB_REPOSITORY/check-runs/$expected"');
+    expect(String(self.run)).toContain(".app.slug");
+    expect(String(self.run)).toContain(".conclusion");
     // POST 步把 id 交出来，自证步才比得动。
     const post = steps.find((step) => step.name === "回写 Check Run");
     expect(post.id).toBe("post");
     expect(String(post.run)).toContain("check_run_id=");
     expect(String(post.run)).toContain("$GITHUB_OUTPUT");
     // 自证步是只读：没有任何写形态，也不碰载体。
-    expect(CHECK_RUNS_WRITE_HINT.test(String(self.run))).toBe(false);
+    // 判据按行判、且先剥 shell 注释：注释里提到 PATCH 不算写形态，命令行里有才算。
+    expect(
+      String(self.run)
+        .split(SH)
+        .map(stripShellComment)
+        .filter((line) => CHECK_RUNS_WRITE_HINT.test(line)),
+    ).toEqual([]);
     expect(auditDirReferenceViolations([self], { root: ROOT })).toEqual([]);
     // 反面对照：把同一个 run 换个名字，放行立刻消失 —— 放行绑的是这一步，不是这个端点。
-    expect(auditDirReferenceViolations([{ ...self, name: "别的步" }], { root: ROOT }).map((v) => v.step)).toEqual([
-      "别的步",
-    ]);
+    const renamed = auditDirReferenceViolations([{ ...self, name: "别的步" }], { root: ROOT });
+    expect(renamed.length).toBeGreaterThan(0);
+    expect(new Set(renamed.map((v) => v.step))).toEqual(new Set(["别的步"]));
+  });
+
+  it("轮十六-1：自证回读的形态被钉住 —— commits/<sha>/check-runs?filter=all&per_page= 与 check-runs/<id>", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-self-shape-"));
+    const self = steps.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self).toBeTruthy();
+    // 端点写回老形态（/check-runs?head_sha=）：这个端点不存在（实测 404），必须红。
+    expect(
+      auditDirReferenceViolations(
+        [
+          {
+            name: "结论自证：回读 Check Run",
+            run: 'gh api "repos/$GITHUB_REPOSITORY/check-runs?head_sha=$AUDIT_SHA" --paginate --slurp > "$runs_file"\n',
+          },
+        ],
+        { root: dir },
+      ).map((v) => v.reason),
+    ).toEqual(["check-runs 只能是那两步的 --input POST，或自证步的两次只读回读"]);
+    // 去掉 filter=all：默认 filter=latest 是按 name 去重的视图，「恰好一条」不许建在去重上。
+    expect(
+      auditDirReferenceViolations(
+        [
+          {
+            name: "结论自证：回读 Check Run",
+            run: 'gh api "repos/$GITHUB_REPOSITORY/commits/$AUDIT_SHA/check-runs?per_page=100" --paginate --slurp > "$runs_file"\n',
+          },
+        ],
+        { root: dir },
+      ),
+    ).toHaveLength(1);
+    // 内容回读仍必须只读：同一个端点带 PATCH 就是改写既有那条，放行立刻消失。
+    expect(
+      auditDirReferenceViolations(
+        [
+          {
+            name: "结论自证：回读 Check Run",
+            run: 'gh api "repos/$GITHUB_REPOSITORY/check-runs/4242" --method PATCH -f conclusion=success\n',
+          },
+        ],
+        { root: dir },
+      ),
+    ).toHaveLength(1);
+    // 正向对照：真实的两次只读回读都在放行里（判据不空转，也不误伤）。
+    expect(auditDirReferenceViolations([self], { root: ROOT })).toEqual([]);
+  });
+
+  it("轮十六-2：PATCH 改写既有那条也是结论写面 —— checks.update 与 PATCH check-runs/{id}", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-workflow-patch-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    // 实测形态：先 listForRef 拿 id，再 checks.update({conclusion:"success"})。不新增记录、不换 id，
+    // 只改既有那条的内容 —— 条数与 id 都看不出来，静态侧必须自己认这个拼写。
+    const peer = [
+      "name: peer",
+      "on: pull_request",
+      "jobs:",
+      "  peer:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - uses: actions/github-script@v7",
+      "        with:",
+      "          script: |",
+      '            const runs = await github.rest.checks.listForRef({ owner: "o", repo: "r", ref: "x" })',
+      '            await github.rest.checks.update({ owner: "o", repo: "r", check_run_id: runs.data.check_runs[0].id, conclusion: "success" })',
+      "",
+    ].join(SH);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer.yml"), peer);
+    const violations = workflowWriteSurfaceViolations({ root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["peer.yml"]);
+    expect(violations[0].reason).toContain("结论写面只允许 audit.yml");
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml", "peer.yml"]);
+    // 另外三种拼写：updateCheckRun / PATCH 直写 REST / -X PATCH。
+    for (const [label, script] of [
+      ["updateCheckRun", 'await updateCheckRun({ check_run_id: 1, conclusion: "success" })'],
+      ["PATCH REST", 'await github.request("PATCH /repos/{owner}/{repo}/check-runs/{id}", { conclusion: "success" })'],
+      ["-X PATCH", "gh api repos/o/r/check-runs/1 -X PATCH -f conclusion=success"],
+    ]) {
+      expect(checkRunWriteSurface(script), label).not.toBeNull();
+    }
+    // 反面对照：只读回读同一端点不红（自证步就是这么用的），真仓库仍然零违规。
+    expect(checkRunWriteSurface("gh api repos/o/r/check-runs/4242 --jq .conclusion")).toBeNull();
+    expect(checkRunWriteSurface("gh api 'repos/o/r/commits/cafebabe/check-runs?filter=all' --paginate --slurp")).toBeNull();
+    expect(workflowWriteSurfaceViolations()).toEqual([]);
   });
 });
 

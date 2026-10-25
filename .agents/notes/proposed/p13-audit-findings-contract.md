@@ -35,6 +35,7 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 - **不做「模型投票多数决」**：两个执行器不一致时，多数决在两个里根本没有多数。不一致就该被人看见，而不是被一个算术抹平。
 - **不做同步率的门限**：现在的样本量是 0，任何门限都是编的。先记录不一致，等真数据够了再谈门限。
+
 ## 落地记录（机制侧，P-14 真跑待办）
 
 - **交付**：`scripts/audit-findings.mjs`（428 行，零网络）、`.github/workflows/audit.yml`（job=Check 名 `audit`）、`tests/audit-findings.test.mjs`（38 例）、`scripts/README.md` 一行索引。
@@ -46,6 +47,7 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 - **触发面只有 `workflow_dispatch`（真 PR #8 抓到的设计错）**：起初挂 `pull_request`，本意是「诚实地说审计还没跑」。真 PR 上它立刻把 PR 自己挡死了——`merge-gate G3 checks FAIL E_CHECK_NOT_GREEN 不是绿的 1 项: audit completed/action_required`。一个只会 `action_required` 的 check，等于每次合并都被自己挡：那不是诚实，是结构性死锁，而且会训练人忽略红灯（正是本脚本要防的那种绿/红失效）。改为手动触发，P-14 接上真执行器再打开 `pull_request`，并用 `tests/audit-findings.test.mjs` 里钉住触发面的用例强制这个决定被重新看一遍。
 - **教训**：把「还没跑」表达成红 check，会立刻被门判成不绿——诚实要用对管道术语。没跑就该不产生 check，而不是产生一个永远红的 check。
 - **验收证据（我独立复跑）**：合法 `pass+pass` → `verdict=pass conclusion=success exit=0`；`pass+needs_revision` → `exit=1`；占位符 `model="unknown"` 与 schema 反例 → `exit=3`；`grep` 无网络调用；整仓 `npm run check` 12 files / 195 tests 全绿。
+
 ## 六、真跑准备（P-14 前半程，PR #10）
 
 **注入面**：`workflow_dispatch.inputs` 的 `pr`（必填）与 `findings_a` / `findings_b`（可选 JSON）。值只经 `env:` 进入脚本，run 块里没有任何承载输入的内联表达式——内联就是一次 shell 拼接，上游 JSON 里一个引号或命令替换就能改写这条命令。这条有反向用例：往 findings 里塞 `$(touch pwned-by-audit-input)`，断言沙箱里没有生成该文件。
@@ -70,12 +72,12 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 2. **判定退出码三个写者，口径必须一致**（`success -> 0` / `failure -> 1` / `action_required -> 0`）：① POST 出去的 `audit` Check Run 的 conclusion，是结论的唯一载体；② job 级 check `audit-runner` 的 exit code，是**冗余信号**，只回答「这个 job 有没有出逻辑故障」，所以 `action_required` 不给它染红——让它红，G3 就会把「未判过」读成「代码不合格」，同一事实两个写者互相矛盾；③ merge-gate G3 读到的 conclusion。三者「一致」的定义不是「都红」，而是「不会互相矛盾」。
 
    缺结论仍然不等于通过：口径层崩溃或未运行时，**结论兜底**补一条 `action_required`（写 `$GITHUB_STEP_SUMMARY` + `::error`）；「回写 Check Run」与「判不了：回写 INFRA」都加 `always()`，前置步骤红了照样写 Check Run；POST 失败不吞——那一步真红，因为「该留痕没留成」是一次真故障。
+
 3. **G3 分两档**：真失败 `{failure, timed_out, startup_failure, cancelled}` -> `E_CHECK_NOT_GREEN`（exit 1，文案「不是绿的 N 项」）；未判过 `{action_required, neutral, skipped, stale}` 以及枚举以外的 completed 结论 -> `E_CHECK_NOT_JUDGED`（exit 3，文案「N 项没有判过（不是判成不合格），未判过不允许合并」，逐项点名 `name(id) status/conclusion`）；两档同时存在时真失败优先（exit 1），但明细里两类分开数。既有的三条行为不动：自己不算进 required checks、同名取 id 最大、pending（未 completed）先判未就绪。未结 INFRA 记录（`E_INFRA_OPEN`）随之归「未判过」——两类 INFRA 都阻断合并，区别只在「是不是代码的问题」。
 
 **变异验证**：把 G3 的分类改回 `conclusion !== success` 一刀切，真失败档与两档并存两条用例必须红；把 `scripts/audit-slot.mjs` 的 realpath 入口改回字面比较，软链用例必须红（`exit 0` 但 `--out` 没写出来）。
 
 **验收证据**：`npm run check` 13 files / 204 tests 全绿；PR #10 上 `check / merge-gate / render / write` 四条真 check 全 pass，issue 被写者带到 `state:in-progress`。
-
 
 ## 七、轮二真 findings 与处置（同一个 PR，新 HEAD）
 
@@ -92,7 +94,6 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **教训**：变异测试的备份用 `cp`，不要用 `git checkout` 去还原一个**工作区里有未提交正修**的文件；我这么干过一次，把四处正修一起回滚了，只能重放 patch。
 
 **验收证据**：`npm run check` 13 files / 207 tests 全绿；`npx oxlint scripts tests` 0 warnings 0 errors（原本有 5 条，是我上一轮引入的空 fallback spread 与未使用导入）。
-
 
 > **这段曾被写错，轮四改正**：下面描述的是「有 Check Run、但与 job 级 check 分叉」。实情比它更糟——`checkout`/`node` 红时上下文步骤被隐式 `success()` 跳过，落点 sha 成了空串，gh 直接 422，**服务器上一条 Check Run 都写不出来**。那不是可接受的分叉，是「一条都没有」。已在轮四修成「落点为空退 `github.sha`、非空是硬断言」；下面这段只描述修好之后仍然存在的那部分。
 
@@ -143,12 +144,12 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **四组数我都自己量过（同一台机、同一夹具，`node -e` 里那段文本原样替换）**：
 
-| 提交 | 变异文本 | 结果 |
-| --- | --- | --- |
-| `53bddf2` | `fromCtx || ""`（语义：去掉回退） | **2 红**（2 failed / 60 passed，共 62） |
-| `53bddf2` | `fromCtx || ''`（字面破的：单引号闭合） | **5 红**（5 failed / 57 passed） |
-| `fc32fd6` | `fromCtx || ""` | **2 红**（2 failed / 63 passed，共 65） |
-| `fc32fd6` | `fromCtx || ''` | **4 红**，且日志里有 `SyntaxError: Unexpected token ';'` |
+| 提交      | 变异文本 | 结果 |
+| --------- | -------- | ---- |
+| `53bddf2` | `fromCtx |      | ""`（语义：去掉回退）       | **2 红**（2 failed / 60 passed，共 62）                  |
+| `53bddf2` | `fromCtx |      | ''`（字面破的：单引号闭合） | **5 红**（5 failed / 57 passed）                         |
+| `fc32fd6` | `fromCtx |      | ""`                         | **2 红**（2 failed / 63 passed，共 65）                  |
+| `fc32fd6` | `fromCtx |      | ''`                         | **4 红**，且日志里有 `SyntaxError: Unexpected token ';'` |
 
 所以「5 红 vs 2 红」不是两个环境，是**两个不同的变异**：review-a 报的「53bddf2 = 5、fc32fd6 = 4」这两个数，正是**字面破的那一版**在两个提交上的红数（与我上表逐格一致），只是被当成了「语义等价」的数。语义版在两个提交上都是 2。差值随提交变（5→4、2→2）的成因我可以确定一半、不确定一半：确定的是破文本让该 step 在写出 payload 之前就抛 `SyntaxError`，凡是需要 payload 的用例都红；不确定的是 `calls.log` ENOENT 那几条假红在两个提交上各占几条（`fc32fd6` 的 `existsSync` 修复消掉了它们，这是 5→4 里至少 1 条的来源）。不再往下拆：拆清楚也不改变结论，而继续拆就是拿预算换一个已定案的细节。
 
@@ -166,17 +167,17 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **被打出来的形态（全部我亲自变异复现）**：
 
-| 形态 | 插进 run 块后 |
-| --- | --- |
-| `node scripts/probe-bare`（无扩展名 CJS，node 照跑） | 77 全绿 |
-| `node scripts/wrapper.cjs`，内部 `spawnSync(process.execPath,["scripts/probe-read.mjs"])` | 77 全绿 |
-| `printf '%s' ' # '; node scripts/probe-read.mjs`（引号里的 `#`） | 77 全绿 |
-| `node scripts/probe-read.mjs;`（行尾分号） | 77 全绿 |
-| `/usr/bin/node scripts/probe-read.mjs` | 77 全绿 |
-| `bash -c "node scripts/probe-read.mjs"` | 77 全绿 |
-| `NODE_BIN=node; $NODE_BIN scripts/probe-read.mjs` | 77 全绿 |
-| `const key=["execu","tors"].join(""); r[key]`（拆词拼键） | 77 全绿 |
-| `node --require ./scripts/preload.cjs scripts/probe-read.mjs` | **1 红**（不是全绿，见下） |
+| 形态                                                                                      | 插进 run 块后              |
+| ----------------------------------------------------------------------------------------- | -------------------------- |
+| `node scripts/probe-bare`（无扩展名 CJS，node 照跑）                                      | 77 全绿                    |
+| `node scripts/wrapper.cjs`，内部 `spawnSync(process.execPath,["scripts/probe-read.mjs"])` | 77 全绿                    |
+| `printf '%s' ' # '; node scripts/probe-read.mjs`（引号里的 `#`）                          | 77 全绿                    |
+| `node scripts/probe-read.mjs;`（行尾分号）                                                | 77 全绿                    |
+| `/usr/bin/node scripts/probe-read.mjs`                                                    | 77 全绿                    |
+| `bash -c "node scripts/probe-read.mjs"`                                                   | 77 全绿                    |
+| `NODE_BIN=node; $NODE_BIN scripts/probe-read.mjs`                                         | 77 全绿                    |
+| `const key=["execu","tors"].join(""); r[key]`（拆词拼键）                                 | 77 全绿                    |
+| `node --require ./scripts/preload.cjs scripts/probe-read.mjs`                             | **1 红**（不是全绿，见下） |
 
 **修法的原则（比任一条修法都重要）**：**「跟不下去」必须变成响，不能变成静默。** 连续八轮里同一类缺陷反复出现，根因不是某个正则写错，而是「每种我不认识的写法都被默默丢弃」，于是判据越修越像、绕过面永远存在。所以认识不了的形态一律记进会被断言为空的清单（`missing` / `unfollowable`），让未知写法立刻红；**不做静态求值去猜它拼出了什么**。
 
@@ -210,18 +211,17 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **仍然未纳入（诚实）**：`with` 里用表达式拼出的脚本路径；跨载荷（env 只有路径、解析动作在另一个 step）；被拆开的路径字面量；绝对路径调脚本与裸模块名 import；白名单外的官方 action（如 `actions/cache`）会红——这是刻意方向（未知要响），风险由名单处注释说明。
 
-
 ### 轮十：放行单位错了一层——「谁写过」不等于「谁在读」，载体漏了 `shell:` 与 job 级
 
 轮九把「放行单位」从文件收到步，方向对了，但**收得还不够**：步内只放行**一次**读才是正确粒度，整步放行等于让唯一能藏第二份口径层的位置（writer 步）免检。同一轮还暴露出载体清单按「step 里的哪个键」去想，漏掉了两个同族键。
 
 **两家的真绕过（我独立复现，均在 `1819b0a` 的隔离副本上）**
 
-| 缺陷 | 变异 | 旧判据 | 后果 |
-| --- | --- | --- | --- |
-| 豁免单位=整步（high） | 兜底步的读之后再挂一次 `Object.entries(read(".audit/result.json"))` 打 key/value（零字段名） | 87 全绿 | 读者排在兜底补写之后、成功路径也照跑，推翻「解引用字段的读者只有口径层一处、且排在兜底之前」 |
-| `step.shell` 不在载荷集（high） | 新步 `shell: bash -c 'node scripts/probe-read.mjs' {0}` + `run: \| echo done` | 87 全绿（连 `unfollowable` 都不进） | 命令由 shell 字段本身携带，该字段零扫描 |
-| job 级 `env` / job `defaults.run.shell` 不在扫描面（high） | job env `NODE_OPTIONS: --require ./scripts/probe-env.cjs`（模块内读 result.json） | 87 全绿 | 它在 GitHub 里对 job 内每次 node 启动生效，与 step env 执行面等价，只是语法位置不同 |
+| 缺陷                                                       | 变异                                                                                         | 旧判据                              | 后果                                                                                         |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------- |
+| 豁免单位=整步（high）                                      | 兜底步的读之后再挂一次 `Object.entries(read(".audit/result.json"))` 打 key/value（零字段名） | 87 全绿                             | 读者排在兜底补写之后、成功路径也照跑，推翻「解引用字段的读者只有口径层一处、且排在兜底之前」 |
+| `step.shell` 不在载荷集（high）                            | 新步 `shell: bash -c 'node scripts/probe-read.mjs' {0}` + `run: \| echo done`                | 87 全绿（连 `unfollowable` 都不进） | 命令由 shell 字段本身携带，该字段零扫描                                                      |
+| job 级 `env` / job `defaults.run.shell` 不在扫描面（high） | job env `NODE_OPTIONS: --require ./scripts/probe-env.cjs`（模块内读 result.json）            | 87 全绿                             | 它在 GitHub 里对 job 内每次 node 启动生效，与 step env 执行面等价，只是语法位置不同          |
 
 **修法（`tests/audit-findings.test.mjs`，92 例）**：`resultJsonReaderViolations`(:1604) 重写——豁免单位从「整步」改成「一次读」（writer 步只放行第一次读，`reads.slice(1)` 全报），配套 `resultJsonReads`(:1548) 按行计数不去重、`RESULT_JSON_PATH_CALL`(:1544) 让 `read(".audit/result.json")` 这种把路径当实参的写法也被数成一次、`wholeResultEnumerations`(:1565) 禁 writer 步对整份 result 做 `Object.entries/keys/values` 与 `JSON.stringify`（整体枚举 = 一次读就拿到全部字段，按读次数放行会漏）；载体侧新增 `jobPayloads`(:1258，job.env.* / doc.env.* / defaults.run.shell) 与 `scanShellField`(:1189，按 custom shell 的 `command [options] {0}` 语义解，两层 `bash -c` 内递归，更深落 `unfollowable{kind:"shell-c"}` 而不是静默)，`payloadScriptRefs`(:1272) 去重合并（否则 `--require` 两路各算一条会误报）。
 
@@ -235,12 +235,12 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 轮十把豁免单位从「整步」收到「一次读」，方向对；轮十一两家各自证明**收口位置错了一层**：写形态按**整行原始文本**判，载体按「flag 前面必须有空白」认。
 
-| 缺陷 | 变异 | 轮十后 | 根因 |
-| --- | --- | --- | --- |
-| 写豁免按行判（high） | 口径层写入那一行行尾追加一次真读 | 0 红 | `RESULT_JSON_WRITE.some(re => re.test(line)) → continue` 判「行里有没有写的样子」，不是「这一行是不是纯写」 |
-| 注释可洗白（high） | 同上再加尾注释 `# 上游写者：--out .audit/result.json` | 0 红（删注释则 2 红，红绿只差四个字） | 写形态不剥 shell 注释 |
-| `--require=./x.cjs` 等号形态（high） | 新步 `run: NODE_OPTIONS=--require=./scripts/probe-env.cjs node -e …` | 0 红（换成空格则 2 红） | `LOADER_FLAG_VALUE` 前缀要求行首/空白/引号，`=` 不是起点；取值也不认 `flag=value` 拼写 |
-| `job.container.env`（medium） | `container: { env: { NODE_OPTIONS: --require … } }` | 0 红 | `jobPayloads` 只收 `job.env.*` / `doc.env.*` / `defaults.run.shell` |
+| 缺陷                                 | 变异                                                                 | 轮十后                                | 根因                                                                                                        |
+| ------------------------------------ | -------------------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 写豁免按行判（high）                 | 口径层写入那一行行尾追加一次真读                                     | 0 红                                  | `RESULT_JSON_WRITE.some(re => re.test(line)) → continue` 判「行里有没有写的样子」，不是「这一行是不是纯写」 |
+| 注释可洗白（high）                   | 同上再加尾注释 `# 上游写者：--out .audit/result.json`                | 0 红（删注释则 2 红，红绿只差四个字） | 写形态不剥 shell 注释                                                                                       |
+| `--require=./x.cjs` 等号形态（high） | 新步 `run: NODE_OPTIONS=--require=./scripts/probe-env.cjs node -e …` | 0 红（换成空格则 2 红）               | `LOADER_FLAG_VALUE` 前缀要求行首/空白/引号，`=` 不是起点；取值也不认 `flag=value` 拼写                      |
+| `job.container.env`（medium）        | `container: { env: { NODE_OPTIONS: --require … } }`                  | 0 红                                  | `jobPayloads` 只收 `job.env.*` / `doc.env.*` / `defaults.run.shell`                                         |
 
 **修法（`tests/audit-findings.test.mjs`，92→98 例）**：读改成按**调用**计数（`resultJsonReadCalls`:1560，`readFileSync`/`readFile`/`createReadStream`/`jq`/非写名单的 `callee("…result.json")` 各算一次，同一行两次读就是两条）；写豁免降到调用级（`resultJsonReads`:1615 给每条读标 `onWriteLine`，:1702 `exempt = reads.findIndex(r => !r.onWriteLine)` 只把「不在写行上的第一次读」当合法额度）；写形态改由 `hasResultJsonWrite`:1584 逐行 `stripShellComment` 后判（注释不再生产写形态）；整体枚举补 `WHOLE_DUMP_CALL`:1634（`console.log/info/debug/warn/dir/table`、`process.stdout.write(标识符)`）并对**所有**步生效（原来非写者分支直接 `continue`，`wholeResultEnumerations` 对非写者步是死代码）；`LOADER_FLAG_VALUE`:1305 前缀改 `(?<![\w-])`、取值认 `=` 与 `\s+` 两种，取不到落 `loader-no-value`、含变量落 `loader-dynamic`。载体侧 `jobPayloads` 补 `job.container.env.KEY` 与 `job.container.options`。
 
@@ -254,17 +254,18 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 轮十一把读的计价单位从「行」收到「调用」，但**计价仍然靠枚举调用拼写**（`\breadFileSync\s*\(`、标识符紧邻 `(`）。两家执行器各自证明：换一种等价拼写就完全不计价。
 
-| 变异 | 轮十一后 | 说明 |
-| --- | --- | --- |
-| `fs["readFileSync"](".audit/result.json", …)` 走 `node -e` | **0 红**（我自己复现，98 passed） | 方括号字符串索引不匹配点号形态的正则；同行无 `JSON.parse` 故兜底不补 |
-| 同一行改回点号 | 3 红 | 红绿只差一个 `.` 与 `["…"]` |
-| 读者写进 `scripts/x.cjs`（`raw.includes("verdict")` 只做分支，不 dump 不 parse），step 只写 `node scripts/x.cjs` | **0 红** | 被引用脚本的内容没有走同一套判定 |
-| `fs["writeFileSync"](".audit/result.json", …)` 改写结论 | 0 判据红 | 写形态同样按字面点号枚举，既不成写者也不触发写形态 |
-| `echo "--out .audit/result.json"` 造伪写者步 | 3 红，但靠 `resultJsonWriterSteps` 整集等值断言兜着 | `hasResultJsonWrite` 不掩字符串字面量 |
+| 变异                                                                                                             | 轮十一后                                            | 说明                                                                 |
+| ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------- |
+| `fs["readFileSync"](".audit/result.json", …)` 走 `node -e`                                                       | **0 红**（我自己复现，98 passed）                   | 方括号字符串索引不匹配点号形态的正则；同行无 `JSON.parse` 故兜底不补 |
+| 同一行改回点号                                                                                                   | 3 红                                                | 红绿只差一个 `.` 与 `["…"]`                                          |
+| 读者写进 `scripts/x.cjs`（`raw.includes("verdict")` 只做分支，不 dump 不 parse），step 只写 `node scripts/x.cjs` | **0 红**                                            | 被引用脚本的内容没有走同一套判定                                     |
+| `fs["writeFileSync"](".audit/result.json", …)` 改写结论                                                          | 0 判据红                                            | 写形态同样按字面点号枚举，既不成写者也不触发写形态                   |
+| `echo "--out .audit/result.json"` 造伪写者步                                                                     | 3 红，但靠 `resultJsonWriterSteps` 整集等值断言兜着 | `hasResultJsonWrite` 不掩字符串字面量                                |
 
 **根因判断（我定的方向）**：判据的**默认方向**决定它拦不拦得住人，**枚举**决定它多久被绕过一次。每补一种拼写就是给对手一张「还差哪几种」的清单（计算属性、`.call`、别名、`util.promisify` 都能再生）。所以不再补拼写。
 
 **新结构（`tests/audit-findings.test.mjs`，98→103 例）**：
+
 - **默认拒绝**：任一行（掩掉字符串字面量后）出现 `result.json` 路径或 `.audit/*.json` 通配即算「引用」；非写者步的引用默认 violation，不再需要先「认出一次读调用」。整行注释不计，行尾注释照计。
 - **白名单（显式且最小）**：只放行「纯文本倒出」——`cat <该文件>`（可 `2>/dev/null`、`|| true`、可 `$(...)` 赋值给变量）与该变量随后 `echo`/`printf` 原样输出、`[[ ]]/test` 比较。附带 FORBIDDEN 名单（`jq` / `JSON.parse` / `Object.keys|entries|values` / `node|python|perl|ruby` / `sed|awk|cut|tee|dd|grep|head|tail|xargs|exec|eval|source|base64|openssl|curl|wget|nc`）与真管道一律 violation。
 - **写侧默认拒绝**：写者 = 引用 + 写意图（写族名字出现，含计算属性 `["writeFileSync"]`、`--out`）。判写形态前先掩字符串，`echo "--out …"` 造不出伪写者。写者步仍只给一次纯读额度。
@@ -275,21 +276,24 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **仍未覆盖（诚实登记）**：拆分/变量拼路径（`"res"+"ult.json"`）、Base64 后倒出、`cat $(echo .audit/result.json)` 这类动态取值（不跟踪，也不落 `unfollowable`）；白名单允许 `echo`/`printf` 把原文本重定向到别处（只禁管道与加工）；别名仅在同一段文本内有效，跨 step 借变量不跟踪。
 
 **白名单是新的绕过面，不是安全区**：每一条放行都必须在报告里带理由，且「把 `cat` 换成 `sed`/`tee`/`dd`/`while read`」必须落 violation 而不是静默放行——这一点已用 8 条反例钉住。
+
 ### 轮十三：判据的坐标从「文本像不像」抬到「执行会发生在哪」
 
 两家都判 needs_revision，7 条，但根因是一句话（review-b 自己写的）：**引用是按「字符串/文件名」认的，而执行是按「文件」发生的**。
 
 **A 组（review-a）——载体与执行层各有一个盲区**：
-| # | 缺口 | 实测 |
-| --- | --- | --- |
-| 1 | 我们守了十二轮的 `.audit/result.json` 不是真正的结论载体；`.audit/check-run.json` 零写者白名单，最强断言只是 `writers.length >= 2`（只有下限、无上限） | 一个**无 name 的步**把它改写成 `conclusion=success` → 103 全绿；另一个无 name 步直接 `gh api .../check-runs --method POST -f conclusion=success`（绕开 `--input` 与 `$GITHUB_REPOSITORY`）→ 也全绿 |
-| 2 | 行为 runner `if (!step.run || !step.name) continue;`：GitHub 上 step name 可选、照常执行，唯一真跑 bash 看 payload 的那层对匿名步失明 | 对照：无 name 步 `jq -r .verdict .audit/result.json` → 3 红，说明匿名步静态扫描照抓，缺口只在「载体零判据 + 行为层漏跑」 |
+
+| #   | 缺口                                                                                                                                                   | 实测                                                                                                                                                                                               |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 我们守了十二轮的 `.audit/result.json` 不是真正的结论载体；`.audit/check-run.json` 零写者白名单，最强断言只是 `writers.length >= 2`（只有下限、无上限） | 一个**无 name 的步**把它改写成 `conclusion=success` → 103 全绿；另一个无 name 步直接 `gh api .../check-runs --method POST -f conclusion=success`（绕开 `--input` 与 `$GITHUB_REPOSITORY`）→ 也全绿 |
+| 2   | 行为 runner `if (!step.run                                                                                                                             |                                                                                                                                                                                                    | !step.name) continue;`：GitHub 上 step name 可选、照常执行，唯一真跑 bash 看 payload 的那层对匿名步失明 | 对照：无 name 步 `jq -r .verdict .audit/result.json` → 3 红，说明匿名步静态扫描照抓，缺口只在「载体零判据 + 行为层漏跑」 |
 
 **B 组（review-b）——引用判据绑在文件名上，五种等价写法全绿**：`grep -rq needs_revision .audit`（父目录不带 `*`，递归读走）、`tar -cf /tmp/x.tar .audit`、`.audit/result.jso?`（`?` glob 同样命中）、`cp -a .audit /tmp/leakdir` 后按别名读（实测打出 `"needs_revision"`）、非写者步 `[[ "$body" == *needs_revision* ]]`（白名单第 3 条只做比较、不限内容）。
 
 **还有一条 low，但它说的是最要紧的事**：那时「`missing`/`unfollowable` 必须为空」实际等于「不许出现 `-r` 这个字」——`jq -r`、`grep -r` 靠**误报**落红，`-rq`/`-rc` 立刻变绿。**红是因为拼写，不是因为引用**，这就是「覆盖真相被噪音掩盖」。
 
 **新结构（`tests/audit-findings.test.mjs`，103→110 例，441 expect，0 条 `expect/it` 删除）**：
+
 - **引用抬到目录级**：整行注释之外的原始文本（**不掩字符串**——路径通常就在引号里）出现 `.audit` 即算引用（`AUDIT_DIR_REF`:1975）。父目录、`?` glob、`tar`/`cp` 搬运因此在**同一条规则**下落红，不需要再枚举拼写。
 - **载体参数化**：`carrierSpec(file)`:1583 + `CARRIERS`:1603（`result.json` / `check-run.json`），`resultJsonWriterSteps`:1822 与 `resultJsonReaderViolations`:1903 接 `options.carrier`。每个载体的写者集合用 `toEqual` 精确断言：`result.json → ["口径层判定","结论兜底"]`、`check-run.json → ["口径层判定","结论兜底","判不了：回写 INFRA"]`、`review-a.json → ["落盘 review-a"]`、`review-b.json → ["落盘 review-b"]`；`mkdir -p .audit` 单独放行且**不算写者**；其余任何 `.audit` 路径一律「未认领的 .audit 引用」violation。
 - **POST 面收口**：任何一步出现 `check-runs` 且不是那两步 `--input .audit/check-run.json` 的 POST → violation（`CHECK_RUNS_*`:1997-2000）。只读查询一律判红，将来要放行需显式白名单。
@@ -302,6 +306,7 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **第一次复核我自己的探针又坏了**：`lines[:i]+new+lines[i+1:]` 把 `- name: INFRA 留痕` 那行**删掉**了，于是那个 step 变成无名步 → `requireStepName` 在用例计数前就抛 → vitest 报 `Tests no tests`。**这恰好演示了 fail-closed 生效**，但红/绿判断失效。教训与之前同一族：插入必须 `lines[:i]+new+lines[i:]`，看到 `Tests no tests` 一律先怀疑探针。
 
 **仍未覆盖（执行器登记，我认可）**：变量拼出的路径（`dir=.audit; grep -rq x "$dir"`）静态不可解；`join(".audit","check-run.json")` 这类拼接会被判成「未认领引用」而不是「该载体写者」（误红方向安全，不漏）；`EP=check-runs` 经变量拼端点可绕字面判据；`uses:` composite action 内部行为不进扫描面（沿用 `ALLOWED_USES`）；POST 面只读查询被故意一律判红。
+
 ### 轮十四：判据要覆盖「执行坐标」（cwd、写通道、结论写面、认不出的通配）
 
 两家共 4 条 + 我复核时补 1 条，7 条里 5 条独立成项。全部「未登记且能真执行」。
@@ -309,9 +314,10 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **A. `working-directory` 不在扫描面（high）**：`stepPayloads` 只收 run/shell/with/env（:1265），`jobPayloads` 只收 env/container/defaults.run.shell（:1288）。插一步 `working-directory: .audit` + `run: jq -r '.conclusion' check-run.json` → **110 全绿**；同一行写全 `.audit/check-run.json`、去掉那个键 → 2 红。**红绿只差一个 YAML 键**。cwd 搬进 `.audit` 后 run 里连一次 `.audit` 都不出现，目录级闸门整层失明。
 
 **B. 覆盖载体的写命令不算写意图（medium，后果 high）**：写意图只认 `--out`/`>`/`>>`/`writeFile*`。我的两版实测（这是本轮最有价值的一次校准）：
+
 - 无条件 `cp /tmp/pwn.json .audit/check-run.json` 塞进写者步 → **9 红**（行为层 payload 断言咬住）；
 - 改成 `[ "$GITHUB_ACTOR" = "attacker" ] && cp …; true` → **110 全绿**。
-即行为层只在夹具**真**被写坏时才咬，加一个条件分叉就绕过；静态写面必须自己认 `cp/tee/install/mv/ln/dd of=/rsync`。
+  即行为层只在夹具**真**被写坏时才咬，加一个条件分叉就绕过；静态写面必须自己认 `cp/tee/install/mv/ln/dd of=/rsync`。
 
 **C. 结论写面还有第二条（high）**：POST 收口 token 只是 `/\bcheck-runs\b/`，GraphQL `createCheckRun` 不含这个词 → 插 `curl -X POST https://api.github.com/graphql -d '{"query":"mutation{createCheckRun(…conclusion:SUCCESS)}"}'` → 110 全绿；token 权限本就含 `checks:write`，能再造一条同名 Check Run 覆盖门读到的结论。
 
@@ -320,6 +326,7 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **E. 短旗标的值被当模块名（low，噪音）**：`jq -r .verdict …` 落 `scripts.missing=['.verdict']`，红得莫名其妙（去掉 `-r` 就 0 红）。又一次「红在拼写上」。
 
 **修复（`tests/audit-findings.test.mjs` 110→115 例，342+/6-，0 条 expect/it 删除）**：
+
 - `working-directory` 进载荷面（step 级 + `defaults.run.working-directory` 两级），`normalizeWorkingDirectory`:1325 把 `.audit`/`./.audit`/`.audit/`/`.audit/.` 归一；cwd 是 `.audit` 时 `bareCarrierPaths`:2073 把裸载体名解析回 `.audit/<name>` 参与判定。
 - `COPY_WRITE_COMMANDS`:2087 + `copyWriteTargets`:2089（含 `dd of=`、`-t/--target-directory`）并入写目标 → 写者集合归属；写面违例 reason「载体的写通道只能是产出那一行（cp/tee/install 不是产出）」。
 - `CHECK_RUNS_ENDPOINT`:2037 扩为 `/\bcheck-runs\b|\bcreateCheckRun\b|\/graphql\b/`，sanctioned 规则不变（仍只有那两步 `--input .audit/check-run.json`）。
@@ -331,6 +338,7 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **仍未覆盖（登记，我认可）**：变量中转后再落盘、python/perl 一行写文件、`curl -o`；通配判据偏保守（任何 `*.json` 通配都红，`/tmp/*.json` 会误报）；GraphQL 只钉字面端点（自建代理中转不可见）；job 级 `defaults.run.working-directory` 的 cwd 只影响引用判定、不影响写者归属。
 
 **到这一轮的判断**：判据已从「文本像不像」走到「执行发生在哪个坐标」，剩下的洞开始集中在**进程边界之后**（解释器一行写文件、变量中转）。那是静态分析追不到的地方，再往下修等于写半个解释器——这是我的止损线，下一轮若仍在本层出新洞，我会带止损判断请人定。
+
 ## 十二、轮十五：判据开始看见「执行坐标」，但这层是开放集
 
 **这一轮两家找到的 5 条有一个共同形态**：YAML 与命令行里**没有一段文本是坏的**，但红绿被改掉了。
@@ -348,6 +356,7 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **F. 按内容落盘整类（high，review-a）**：`tar -xf .github/audit-fixture.tar -C .` → 0 红，本地实跑把 `.audit/check-run.json` 由 `conclusion=failure` 改成 `success`；`unzip -o`/`cpio -id`/`patch -p1 -i`/`git apply` 同族。命令行里一个路径都没有，写者集合与写面判据双双失明。review-a 问过它与已登记的 `curl -o` 是否同族——**我判为不同族**（那是下载，这是解包/打补丁改工作树），按未登记处理。
 
 **修复（`tests/audit-findings.test.mjs` 115→127 例，+621/−0，0 条 expect/it 删除；执行器 `ffdd8922`）**：
+
 - `STEP_ALLOWED_KEYS`:2050 / `JOB_ALLOWED_KEYS`:2052 → `unknownKeyViolations`:2072、`stepKeyViolations`:2087、`jobKeyViolations`:2097：**未知键即 violation**（fail-closed），`continue-on-error` 不在白名单里，另加三步显式断言为 undefined。
 - `ENV_OVERRIDE_FORBIDDEN`:2105 + `stepEnvOverrideViolations`:2114：step env 不得覆写 job/workflow 级同名键，也不得碰 `GITHUB_REPOSITORY/GITHUB_TOKEN/GH_TOKEN/GITHUB_OUTPUT/GITHUB_STEP_SUMMARY/GITHUB_SHA`。
 - `CHECK_RUNS_WRITE_HINT`:2138 + `checkRunWriteSurface`:2140 + `workflowFiles`:2149 + `workflowWriteSurfaceViolations`:2170：扫描面从单文件扩到 `.github/workflows/*.ya?ml`，结论写面只允许 `audit.yml`。
@@ -356,17 +365,18 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 - `contentLandingCommands`:2309：`tar -x/-xf/--extract`、`unzip`、`cpio -i*`、`patch`、`git apply/restore/checkout -- <path>` 在非白名单步 → violation「按内容落盘」；`tar -cf` 打包**不**算。
 
 **我的独立复核（七组变异，`/tmp/vrf-r15` 副本，先 `yaml.parse` 验过再跑）**：
-| 变异 | 结果 |
-| --- | --- |
-| 基线（`mut none`） | 127 passed |
-| `peer.yml` gh api POST 同名 check | 2 红 |
-| `continue-on-error: true` 插步 | 2 红 |
-| step `env: GITHUB_REPOSITORY` | 1 红 |
-| `grep -rn needs_revision .` | 6 红 |
-| `find -exec cp` | 8 红 |
-| `tar -xf` | 6 红 |
-| `find -exec sh -c 'cp …'`（执行器登记为残余） | **8 红**（一层 `sh -c` 被我实测咬住，残余比登记的小） |
-| `peer.yml` + `actions/github-script` 里 `github.rest.checks.create({name:"audit",conclusion:"success"})` | **127 全绿——真残余，未关闭** |
+
+| 变异                                                                                                     | 结果                                                  |
+| -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| 基线（`mut none`）                                                                                       | 127 passed                                            |
+| `peer.yml` gh api POST 同名 check                                                                        | 2 红                                                  |
+| `continue-on-error: true` 插步                                                                           | 2 红                                                  |
+| step `env: GITHUB_REPOSITORY`                                                                            | 1 红                                                  |
+| `grep -rn needs_revision .`                                                                              | 6 红                                                  |
+| `find -exec cp`                                                                                          | 8 红                                                  |
+| `tar -xf`                                                                                                | 6 红                                                  |
+| `find -exec sh -c 'cp …'`（执行器登记为残余）                                                            | **8 红**（一层 `sh -c` 被我实测咬住，残余比登记的小） |
+| `peer.yml` + `actions/github-script` 里 `github.rest.checks.create({name:"audit",conclusion:"success"})` | **127 全绿——真残余，未关闭**                          |
 
 **探针第四次坏**：`mut.mjs` 在 `peer.yml` 不存在时无条件 `readFileSync` 抛 ENOENT，而 shell 用 `&&` 串起来 → vitest 根本没跑、输出为空，看起来像「没红」。固定动作补一条：**变异脚本自身失败必须显式打印**，输出为空一律先怀疑探针。
 
@@ -374,3 +384,66 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **这一轮的判断（写给下一个读的人）**：判据已经从「文本像不像」走到「执行发生在哪个坐标」，而**坐标是开放集**——每修一条就是给对手一张「还差哪几种」的清单。剩余洞的性质是一致的：**静态层列举不完执行形态**。要根治只能换观测点（回读本 sha 上 `name=audit` 的 Check Run 恰好 1 条且由本次 run 创建），而不是继续枚举。
 
+## 十三、轮七～轮十四：同一根病，八个变体（补记）
+
+> 这几轮的处置只落在提交信息与测试里，note 没跟上。补记的目的不是复述细节，
+> 而是留下「每条洞属于哪一类、修法把判据往前推到了哪」的线索；细节看提交与测试函数。
+
+| 轮   | 审查者找到的关键绕过                                                                                             | 修法（把判据推到哪）                                                                                                                        | 提交      |
+| ---- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| 七   | `node "scripts/x.mjs"` 双引号、反斜杠续行、`import "./x.mjs"` wrapper、账本写 `$PWD`                             | 引号两侧都剥、跟静态 import（深度 3）、账本写死绝对路径、解引用按剥后文本判                                                                 | `fdfa77a` |
+| 八   | `node --require …`、行尾分号、`/usr/bin/node`、`bash -c "node …"`、`$NODE_BIN`、`["execu","tors"].join("")`      | `shellWords`/`parseNodeCommand`/`resolveScriptRef`、拆词键识别、跟不下去落 `unfollowable`                                                   | `1f4767b` |
+| 九   | `uses: actions/github-script` 的 `with.script`、composite、`env: NODE_OPTIONS=--require`                         | 扫描面从 `step.run` 扩到 run + with.* + env.*（载体带来源名）；`result.json` 读者改行为判据（同一段被执行文本同时出现路径与解析形态即读者） | `1819b0a` |
+| 十   | writer 步「整步豁免」可挂任意读者、`step.shell`、job 级 `env`、`defaults.run.shell`                              | 豁免收到「一次读」；`jobPayloads` 与 `stepPayloads` 并列；custom shell 按 `bash -c` 递归解                                                  | `b8210ab` |
+| 十一 | 写豁免按整行原文、行尾注释洗白读、`--require=./x.cjs` 等号、`container.env`                                      | 读写都降到「调用级」计数、判写形态前剥注释、loader 取值认 `=` 与空白、容器载体入面                                                          | `c6f9e60` |
+| 十二 | `fs["readFileSync"]`、别名、`.cjs` 里方括号读只做分支                                                            | **不再枚举拼写**：出现 `.audit/*.json` 路径即「引用」，非写者步默认 violation，白名单只放行 `cat`/`echo` 纯文本倒出                         | `eb07be5` |
+| 十三 | `.audit/check-run.json` 零写者白名单（最强断言只 `length >= 2`）、匿名 step 被行为层静默跳过                     | 载体参数化（四个载体各自 `toEqual` 写者集合）、引用抬到目录级、`requireStepName` 在入口抛                                                   | `4c35a4d` |
+| 十四 | `working-directory: .audit` + 裸文件名读、`cp/tee/install` 写通道、GraphQL `createCheckRun`、目录段+文件名双通配 | `bareCarrierPaths`、`copyWriteTargets`、`CHECK_RUNS_ENDPOINT` 加 graphql、通配认不出也必须响                                                | `2e4e4b9` |
+
+**八轮同一根病**：判据默认方向是「先证明它像读者/写者」（允许式），而攻击面是开放集；每补一种拼写就是给对手一张「还差哪几种」的清单。转折点是轮十二：改成**默认拒绝 + 白名单放行**，从此新增形态默认落红，只有显式放行的纯文本倒出能过。
+
+**两个反复出现的流程缺陷（不是代码缺陷）**：
+
+1. **变异探针自身会坏**，坏法已见四种：锚点不命中（文件没改却显示全绿）、引号提前闭合（`node -e '…'
+里 `|| ''`让 JS 变`SyntaxError`）、YAML 插坏（`All mapping items must start at the same column`）、
+变异脚本 `readFileSync`抛 ENOENT 被`&&`短路（vitest 根本没跑，输出为空）。固定动作：先`yaml.parse`验可解析、
+打印改后那一行、看到`Tests no tests` 或空输出**一律先怀疑探针**。
+2. **审查执行器必须 `cp -a` 到 `/tmp` 隔离副本做变异，真仓库只读**——前几轮两家同副本互相踩过。
+
+**判断句**：这十四轮的净收益不是「审完了」，而是判据的观测点从「文本像不像」走到了「执行坐标」（cwd、载体、写通道）；再往后剩的洞都在**进程边界之后**（包装器内部的读），静态分析追不到，追杀等于写半个解释器。
+
+## 十四、轮十六：自证从「是谁」走到「写着什么」
+
+**背景**：轮十五的止损决策（m01807 用户委托「接着做」，按推荐项 A 执行）是把观测点从静态判据换到运行时自证——`audit.yml` 末步回读本 sha 上 `name=audit` 的 Check Run，要求与刚 POST 的那条一致。第一版（`31798fd`）只比了「条数与 id」。
+
+**轮十六两家（review-a `abd697b1` / review-b `45087a9e`，审 `31798fd`）都判 needs_revision**：
+
+| #   | 严重度 | 位置            | 问题                                                                                                                  | 我本人复核                             |
+| --- | ------ | --------------- | --------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| F1  | high   | `audit.yml:290` | `gh api … --slurp --jq` 同现 → `the --slurp option is not supported with --jq or --template`，请求都不发              | 真 gh 2.102.0 复现，打印 Usage         |
+| F2  | high   | 同上            | `GET /repos/{o}/{r}/check-runs?head_sha=` 回 `{"message":"Not Found"}`；真端点是 `commits/{ref}/check-runs`           | 真 sha 实测：404 / 真端点回 4 条       |
+| F3  | medium | `tests:545`     | 假 gh 吞掉 `--jq/--paginate/--slurp`、不校验 path、直接回「已过滤好」数组 → 端点/分页/形状四点均不可观测              | 这就是 F1/F2 能在 132 全绿里上线的机制 |
+| F4  | low    | 自证步          | `expected` 空串靠短路兜（fail-closed 但无用例钉住）                                                                   | 成立                                   |
+| F5  | high   | `audit.yml:290` | `PATCH check-runs/{id}` / `checks.update` 改写**既有那条**：不新增、不换 id，条数与 id 都看不见；静态侧只认 POST 形态 | 两种写法各 132 全绿                    |
+
+**修法**（执行器 `fb012bbb` 起手，额度用尽后我接手补完）：
+
+- **端点与取数**：改 `commits/$AUDIT_SHA/check-runs?filter=all&per_page=100`（`filter=all` 必须显式写：默认 `filter=latest` 是按 name 去重后的视图，「恰好一条」不能建在默认去重上）；去 `--jq`，`--paginate --slurp` 落 `mktemp` 文件交给 node（真仓 4 条 check run 已 14KB，经 env 传会撞上限）。
+- **自证补「内容」**：按 id 回读单条 `GET check-runs/<id>`，取 `name|app.slug|status|conclusion` 四字段全断言；期望 `conclusion` 从本次载体的 `.audit/check-run.json` 读，读不到 fail-closed；失败分四类（条数不对 / id 不对 / 内容被改 / 内容无从比对）各自点名。`app.slug == github-actions` 顺手关掉「不比 app」的登记项。
+- **假 gh 行为仿真**：route 表 + 未登记 path 404 + `--slurp` 与 `--jq` 同现报错 + 回原始页形状 `{total_count, check_runs}`（单页也套数组）+ `GET check-runs/<id>` 回单条对象。**判据是替身的保真度，不是断言条数**。
+- **静态写面补 PATCH 族**：`CHECK_RUNS_WRITE_HINT` 认 `--method PATCH` / `-X PATCH` / `PATCH`；`checkRunSanctioned` 只放行自证步的两段只读回读；用例「轮十六-2」覆盖 `checks.update` / `updateCheckRun` / `PATCH REST` / `-X PATCH`。
+
+**我的十一组变异（`/tmp/vrf-r17` 副本，基线 138 passed）**：
+
+| 变异                               | 红  | 变异                                  | 红  |
+| ---------------------------------- | --- | ------------------------------------- | --- |
+| 端点退回 `check-runs?head_sha=`    | 16  | 去 `filter=all&per_page=100`          | 10  |
+| 加回 `--jq .`（与 `--slurp` 同现） | 8   | 去 `name === "audit"` 过滤            | 1   |
+| `ids.length !== 1` → `< 1`         | 1   | 整步删除                              | 12  |
+| `if (!expected)` → `if (false)`    | 1   | 去 conclusion 比对                    | 1   |
+| 去 app.slug 比对                   | 1   | 兄弟 workflow 用 `checks.update` 改写 | 4   |
+
+**残余与开放项**：
+
+- 信任根问题（review-a 提出，属 P-14 编排层）：`workflow_dispatch` 跑的是**被 dispatch 那个 ref 的 YAML**，`audit.yml` 与 `scripts/` 都来自被审对象——被审者能整步删掉自证，或改判据。根治方向是「从受信 ref（main）dispatch + 用受信 ref 的脚本，只把 PR 的 sha 当数据」。
+- Check Run 的条数与 id 由自证兜住，内容由四字段比对兜住；但「自证步自己是否真跑过」仍依赖 job 结论，属于上面同一条信任根。
