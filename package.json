@@ -4,12 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "npm run check:state && npm run lint && npm test",
+    "check": "npm run check:state && npm run lint && npm test && npm run check:go && npm run check:web",
     "check:state": "node scripts/state-validate.mjs --check-config",
+    "check:go": "cd apps/api-go && test -z \"$(gofmt -l .)\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
+    "check:web": "npm --prefix apps/web-vue run build",
     "format": "prettier --write .",
     "lint": "oxlint scripts tests",
     "test": "vitest run",
-    "platform": "node scripts/server.mjs"
+    "api": "cd apps/api-go && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go run .",
+    "platform": "npm run api",
+    "web:dev": "npm --prefix apps/web-vue run dev",
+    "web:build": "npm --prefix apps/web-vue run build"
   },
   "dependencies": {
     "yaml": "^2.5.0"

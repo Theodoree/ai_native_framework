@@ -48,3 +48,5 @@ tmp/
 coverage/
 .pytest_cache/
 .agent-teams
+# 工作区内的 Go 构建缓存（门在受限环境下也要能跑）
+.cache/

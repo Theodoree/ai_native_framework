@@ -24,6 +24,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
       - run: npm ci || npm install
-      # 一个入口跑完三件事（配置自洽 + lint + 测试），结论只有一个退出码。
+      # 前端自带依赖树（根 package.json 不管它），check:web 需要先装上。
+      - run: npm --prefix apps/web-vue ci || npm --prefix apps/web-vue install
+      # 一个入口跑完五件事（配置自洽 + lint + 测试 + Go + 前端构建），结论只有一个退出码。
       - run: npm run check

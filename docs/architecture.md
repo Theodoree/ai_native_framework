@@ -38,6 +38,8 @@ AI 原生研发交付引擎：需求以 issue 入库，以 PR 交付，交付物
 | PR 必填字段                         | `.github/PULL_REQUEST_TEMPLATE/proposed.md`、`.github/PULL_REQUEST_TEMPLATE/bugfix.md` |
 | 汇入什么 / 何时 / 什么格式          | `docs/knowledge-base.md`                                                               |
 | 每个模块是否强制带测试              | `OWNERS.md` 的模块表                                                                   |
+| 本机平台实例：HTTP 面与账本接口     | `apps/api-go/README.md`（Go 只调 `scripts/` 的两个 Node 入口，不自己判状态机）        |
+| 本机平台实例：页面与交互            | `apps/web-vue/README.md`（页面只经 JSON API 说话，不判合法性，409 原样呈现）          |
 
 ## 四、两段式触发（按实例分，不写进规范分支）
 
