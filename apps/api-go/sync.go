@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +18,8 @@ const (
 	remoteEndpoint  = "https://api.github.com"
 	remotePageLimit = 100
 	remoteBodyLimit = 8 << 20
+	// remotePageCap 是跟随 Link 的上限：远端分页成环时宁可报错，也不静默截断成半份快照。
+	remotePageCap = 50
 )
 
 // RemoteIssue 是同步唯一读的字段：number/title/state/labels/updated_at。
@@ -39,11 +40,11 @@ type RemoteSnapshot struct {
 	Issues    []RemoteIssue `json:"issues"`
 }
 
+// FetchRequest 没有 since：缓存语义是「整份快照」，增量结果覆盖缓存只会写出半份。
 type FetchRequest struct {
 	Repo  string
 	Token string
 	ETag  string
-	Since string
 }
 
 type FetchResult struct {
@@ -59,42 +60,87 @@ type Fetcher interface {
 
 type httpFetcher struct {
 	client *http.Client
+	// baseURL 可注入：测试拿 httptest.Server 顶替真 GitHub，生产留空走 remoteEndpoint。
+	baseURL string
 }
 
 func newHTTPFetcher() Fetcher {
 	return &httpFetcher{client: &http.Client{Timeout: 20 * time.Second}}
 }
 
-func (f *httpFetcher) Fetch(ctx context.Context, request FetchRequest) (*FetchResult, error) {
-	address := fmt.Sprintf("%s/repos/%s/issues?state=all&per_page=%d&sort=updated&direction=desc",
-		remoteEndpoint, request.Repo, remotePageLimit)
-	if request.Since != "" {
-		address += "&since=" + url.QueryEscape(request.Since)
+func (f *httpFetcher) base() string {
+	if f.baseURL != "" {
+		return f.baseURL
 	}
+	return remoteEndpoint
+}
+
+// Fetch 取的是「整份快照」：跟 Link: rel="next" 一页页取完再合并。
+// 缓存只能被整份结果覆盖 —— 拿增量结果覆盖缓存会写出半份快照，对账随即把未结在途误判成 pending。
+func (f *httpFetcher) Fetch(ctx context.Context, request FetchRequest) (*FetchResult, error) {
+	issues := make([]RemoteIssue, 0, remotePageLimit)
+	etag := ""
+	address := f.firstPage(request.Repo)
+	for page := 1; address != ""; page++ {
+		if page > remotePageCap {
+			return nil, &apiError{Kind: "infra", Code: "E_REMOTE_PAGING",
+				Message: fmt.Sprintf("远端分页超过 %d 页，拒绝截断（旧缓存保留）", remotePageCap),
+				Extra:   map[string]any{"pages": remotePageCap, "next": address}}
+		}
+		result, next, err := f.fetchPage(ctx, request, address, page == 1)
+		if err != nil {
+			return nil, err
+		}
+		if result.NotModified {
+			return result, nil
+		}
+		// 快照 ETag 只取第一页：后续页各有各的 URL 与 ETag，条件请求只对第一页成立。
+		if page == 1 {
+			etag = result.ETag
+		}
+		issues = append(issues, result.Issues...)
+		if next != "" && !strings.HasPrefix(next, f.base()) {
+			// 分页地址是远端给的：只跟本端点下的地址，否则等于把 token 送去别的主机。
+			return nil, &apiError{Kind: "infra", Code: "E_REMOTE_PAGING",
+				Message: "远端分页指向别的主机，拒绝跟随（旧缓存保留）",
+				Extra:   map[string]any{"next": next}}
+		}
+		address = next
+	}
+	return &FetchResult{ETag: etag, Issues: issues}, nil
+}
+
+func (f *httpFetcher) firstPage(repo string) string {
+	return fmt.Sprintf("%s/repos/%s/issues?state=all&per_page=%d&sort=updated&direction=desc",
+		f.base(), repo, remotePageLimit)
+}
+
+// fetchPage 取一页；conditional 只对第一页为真 —— 「没变」的唯一判据是缓存的 ETag。
+func (f *httpFetcher) fetchPage(ctx context.Context, request FetchRequest, address string, conditional bool) (*FetchResult, string, error) {
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
-		return nil, infraErr("E_REMOTE_REQUEST", "构造远端请求失败: "+err.Error())
+		return nil, "", infraErr("E_REMOTE_REQUEST", "构造远端请求失败: "+err.Error())
 	}
 	httpRequest.Header.Set("accept", "application/vnd.github+json")
 	httpRequest.Header.Set("x-github-api-version", "2022-11-28")
 	if request.Token != "" {
 		httpRequest.Header.Set("authorization", "Bearer "+request.Token)
 	}
-	// 条件请求：带上上次的 ETag，304 就是「没变」。
-	if request.ETag != "" {
+	// 条件请求：带上缓存的 ETag，304 就是「没变」。URL 里不再有 since，ETag 才稳定得下来。
+	if conditional && request.ETag != "" {
 		httpRequest.Header.Set("if-none-match", request.ETag)
 	}
 	response, err := f.client.Do(httpRequest)
 	if err != nil {
-		return nil, infraErr("E_REMOTE_NETWORK", "请求远端失败（旧缓存保留）: "+err.Error())
+		return nil, "", infraErr("E_REMOTE_NETWORK", "请求远端失败（旧缓存保留）: "+err.Error())
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	switch response.StatusCode {
 	case http.StatusNotModified:
-		return &FetchResult{NotModified: true, ETag: request.ETag}, nil
+		return &FetchResult{NotModified: true, ETag: request.ETag}, "", nil
 	case http.StatusUnauthorized:
-		return nil, &apiError{Kind: "infra", Code: "E_REMOTE_UNAUTHORIZED",
+		return nil, "", &apiError{Kind: "infra", Code: "E_REMOTE_UNAUTHORIZED",
 			Message: "远端拒绝凭据（401），旧缓存保留", Extra: map[string]any{}}
 	case http.StatusForbidden, http.StatusTooManyRequests:
 		extra := map[string]any{
@@ -104,11 +150,11 @@ func (f *httpFetcher) Fetch(ctx context.Context, request FetchRequest) (*FetchRe
 			"retryAfter":       response.Header.Get("retry-after"),
 			"documentationUrl": "https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting",
 		}
-		return nil, &apiError{Kind: "infra", Code: "E_REMOTE_RATE_LIMIT",
+		return nil, "", &apiError{Kind: "infra", Code: "E_REMOTE_RATE_LIMIT",
 			Message: "远端限流或禁止访问，旧缓存保留", Extra: extra}
 	case http.StatusOK:
 	default:
-		return nil, &apiError{Kind: "infra", Code: "E_REMOTE_STATUS",
+		return nil, "", &apiError{Kind: "infra", Code: "E_REMOTE_STATUS",
 			Message: fmt.Sprintf("远端返回 %d，旧缓存保留", response.StatusCode),
 			Extra:   map[string]any{"status": response.StatusCode}}
 	}
@@ -124,7 +170,7 @@ func (f *httpFetcher) Fetch(ctx context.Context, request FetchRequest) (*FetchRe
 		PullRequest json.RawMessage `json:"pull_request"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, remoteBodyLimit)).Decode(&payload); err != nil {
-		return nil, infraErr("E_REMOTE_BODY", "远端响应不是合法 JSON: "+err.Error())
+		return nil, "", infraErr("E_REMOTE_BODY", "远端响应不是合法 JSON: "+err.Error())
 	}
 	issues := make([]RemoteIssue, 0, len(payload))
 	for _, entry := range payload {
@@ -144,7 +190,31 @@ func (f *httpFetcher) Fetch(ctx context.Context, request FetchRequest) (*FetchRe
 			UpdatedAt: entry.UpdatedAt,
 		})
 	}
-	return &FetchResult{ETag: response.Header.Get("etag"), Issues: issues}, nil
+	return &FetchResult{ETag: response.Header.Get("etag"), Issues: issues}, nextLink(response.Header.Get("link")), nil
+}
+
+// nextLink 从 Link 头里取 rel="next" 的地址；没有就返回空串（= 取完了）。
+// 一页可能同时带 next/last 多段，rel 也可能带引号，所以按键值解析而不是按位置取。
+func nextLink(header string) string {
+	for _, part := range strings.Split(header, ",") {
+		fields := strings.Split(part, ";")
+		target := strings.TrimSpace(fields[0])
+		if !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+			continue
+		}
+		for _, field := range fields[1:] {
+			key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(key), "rel") {
+				continue
+			}
+			for _, token := range strings.Fields(strings.Trim(strings.TrimSpace(value), "\"")) {
+				if strings.EqualFold(token, "next") {
+					return target[1 : len(target)-1]
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (a *app) cachePath() string {
@@ -271,7 +341,6 @@ func (a *app) runSync(ctx context.Context) (*syncReport, error) {
 		Repo:  repo,
 		Token: token,
 		ETag:  cache.ETag,
-		Since: cache.FetchedAt,
 	})
 	if err != nil {
 		// 网络错误/403/限流：旧缓存一个字节不动，原样上报 infra。
