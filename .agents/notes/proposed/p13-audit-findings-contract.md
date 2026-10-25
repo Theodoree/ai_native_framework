@@ -634,3 +634,22 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **仍未解决**：信任根（同 §十四～§十六）——`workflow_dispatch` 用被 dispatch 那个 ref 的 YAML 与被审对象自己的 `scripts/`。
 
+## 十八、轮二十：端点判定收到「这一次调用」，赋值看见层从行首下到命令行
+
+**两家的六条（全是我先实测复现、再修）**
+
+| # | 绕过/误判 | 变异前 | 变异后 |
+| --- | --- | --- | --- |
+| a | 引号拼接 URL：\`gh api "https://api.github.com/repos/o/r/check-"runs -f conclusion=success\` | 8 红→按词看后绿 | 8 红 |
+| b | 同行另一个良性 URL 洗白未知端点：\`gh api -H "X-Url: https://hooks.slack.com/x" --method POST --input body.json "$EP"\` | 8 红→绿 | 8 红 |
+| c | 双引号里的撇号被当单引号起始，后面的 \`$(gh api …)\` 整段跳过 | 8 红→绿 | 8 红 |
+| d | 值里含 \`$\` 的赋值被静默丢弃：\`A="-X POST -f conclusion=success"; B=$A; gh api … $B\` | 8 红→绿 | 8 红 |
+| e | 赋值只认物理行首：\`echo hi; B="-X POST -f conclusion=success"; gh api … $B\` | 8 红→绿 | 8 红 |
+
+**修法**：命令替换体在双引号里也要看（单引号里 shell 不展开，这边也不展开，见 \`substitutionBodies\`）；端点判定单位从「整行」收到「这一次 http 调用」（\`httpCalls\` / \`callEndpointWords\` / \`resolveEndpoint\`），同行另一条调用洗不白；赋值看见层下到命令行段（\`shellSegments\` 按未加引号的 \`;\` \`&&\` \`||\` 切），且 \`B=$A\` 一跳跟过去，跟不动就进 \`unresolved\`、表满进 \`truncated\`——两档都默认拒绝并各自点名（\`ASSIGNMENT_UNRESOLVED_REASON\` / \`ASSIGNMENT_TRUNCATED_REASON\`），不再静默丢弃。
+
+**我的十探针（/tmp 副本，基线 168）**：a/b/c/d/e 各 **8 红**；对照组 \`curl -X POST https://hooks.slack.com/…\`、\`gh api …/issues/1/comments -f body=hi\`、\`xh get … page==1\`、\`curl -G -d per_page=100\`、良性 peer（echo + 只读 gh api）**全绿**。六组变异里五组见红（撇号 1、按段切 1、一跳跟不动就丢 1、端点不可判改跳过 8、不展开赋值 4）。
+
+**第六组变异暴露的东西（比六条 finding 更值钱）**：把 \`checkRunWriteSurface\` 里那句 \`if (blindAssignmentArg(call)) return "check-runs"\` 停用 → **168 全绿**，说明它是死守卫；但把 \`blindAssignmentReason\` 停用 → 2 红，说明「赋值跟不下去要响」这件事真正的家在那条 reason 通道里。同一个事实两处守卫是重复（第二处还会在**字面量良性端点**上误响：\`curl … https://hooks.slack.com/x -d $B\` 本该放行），删掉后 168 仍绿。教训：变异测试不只用来找「漏判」，也用来找「多余的守卫」——多出来的那处只有误判风险，没有覆盖收益。
+
+**提交**：\`fix(audit): 轮二十 端点判定收到单次调用、赋值看见层下到命令段\`；整仓 13 files / **334 tests**，oxlint 0/0。

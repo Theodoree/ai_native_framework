@@ -1486,7 +1486,11 @@ try {
         quote = quote === '"' ? null : '"';
         continue;
       }
+      // 双引号里的撇号是字面量（shell 不认它是引号起始）：在这里开单引号会把后面整段
+      // 当成不展开的字面量跳过，里面的 `$(gh api …)` 既不进 bodies 也不进 overflow ——
+      // 深度闸门于是静默放行（review-a r20-a-1 实测）。
       if (ch === "'") {
+        if (quote === '"') continue;
         quote = "'";
         continue;
       }
@@ -2797,19 +2801,84 @@ try {
     return value;
   }
 
+  // 逻辑行里的命令段：shell 语义下未加引号的 `;` / `&&` / `||` 都是命令结尾，
+  // 赋值只是**段首**那个词，不是物理行首（review-a r20-a-4 实测：`echo hi; B=…; gh api … $B`）。
+  function shellSegments(line) {
+    const segments = [];
+    let quote = null;
+    let current = "";
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i];
+      if (quote) {
+        current += ch;
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "\\") {
+        current += ch + (line[i + 1] ?? "");
+        i += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        current += ch;
+        continue;
+      }
+      if (ch === ";" || ((ch === "&" || ch === "|") && line[i + 1] === ch)) {
+        segments.push(current);
+        current = "";
+        if (ch !== ";") i += 1;
+        continue;
+      }
+      current += ch;
+    }
+    segments.push(current);
+    return segments;
+  }
+
   function simpleAssignments(text) {
     const map = new Map();
+    // 表里收不下的名字要**响**，不能当成没有赋值：
+    //   - 值只是一个变量引用（`B=$A`）→ 一跳跟过去；跟不动就记 unresolved，引用到它时默认拒绝；
+    //   - 值里带命令替换（`F="$(cat body.json)"`）→ 静态层不展开，也不冒充可判形态（不落表）；
+    //   - 超过上限 → 记 truncated。
+    // 静默丢弃赋值等于静默丢弃写意图（review-a r20-a-2 / r20-a-3 实测全绿）。
+    map.unresolved = new Set();
+    map.truncated = false;
     for (const raw of foldContinuations(String(text)).split("\n").map(stripShellComment)) {
-      if (map.size >= MAX_ASSIGNMENTS) break;
-      const match = ASSIGNMENT_LINE.exec(raw);
-      if (!match) continue;
-      const value = unquote(cutAtShellSeparator(match[2]).trim());
-      if (!value) continue;
-      if (/[$\x60]/.test(value)) continue;
-      // 先定义先赢：同一个名字多处赋值时不猜后一处覆盖了谁（歧义就往「看得见」的那侧留）。
-      if (map.has(match[1])) continue;
-      map.set(match[1], value);
+      for (const segment of shellSegments(raw)) {
+        const match = ASSIGNMENT_LINE.exec(segment);
+        if (!match) continue;
+        const name = match[1];
+        // 先定义先赢：同一个名字多处赋值时不猜后一处覆盖了谁（歧义就往「看得见」的那侧留）。
+        if (map.has(name) || map.unresolved.has(name)) continue;
+        if (map.size >= MAX_ASSIGNMENTS) {
+          map.truncated = true;
+          continue;
+        }
+        const value = unquote(cutAtShellSeparator(match[2]).trim());
+        if (!value) continue;
+        const alias = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value);
+        if (alias) {
+          if (map.has(alias[1])) map.set(name, map.get(alias[1]));
+          else map.unresolved.add(name);
+          continue;
+        }
+        if (/[$\x60]/.test(value)) continue;
+        map.set(name, value);
+      }
     }
+    return map;
+  }
+
+  // 外层行的赋值表 + 命令替换正文里自己写的赋值（内层覆盖外层，与 shell 的执行顺序一致）。
+  function mergeAssignmentMaps(outer, inner) {
+    const map = new Map(outer ?? []);
+    map.unresolved = new Set(outer?.unresolved ?? []);
+    map.truncated = Boolean(outer?.truncated);
+    for (const [name, value] of inner ?? []) map.set(name, value);
+    for (const name of inner?.unresolved ?? []) map.unresolved.add(name);
+    if (inner?.truncated) map.truncated = true;
     return map;
   }
 
@@ -2821,11 +2890,21 @@ try {
     });
   }
 
-  function commandWriteIntent(line, assignments) {
-    // 写面判据要看见的东西：赋值展开后的同一行 + 它里面所有命令替换的正文（递归到 3 层）。
-    const expanded = expandAssignments(String(line), assignments);
-    for (const text of [expanded, ...substitutionExpansion(expanded).bodies]) {
-      for (const words of shellCommands(text)) {
+  // 一次 http 客户端调用：head 是客户端名，words 是（赋值展开后的）词序列，map 是**那一层**
+  // 的赋值表。端点判定必须以「这次调用」为单位，否则同行另一个良性 URL 就能把不可判的
+  // 端点洗白（review-b 实测：`curl … https://hooks.slack.com/x "$EP"` 全绿）。
+  function httpCalls(line, assignments) {
+    const outer = assignments ?? new Map();
+    // 要看见的东西：赋值展开后的同一行 + 它里面所有命令替换的正文（递归到 3 层）。
+    const sources = [{ text: expandAssignments(String(line), outer), map: outer }];
+    for (const body of substitutionExpansion(sources[0].text).bodies) {
+      // 正文里的简单赋值同样要看得见：`x="$( F="…"; gh api … $F )"`（review-a r20-a-4 实测）。
+      const inner = mergeAssignmentMaps(outer, simpleAssignments(body));
+      sources.push({ text: expandAssignments(body, inner), map: inner });
+    }
+    const calls = [];
+    for (const source of sources) {
+      for (const words of shellCommands(source.text)) {
         if (words.length === 0) continue;
         // 客户端不一定在第 0 个词：workflow 里的行常带 YAML 前缀（`- run: gh api …`、
         // `- run: |` 的正文）与赋值前缀（`id=$(gh api …)`）。按词扫，别按位置猜。
@@ -2834,11 +2913,19 @@ try {
           if (!HTTP_CLIENTS.has(head)) continue;
           // gh 只有 `gh api` 是 http 调用（gh pr view --json 是读，不在这条面上）。
           if (head === "gh" && String(words[start + 1] ?? "") !== "api") continue;
-          if (commandWriteIntentAt(head, words, start)) return true;
+          calls.push({ head, words, start, map: source.map });
         }
       }
     }
-    return false;
+    return calls;
+  }
+
+  function httpWriteCalls(line, assignments) {
+    return httpCalls(line, assignments).filter((call) => commandWriteIntentAt(call.head, call.words, call.start));
+  }
+
+  function commandWriteIntent(line, assignments) {
+    return httpWriteCalls(line, assignments).length > 0;
   }
 
   // httpie 的体是**独立成词的** k=v / k:=v；k==v 是查询参数（读），Header:value 与 URL 里的
@@ -2949,26 +3036,98 @@ try {
   const GITHUB_API_HOST = "api.github.com";
   const CHECK_RUNS_IN_PATH = /\b(?:check-runs|graphql)\b/;
 
-  // 取得到的字面量端点。取不到返回空数组 —— 空数组是「不可判」，不是「不是写面」。
-  function literalEndpoints(line) {
-    const text = String(line);
-    const urls = [...text.matchAll(/https?:\/\/([^\s"'/]+)([^\s"']*)/gi)].map((match) => ({
-      host: match[1].toLowerCase(),
-      path: match[2],
-    }));
-    if (urls.length > 0) return urls;
+  // 端点一律从 shellWords 展开后的**词**里取：shell 会把相邻的引号段与裸段拼成一个词，
+  // 原始文本正则按引号截断，`"…/check-"runs` 于是只取到 `…/check-`（review-b 实测全绿放行）。
+  const URL_WORD = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+  const WHOLE_VAR = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/;
+  // gh api 里带取值的标志：它们后面那个词是值，不是端点。
+  const GH_VALUE_FLAGS = new Set([
+    "--method",
+    "-X",
+    "--input",
+    "-f",
+    "-F",
+    "--field",
+    "--raw-field",
+    "--header",
+    "-H",
+    "--jq",
+    "-q",
+    "--template",
+    "--cache",
+    "--hostname",
+    "--preview",
+    "--json",
+  ]);
+
+  // 这一次调用里的端点候选词（未解析）。gh api 取位置参数；其它客户端取 URL 词与整词变量。
+  function callEndpointWords(call) {
+    const words = call.words;
     const endpoints = [];
-    for (const words of shellCommands(text)) {
-      for (let start = 0; start < words.length; start += 1) {
-        if (String(words[start]).replace(/^.*\//, "") !== "gh") continue;
-        if (String(words[start + 1] ?? "") !== "api") continue;
-        // gh api 的端点就是第一个位置参数：它是标志词、或者带变量，就不是字面量。
-        const token = unquote(String(words[start + 2] ?? ""));
-        if (!token || token.startsWith("-") || /[$\x60]/.test(token)) continue;
-        endpoints.push({ host: GITHUB_API_HOST, path: token });
+    if (call.head !== "gh") {
+      for (let i = call.start + 1; i < words.length; i += 1) {
+        const word = String(words[i]);
+        if (URL_WORD.test(word) || word.includes("://") || WHOLE_VAR.test(word)) endpoints.push(word);
       }
+      return endpoints;
+    }
+    let index = call.start + 2; // 跳过 `gh api`
+    while (index < words.length) {
+      const word = String(words[index]);
+      if (word.startsWith("-")) {
+        // 取值标志把它后面那个词吃掉；`--flag=value` 自带值，只前进一个词。
+        const name = longFlagName(word) ?? word;
+        index += word.includes("=") || !GH_VALUE_FLAGS.has(name.toLowerCase()) ? 1 : 2;
+        continue;
+      }
+      endpoints.push(word);
+      index += 1;
     }
     return endpoints;
+  }
+
+  // 端点解析：不可判（变量 / 命令替换 / 空 host）返回 null —— null 是「不可判」，不是「不是写面」。
+  function resolveEndpoint(word, ghPath) {
+    const text = String(word);
+    if (/[$\x60]/.test(text)) return null;
+    const at = text.indexOf("://");
+    if (at >= 0) {
+      const rest = text.slice(at + 3);
+      const slash = rest.indexOf("/");
+      const host = (slash === -1 ? rest : rest.slice(0, slash)).toLowerCase();
+      if (!host) return null;
+      return { host, path: slash === -1 ? "" : rest.slice(slash) };
+    }
+    if (!ghPath) return null;
+    return { host: GITHUB_API_HOST, path: text };
+  }
+
+  // 实参引用了「跟不下去」的赋值时的默认拒绝理由：赋值表既收不下也丢不得，
+  // 静默丢弃等于静默丢弃写意图（review-a r20-a-2 / r20-a-3 实测全绿）。
+  const ASSIGNMENT_UNRESOLVED_REASON =
+    CHECK_RUNS_REASON + "（原因：赋值跟不下去 —— 值里含变量或命令替换，静态层展开不了，按命令级默认拒绝）";
+  const ASSIGNMENT_TRUNCATED_REASON =
+    CHECK_RUNS_REASON + "（原因：赋值表已截断，跟不下去 —— 按命令级默认拒绝）";
+
+  function blindAssignmentArg(call) {
+    const map = call.map;
+    if (!map) return null;
+    for (let i = call.start + 1; i < call.words.length; i += 1) {
+      const match = WHOLE_VAR.exec(String(call.words[i]));
+      if (!match) continue;
+      if (map.unresolved?.has(match[1])) return { kind: "unresolved", name: match[1] };
+      if (map.truncated && !map.has(match[1])) return { kind: "truncated", name: match[1] };
+    }
+    return null;
+  }
+
+  function blindAssignmentReason(line, assignments) {
+    for (const call of httpCalls(line, assignments ?? simpleAssignments(String(line)))) {
+      const blind = blindAssignmentArg(call);
+      if (!blind) continue;
+      return blind.kind === "truncated" ? ASSIGNMENT_TRUNCATED_REASON : ASSIGNMENT_UNRESOLVED_REASON;
+    }
+    return null;
   }
 
   function checkRunWriteSurface(line, assignments) {
@@ -2980,20 +3139,20 @@ try {
     if (CHECKS_CREATE_CALL.test(text)) return "checks.create";
     // gh api graphql 与 https://api.github.com/graphql 是同一个端点，写法不同不改面。
     if (/\bgraphql\b/.test(text)) return "/graphql";
-    // 判据是命令级的：端点可以是变量（`ep="repos/o/r/check-runs"; gh api --method POST … "$ep"`），
-    // 甚至可以只出现在命令替换里（`id="$(gh api …)"`）—— 「有没有写意图」不看端点拼写。
-    if (!commandWriteIntent(text, map)) return null;
-    // 只有「端点字面量且明确不是结论写面」才放行；端点不可判就落回默认拒绝。
-    if (!CHECK_RUNS_ENDPOINT.test(text)) {
-      const endpoints = literalEndpoints(text);
-      if (
-        endpoints.length > 0 &&
-        endpoints.every((endpoint) => endpoint.host !== GITHUB_API_HOST || !CHECK_RUNS_IN_PATH.test(endpoint.path))
-      ) {
-        return null;
+    // 判定单位是**这一次 http 调用**：同行另一个良性 URL 洗不白这次调用的未知端点（review-b 实测）。
+    for (const call of httpCalls(raw, map)) {
+      // 实参里的变量跟不下去由 blindAssignmentReason 判；这里是同一件事的第二处守卫，删掉它
+      // 不是放水：判据过宽同样会把闸门弄坏（字面量良性端点不该因为一个跟不下去的实参就变红）。
+      if (!commandWriteIntentAt(call.head, call.words, call.start)) continue;
+      // 端点不可判（变量 / 拼接 / 命令替换 / 根本没有端点词）→ 默认拒绝。
+      const endpoints = callEndpointWords(call).map((word) => resolveEndpoint(word, call.head === "gh"));
+      if (endpoints.length === 0 || endpoints.some((endpoint) => endpoint === null)) return "check-runs";
+      // 字面量端点且明确不是结论写面（别的 host，或 gh api 的别条路径）→ 这一次调用不是写面。
+      if (endpoints.some((endpoint) => endpoint.host === GITHUB_API_HOST && CHECK_RUNS_IN_PATH.test(endpoint.path))) {
+        return "check-runs";
       }
     }
-    return "check-runs";
+    return null;
   }
 
   function workflowFiles(options = {}) {
@@ -3039,7 +3198,9 @@ try {
           step: file,
           where: surface,
           excerpt: line.trim(),
-          reason: "结论写面只允许 audit.yml：同名的第二条 Check Run 会盖掉真结论（" + file + "）",
+          reason:
+            blindAssignmentReason(line, assignments) ??
+            "结论写面只允许 audit.yml：同名的第二条 Check Run 会盖掉真结论（" + file + "）",
         });
       }
     }
@@ -3407,7 +3568,8 @@ try {
             step: name,
             where,
             excerpt: line.trim(),
-            reason: checkRunReason(line, writeIntent),
+            // 赋值跟不下去时，写意图本身不可判 —— 理由要指向那一层，不能装成「不可判形态」。
+            reason: blindAssignmentReason(line, assignments) ?? checkRunReason(line, writeIntent),
           });
         }
         // 复制/替换写载体：写通道只能是产出那一行 —— 写者可以产出，但不能**替换**。
@@ -6211,6 +6373,138 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     }
     expect(workflowWriteSurfaceViolations()).toEqual([]);
     expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
+  });
+
+  // ---- 轮二十：审计闸门自己的六条静态绕过（判据的自我防护） ----
+  it("轮二十-1：端点是 shell 拼出来的一个词 —— 引号切开 URL 不许把端点读残", () => {
+    // shell 把 "…/check-"runs 拼成一个词；原始文本正则只取到 …/check-，写面整个消失。
+    for (const [label, line] of [
+      ["gh api 引号拼接", 'gh api "https://api.github.com/repos/o/r/check-"runs -f conclusion=success'],
+      ["curl 引号拼接", 'curl -sS -X POST -d @body.json https://api.github.com/repos/o/r/"check-"runs'],
+      ["gh api 拼出来的是路径", 'gh api repos/o/r/"check-"runs --method POST --input body.json'],
+    ]) {
+      expect(checkRunWriteSurface(line), label).toBe("check-runs");
+    }
+    // 反面对照：同一个写法落在只读方法上仍是读，拼词规则不许把它撑成写。
+    expect(checkRunWriteSurface('curl -sS -X GET https://api.github.com/repos/o/r/"check-"runs')).toBeNull();
+    expect(checkRunWriteSurface('gh api repos/o/r/"check-"runs --jq .[].id')).toBeNull();
+  });
+
+  it("轮二十-2：判定单位是这一次调用的端点 —— 同行另一个良性 URL 洗不白未知端点", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-endpoint-unit-"));
+    const steps = [
+      { name: "插一步", run: ['curl -sS -X POST -d @body.json https://hooks.slack.com/x "$EP"', ""].join(SH) },
+      {
+        name: "带头的插一步",
+        run: ['gh api -H "X-Url: https://hooks.slack.com/x" --method POST --input body.json "$EP"', ""].join(SH),
+      },
+    ];
+    for (const step of steps) {
+      // 同行那个良性 URL 不能让这次调用的未知端点变成「良性」：理由是写形态，不是「不可判形态」。
+      expect(auditDirReferenceViolations([step], { root: dir }).map((v) => v.reason), step.name).toEqual([
+        CHECK_RUNS_REASON_WRITE_BLIND,
+      ]);
+    }
+    expect(checkRunWriteSurface('curl -sS -X POST -d @body.json https://hooks.slack.com/x "$EP"')).toBe("check-runs");
+    expect(
+      checkRunWriteSurface('gh api -H "X-Url: https://hooks.slack.com/x" --method POST --input body.json "$EP"'),
+    ).toBe("check-runs");
+    // 对照：同行没有良性 URL 的老绕过仍然红（同一套判据，不靠拼写枚举）。
+    expect(checkRunWriteSurface('gh api --method POST --input body.json "$EP"')).toBe("check-runs");
+    // 反面对照 1：纯非 GitHub 目标 + 写体 —— 端点良性就不红。
+    expect(checkRunWriteSurface("curl -sS -X POST https://hooks.slack.com/services/T/B/X -d '{\"text\":\"ok\"}'")).toBeNull();
+    // 反面对照 2：gh api 的别条路径（评论）。
+    expect(checkRunWriteSurface("gh api repos/o/r/issues/1/comments -f body=hi")).toBeNull();
+    // 反面对照 3：httpie 的查询参数是读。
+    expect(checkRunWriteSurface("xh get https://status.example.com/api/health page==1")).toBeNull();
+    // 反面对照 4：curl -G 把体翻成查询串，也是读。
+    expect(checkRunWriteSurface("curl -sS -G -d per_page=100 https://api.github.com/repos/o/r/check-runs")).toBeNull();
+  });
+
+  it("轮二十-3：双引号里的撇号是字面量 —— 不许靠它把命令替换挡在深度闸门之外", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-apostrophe-"));
+    const apostrophe = 'id="note: don\'t; $(gh api repos/o/r/check-runs --method POST --input body.json)"';
+    expect(substitutionExpansion(apostrophe).bodies.some((body) => body.includes("gh api"))).toBe(true);
+    expect(checkRunWriteSurface(apostrophe)).toBe("check-runs");
+    expect(
+      auditDirReferenceViolations([{ name: "插一步", run: apostrophe + SH }], { root: dir }).map((v) => v.reason),
+    ).toEqual([CHECK_RUNS_REASON_WRITE]);
+    // 对照：同一行去掉撇号仍红（差异只能来自引号状态机）。
+    expect(checkRunWriteSurface('id="note: do not; $(gh api repos/o/r/check-runs --method POST --input body.json)"')).toBe(
+      "check-runs",
+    );
+    // 反面对照：双引号里的撇号不会把只读替换撑成写。
+    expect(checkRunWriteSurface('echo "don\'t run $(echo hi)"')).toBeNull();
+    // 反面对照：单引号里的 $() 依然是字面量（轮十九-1 已钉，这里守同一件事）。
+    expect(checkRunWriteSurface("echo '$(gh api --method POST --input body.json repos/o/r/check-runs)'")).toBeNull();
+  });
+
+  it("轮二十-4：赋值一跳跟不动就响 —— 值里含变量的链不许把写意图整个吞掉", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-alias-chain-"));
+    const chain = [
+      'A="-X POST -f name=audit -f conclusion=success"',
+      "B=$A",
+      "gh api repos/o/r/check-runs $B",
+      "",
+    ].join(SH);
+    expect(auditDirReferenceViolations([{ name: "插一步", run: chain }], { root: dir }).map((v) => v.reason)).toEqual([
+      CHECK_RUNS_REASON_WRITE,
+    ]);
+    // 对照：单跳赋值仍然红，理由同为写形态。
+    const single = ['B="-X POST -f conclusion=success"', "gh api repos/o/r/check-runs $B", ""].join(SH);
+    expect(auditDirReferenceViolations([{ name: "插一步", run: single }], { root: dir }).map((v) => v.reason)).toEqual([
+      CHECK_RUNS_REASON_WRITE,
+    ]);
+    // 跟不动（值来自未定义/环境变量）不许当成「没有赋值」：落命令级默认拒绝，理由指向赋值层。
+    const envChain = ["B=$EXTERNAL_FLAGS", "gh api repos/o/r/check-runs $B", ""].join(SH);
+    expect(auditDirReferenceViolations([{ name: "插一步", run: envChain }], { root: dir }).map((v) => v.reason)).toEqual([
+      ASSIGNMENT_UNRESOLVED_REASON,
+    ]);
+    // 反面对照：命令替换体的赋值不冒充可判形态（静态层不展开），只读调用不许被撑成写（轮十九-2 已钉）。
+    expect(checkRunWriteSurface('F="$(cat body.json)"; curl -sS $F https://api.github.com/repos/o/r/check-runs/1')).toBeNull();
+  });
+
+  it("轮二十-5：赋值表超过上限要响 —— 截断不是「没有赋值」", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-assignment-cap-"));
+    const lines = [];
+    for (let i = 0; i < 32; i += 1) lines.push("V" + i + "=1");
+    lines.push('B="-X POST -f conclusion=success"', "gh api repos/o/r/check-runs $B", "");
+    const run = lines.join(SH);
+    expect(simpleAssignments(run).truncated).toBe(true);
+    expect(auditDirReferenceViolations([{ name: "插一步", run }], { root: dir }).map((v) => v.reason)).toEqual([
+      ASSIGNMENT_TRUNCATED_REASON,
+    ]);
+    // 反面对照：上限以内的同名表照旧跟得住，理由仍是写形态而不是截断。
+    const small = ["V0=1", 'B="-X POST -f conclusion=success"', "gh api repos/o/r/check-runs $B", ""].join(SH);
+    expect(auditDirReferenceViolations([{ name: "插一步", run: small }], { root: dir }).map((v) => v.reason)).toEqual([
+      CHECK_RUNS_REASON_WRITE,
+    ]);
+  });
+
+  it("轮二十-6：赋值只是段首那个词 —— 分号后、命令替换正文里的赋值同样看得见", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-segment-assign-"));
+    const sameLine = [
+      'echo hi; B="-X POST -f name=audit -f conclusion=success"; gh api repos/o/r/check-runs $B',
+      "",
+    ].join(SH);
+    expect(auditDirReferenceViolations([{ name: "插一步", run: sameLine }], { root: dir }).map((v) => v.reason)).toEqual([
+      CHECK_RUNS_REASON_WRITE,
+    ]);
+    const inSubstitution = ['x="$( F="-X POST -f conclusion=success"; gh api repos/o/r/check-runs $F )"', ""].join(SH);
+    expect(
+      auditDirReferenceViolations([{ name: "插一步", run: inSubstitution }], { root: dir }).map((v) => v.reason),
+    ).toEqual([CHECK_RUNS_REASON_WRITE]);
+    // 对照：同样内容拆成三行仍然红（差异只能来自「赋值只认行首」）。
+    const threeLines = ['B="-X POST -f name=audit -f conclusion=success"', "gh api repos/o/r/check-runs $B", ""].join(SH);
+    expect(auditDirReferenceViolations([{ name: "插一步", run: threeLines }], { root: dir }).map((v) => v.reason)).toEqual([
+      CHECK_RUNS_REASON_WRITE,
+    ]);
+    // 反面对照：段内的良性赋值 + 良性写调用不制造假红。
+    const benign = [
+      "echo hi; U=\"https://hooks.slack.com/services/T/B/X\"; curl -sS -X POST \"$U\" -d '{\"text\":\"ok\"}'",
+      "",
+    ].join(SH);
+    expect(auditDirReferenceViolations([{ name: "告警", run: benign }], { root: dir })).toEqual([]);
   });
 });
 
