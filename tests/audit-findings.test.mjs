@@ -1964,6 +1964,28 @@ try {
   // 认不出的载体必须响，让它变成一条红断言，而不是一条静默跳过的 continue。
   const ALLOWED_USES = [/^actions\/checkout(?:@|$)/, /^actions\/setup-node(?:@|$)/];
 
+  // 本地 uses（./.github/actions/x）的实现在**这份仓库里**：它的 runs.steps 与普通 step
+  // 是同一个执行面。远端 action 的行为不在仓库里，只能按白名单判；本地 action 读不到就不是
+  // 「没有执行面」，而是跟不下去 —— 交给 gaps 判红，不做 continue。
+  const LOCAL_USES = /^\.{1,2}\//;
+  const MAX_ACTION_DEPTH = 3;
+  function localActionSteps(root, uses) {
+    const base = join(root, uses);
+    const candidates = [base, base + ".yml", base + ".yaml", join(base, "action.yml"), join(base, "action.yaml")];
+    for (const candidate of candidates) {
+      if (!existsSync(candidate)) continue;
+      let doc = null;
+      try {
+        doc = YAML.parse(readFileSync(candidate, "utf8"));
+      } catch {
+        doc = null;
+      }
+      if (!doc || typeof doc !== "object") continue;
+      return { file: candidate, steps: Array.isArray(doc.runs?.steps) ? doc.runs.steps : [] };
+    }
+    return null;
+  }
+
   // result.json 的**写者**：run 块里同一行既用 node 启动某个脚本、又写 `--out .audit/result.json`。
   // 生产者必然同时出现这些字段名（它要造出这些字段），把它算成「读者」只会逼出一份手写豁免名单 ——
   // 判据变成名单的一刻就不再是判据。所以从 run 文本里推导，且这条推导本身被断言钉住。
@@ -2391,15 +2413,50 @@ try {
   function hasResultJsonWrite(text, options = {}) {
     return scanResultJsonText(text, options).some((entry) => entry.write);
   }
+  // 一个 step 的**闭合执行面**：载荷 + 被引用脚本（含 import 闭包）+ 本地 composite 的
+  // runs.steps（递归，深度上限 3）。三个入口各判各的面时，同一份代码换个入口就换一个结论：
+  // step 入口跟进脚本、workflow 入口只看载荷、composite 谁也不看。
+  // 面必须闭合：任一处跟不下去（脚本解析不到 / 本地 uses 读不到 action.yml / 深度超限）
+  // 进 options.gaps，由入口判成违规 —— 静默跳过就是「括号闭不上」。
   function stepTexts(step, options = {}) {
     const root = options.root ?? ROOT;
-    const texts = stepPayloads(step).map((payload) => ({ where: payload.carrier, text: payload.text }));
-    for (const rel of stepScriptRefs(step, { root })) {
-      for (const file of scriptTree(root, rel).files) {
-        const abs = scriptPath(root, file);
-        if (abs && existsSync(abs)) texts.push({ where: file, text: readFileSync(abs, "utf8") });
+    const gaps = options.gaps;
+    const texts = [];
+    const noteGap = (entry) => {
+      if (!gaps) return;
+      if (gaps.some((gap) => gap.kind === entry.kind && gap.detail === entry.detail)) return;
+      gaps.push(entry);
+    };
+    const visit = (one, depth, label) => {
+      for (const payload of stepPayloads(one)) texts.push({ where: payload.carrier, text: payload.text });
+      for (const rel of stepScriptRefs(one, { root })) {
+        const tree = scriptTree(root, rel);
+        // 只对**脚本**引用要求解析成功：扫描面还会收进 node 命令后面的数据文件名
+        // （`node scripts/writer-record.mjs verdict.json`），那不是被跟随的脚本。
+        for (const gone of tree.missing) {
+          if (SCRIPT_EXT.test(gone) && !tree.files.includes(gone)) {
+            noteGap({ step: label, where: rel, kind: "script-missing", detail: gone });
+          }
+        }
+        for (const file of tree.files) {
+          const abs = scriptPath(root, file);
+          if (abs && existsSync(abs)) texts.push({ where: file, text: readFileSync(abs, "utf8") });
+          else noteGap({ step: label, where: rel, kind: "script-missing", detail: file });
+        }
       }
-    }
+      if (typeof one.uses !== "string" || !LOCAL_USES.test(one.uses)) return;
+      if (depth >= MAX_ACTION_DEPTH) {
+        noteGap({ step: label, where: "uses", kind: "action-depth", detail: one.uses });
+        return;
+      }
+      const action = localActionSteps(root, one.uses);
+      if (!action) {
+        noteGap({ step: label, where: "uses", kind: "action-missing", detail: one.uses });
+        return;
+      }
+      for (const sub of action.steps) visit(sub, depth + 1, label);
+    };
+    visit(step, 0, step.id ?? step.name);
     return texts;
   }
 
@@ -3402,6 +3459,21 @@ try {
     return null;
   }
 
+  // 端点整个是变量 / 命令替换（`gh api $EP $M $B`：端点、方法、请求体一起进变量）：
+  // 静态层解不出它指哪条路径 —— 看不见方法不等于没有方法，默认拒绝。
+  // 只认「整词就是变量」：`repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs` 这类带变量的
+  // 字面量仍然可判（回读形态照旧放行），否则良性回读会被一起打死。
+  const BLIND_ENDPOINT_WORD = /^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\([^)]*\)|`[^`]*`)$/;
+  // 能证明「这一次是读」的请求形态：显式 GET、只读输出（--jq/--template）、分页读。
+  const READ_ONLY_REQUEST = /(?:^|\s)(?:-X|--method)\s+GET\b|(?:^|\s)(?:--jq|-q|--template|--paginate|--slurp)(?:\s|=|$)/i;
+  function blindEndpointCall(state) {
+    if (state.writeIntent) return false;
+    // 端点词**全部**不可解才算「跟不下去」：看得见的那条字面量端点已经能定这一次调用的面。
+    if (state.words.length === 0) return false;
+    if (!state.words.every((word) => BLIND_ENDPOINT_WORD.test(unquote(String(word ?? ""))))) return false;
+    return !READ_ONLY_REQUEST.test(state.call.words.join(" "));
+  }
+
   function checkRunWriteSurface(line, assignments) {
     // 端点也按赋值展开后判：没把整份载荷的赋值表传进来时，至少看得见这一行自己写的
     // `U="https://…/x"; curl $U …` —— 否则良性端点会掉进「不可判」那档被误拒。
@@ -3411,6 +3483,12 @@ try {
     if (CHECKS_CREATE_CALL.test(text)) return "checks.create";
     // gh api graphql 与 https://api.github.com/graphql 是同一个端点，写法不同不改面。
     if (/\bgraphql\b/.test(text)) return "/graphql";
+    // 子进程包装（child_process / execSync('gh api …')）：真正的命令在另一层进程里，
+    // shellWords 把整段引号内容并成一个词，端点与方法随引号一起消失。既然这一行自己
+    // 点名了 check-runs / graphql，就不是「没有写面」而是**跟不下去** —— 按默认拒绝。
+    if (CHECK_RUNS_ENDPOINT.test(text) && (CHILD_PROCESS.test(text) || CHILD_PROCESS_CALL.test(text))) {
+      return "check-runs";
+    }
     // 判定单位是**这一次 http 调用**：同行另一个良性 URL 洗不白这次调用的未知端点（review-b 实测）。
     const calls = httpCalls(raw, map);
     // 跟不下去的正文（命令替换 / 解释器包装超过深度上限、别的语言里的内联程序）：响，不静默丢。
@@ -3429,6 +3507,10 @@ try {
         ) {
           return "check-runs";
         }
+        // 端点整个不可解（`gh api $EP $M $B`）：三次盲赋值把端点、方法、请求体一起藏进变量，
+        // 上面那条守卫要求「端点已可见」，在这里正好失效 —— 于是写面彻底静默。
+        // 「看不见方法」不是「没有方法」：除非能证明是已放行的只读回读形态，一律默认拒绝。
+        if (blindEndpointCall(state) && !state.words.some(isReadBackWord)) return "check-runs";
         continue;
       }
       // 端点不可判（变量 / 拼接 / 命令替换 / 根本没有端点词）→ 默认拒绝。
@@ -3453,7 +3535,11 @@ try {
   // 就是脚本，'with'/'env' 的叶子也是执行面。按物理行判时端点行没有写形态、写形态行没有
   // 端点，两半都放过（实测 0 红），而按解析出的 steps 判的 auditDirReferenceViolations 对
   // 同一文件报 1 条 —— 两个入口对同一份文件自相矛盾。
-  function workflowPayloadTexts(file, root) {
+  // workflow 入口的**闭合面**：与 step 入口同一套 stepTexts（脚本 import 闭包 + 本地 composite
+  // 的 runs.steps），外加 job 级载体。同一份代码不管从哪个入口进来，判的必须是同一个面 ——
+  // 之前这里只取 YAML 载荷文本，于是 `- run: node scripts/peer-evil.mjs` 与
+  // `uses: ./.github/actions/sneak` 在这里完全看不见，换个入口就换个结论。
+  function workflowSurfaceTexts(file, root, gaps) {
     const source = readFileSync(join(root, WORKFLOW_DIR, file), "utf8");
     let doc = null;
     try {
@@ -3463,16 +3549,34 @@ try {
     }
     const structured = doc && typeof doc === "object" && doc.jobs && typeof doc.jobs === "object";
     // 解析不了就没有结构可判：回落到整份文本 —— 判不了不等于没有写面。
-    if (!structured) return [source];
+    if (!structured) return [{ where: file, text: source }];
     const texts = [];
     for (const job of Object.values(doc.jobs)) {
       if (!job || typeof job !== "object") continue;
-      const payloads = [...jobPayloads(job, doc)];
-      for (const step of Array.isArray(job.steps) ? job.steps : []) payloads.push(...stepPayloads(step));
-      for (const payload of payloads) texts.push(payload.text);
+      for (const payload of jobPayloads(job, doc)) texts.push({ where: payload.carrier, text: payload.text });
+      for (const step of Array.isArray(job.steps) ? job.steps : []) {
+        texts.push(...stepTexts(step, { root, gaps }));
+      }
     }
     // 一份 workflow 的载荷全空（结构里没有可判文本）时同样回落整份文本，避免「没载荷 = 没写面」。
-    return texts.length > 0 ? texts : [source];
+    return texts.length > 0 ? texts : [{ where: file, text: source }];
+  }
+
+  // 「跟不下去」不是「没有执行面」：脚本缺文件 / 本地 action 读不到 / 嵌套超限，一律响。
+  const GAP_REASONS = {
+    "script-missing": "被引用脚本跟不下去（路径解析不到或文件不存在）：这个入口的执行面排除不了，按默认拒绝",
+    "action-missing": "本地 composite action 读不到 action.yml：它的 runs.steps 不可见，按默认拒绝",
+    "action-depth": "本地 composite 嵌套超过 " + MAX_ACTION_DEPTH + " 层：静态层跟不下去，按默认拒绝",
+  };
+  function gapReason(gap) {
+    return (
+      (GAP_REASONS[gap.kind] ?? "执行面跟不下去：按默认拒绝") +
+      "（" +
+      String(gap.where ?? "") +
+      " → " +
+      String(gap.detail ?? "") +
+      "）"
+    );
   }
 
   // 载荷文本按行剔掉 shell 注释：'|' 块里的 # 是 shell 注释，YAML 层面的注释解析时已经被 YAML 摘掉了。
@@ -3488,8 +3592,12 @@ try {
     const root = options.root ?? ROOT;
     return workflowFiles({ root }).filter((file) => {
       const assignments = simpleAssignments(readFileSync(join(root, WORKFLOW_DIR, file), "utf8"));
-      return workflowPayloadTexts(file, root).some(
-        (text) => checkRunWriteSurface(payloadSurfaceText(text), assignments) !== null,
+      const gaps = [];
+      // 跟不下去的文件同样算「命中」：它的写面证明不了不存在。
+      return (
+        workflowSurfaceTexts(file, root, gaps).some(
+          (entry) => checkRunWriteSurface(payloadSurfaceText(entry.text), assignments) !== null,
+        ) || gaps.length > 0
       );
     });
   }
@@ -3504,10 +3612,24 @@ try {
     for (const file of files) {
       if (file === "audit.yml") continue;
       const assignments = simpleAssignments(readFileSync(join(root, WORKFLOW_DIR, file), "utf8"));
-      // 逐个载荷判（run / shell / working-directory / with.* / env.* / job 级载体），
-      // 与 auditDirReferenceViolations 用同一个单位：解析后的那一份文本。
-      for (const text of workflowPayloadTexts(file, root)) {
-        const payload = payloadSurfaceText(text);
+      // 逐个载荷判（run / shell / working-directory / with.* / env.* / job 级载体 + 被引用脚本
+      // 的闭包 + 本地 composite 的 runs.steps），与审计入口用同一个单位：解析后的那一份文本。
+      const gaps = [];
+      const entries = workflowSurfaceTexts(file, root, gaps);
+      // 跟不下去就响：脚本缺文件 / 本地 action 读不到 / 嵌套超限，都不许当成「没有执行面」。
+      for (const gap of gaps) {
+        const gapKey = file + "\u0000gap\u0000" + gap.kind + "\u0000" + gap.detail;
+        if (seen.has(gapKey)) continue;
+        seen.add(gapKey);
+        violations.push({
+          step: file,
+          where: gap.kind,
+          excerpt: String(gap.where ?? "") + " → " + String(gap.detail ?? ""),
+          reason: gapReason(gap),
+        });
+      }
+      for (const entry of entries) {
+        const payload = payloadSurfaceText(entry.text);
         for (const rawLine of payload.split("\n")) {
           const line = rawLine;
           const surface = checkRunWriteSurface(line, assignments);
@@ -3853,11 +3975,21 @@ try {
     const root = options.root ?? ROOT;
     const violations = [];
     const texts = [];
+    const gaps = [];
     for (const step of stepList) {
       const name = step.name ?? step.id;
       // cwd 随行携带：同一行文本在 cwd=.audit 与在仓库根下指的是两份不同的路径。
       const cwd = stepWorkingDir(step, options);
-      for (const { where, text } of stepTexts(step, { root })) texts.push({ name, where, text, cwd });
+      for (const { where, text } of stepTexts(step, { root, gaps })) texts.push({ name, where, text, cwd });
+    }
+    // 跟不下去就响：脚本解析不到 / 本地 action 读不到 / 嵌套超限 —— 静默跳过等于给分叉留后门。
+    for (const gap of gaps) {
+      violations.push({
+        step: gap.step,
+        where: gap.kind,
+        excerpt: String(gap.where ?? "") + " → " + String(gap.detail ?? ""),
+        reason: gapReason(gap),
+      });
     }
     const jobCwd = jobWorkingDir(options.jobPayloads ?? []);
     for (const { source, where, text } of jobPayloadTexts(options.jobPayloads ?? [], { root })) {
@@ -7123,6 +7255,164 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       "if",
       "permissions",
     ]);
+  });
+
+  it("轮二十三-1：workflow 入口跟进被引用脚本 —— 换个入口不许换结论（A-1）", () => {
+    const SH = String.fromCharCode(10);
+    const dir = mkdtempSync(join(tmpdir(), "audit-workflow-script-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    const peer = (command) =>
+      [
+        "name: peer-x",
+        "on: pull_request",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: " + command,
+        "",
+      ].join(SH);
+    // 被引用的脚本：gh 调用写在 execSync 的引号里 —— 正是 shellcheck 推荐、按行切词却看不见的形态。
+    writeFileSync(
+      join(dir, "scripts", "peer-evil.mjs"),
+      [
+        'import { execSync } from "node:child_process";',
+        'execSync("gh api repos/o/r/check-runs -X PATCH -f conclusion=success");',
+        "",
+      ].join(SH),
+    );
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-x.yml"), peer("node scripts/peer-evil.mjs"));
+    // 同一份文件，两个入口必须给同一个结论。
+    const violations = workflowWriteSurfaceViolations({ root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["peer-x.yml"]);
+    expect(violations.some((v) => v.where === "check-runs")).toBe(true);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml", "peer-x.yml"]);
+    const peerSteps = YAML.parse(readFileSync(join(dir, WORKFLOW_DIR, "peer-x.yml"), "utf8")).jobs.p.steps;
+    expect(auditDirReferenceViolations(peerSteps, { root: dir }).length).toBeGreaterThanOrEqual(1);
+    // 跟不下去必须响：脚本文件不存在时不许静默当成「没有执行面」。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-x.yml"), peer("node scripts/peer-gone.mjs"));
+    const gaps = workflowWriteSurfaceViolations({ root: dir });
+    expect(gaps.map((v) => v.where)).toEqual(["script-missing"]);
+    expect(gaps[0].reason).toContain("跟不下去");
+    // 良性反面对照 1：只打日志的脚本不是写面。
+    writeFileSync(join(dir, "scripts", "ok.mjs"), "console.log('ok');" + SH);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-x.yml"), peer("node scripts/ok.mjs"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    // 良性反面对照 2：纯 echo 也不是写面（不是「多写一行就红」）。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-x.yml"), peer("echo hi"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+  });
+
+  it("轮二十三-2：本地 composite action 的步骤也是判据面（A-2）", () => {
+    const SH = String.fromCharCode(10);
+    const dir = mkdtempSync(join(tmpdir(), "audit-workflow-composite-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    mkdirSync(join(dir, ".github", "actions", "sneak"), { recursive: true });
+    mkdirSync(join(dir, ".github", "actions", "hello"), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    const composite = (body) =>
+      ["name: local", "description: local composite", "runs:", "  using: composite", "  steps:", "    - shell: bash", "      run: " + body, ""].join(SH);
+    const peer = (uses) =>
+      [
+        "name: peer-composite",
+        "on: pull_request",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - uses: " + uses,
+        "",
+      ].join(SH);
+    // ALLOWED_USES 只管传进来的 stepList（= 真 audit.yml），兄弟 workflow 的本地 uses 此前无人判。
+    writeFileSync(
+      join(dir, ".github", "actions", "sneak", "action.yml"),
+      composite("gh api repos/o/r/check-runs -X PATCH -f conclusion=success"),
+    );
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-composite.yml"), peer("./.github/actions/sneak"));
+    const violations = workflowWriteSurfaceViolations({ root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["peer-composite.yml"]);
+    expect(violations.some((v) => v.where === "check-runs")).toBe(true);
+    // step 入口与 workflow 入口是同一套闭合面：同一份文件两边都红。
+    const peerSteps = YAML.parse(readFileSync(join(dir, WORKFLOW_DIR, "peer-composite.yml"), "utf8")).jobs.p.steps;
+    expect(auditDirReferenceViolations(peerSteps, { root: dir }).length).toBe(1);
+    // 读不到 action.yml 时跟不下去 —— 响，不许静默跳过。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-composite.yml"), peer("./.github/actions/ghost"));
+    const gaps = workflowWriteSurfaceViolations({ root: dir });
+    expect(gaps.map((v) => v.where)).toEqual(["action-missing"]);
+    expect(gaps[0].reason).toContain("读不到 action.yml");
+    // 良性反面对照 1：只 echo 的 composite 不是写面。
+    writeFileSync(join(dir, ".github", "actions", "hello", "action.yml"), composite("echo hi"));
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-composite.yml"), peer("./.github/actions/hello"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    // 嵌套超过深度上限：链跟不下去 → 响（不是「没有执行面」）。
+    const chain = (child) =>
+      ["name: chain", "description: chain", "runs:", "  using: composite", "  steps:", "    - uses: " + child, ""].join(SH);
+    for (const [name, child] of [["a", "b"], ["b", "c"], ["c", "d"], ["d", "e"]]) {
+      mkdirSync(join(dir, ".github", "actions", name), { recursive: true });
+      writeFileSync(join(dir, ".github", "actions", name, "action.yml"), chain("./.github/actions/" + child));
+    }
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-composite.yml"), peer("./.github/actions/a"));
+    const deep = workflowWriteSurfaceViolations({ root: dir });
+    expect(deep.map((v) => v.where)).toEqual(["action-depth"]);
+    expect(deep[0].reason).toContain("嵌套超过 3 层");
+    // 良性反面对照 2：两层的本地链判得下去，不是「一有 uses 就红」。
+    writeFileSync(join(dir, ".github", "actions", "b", "action.yml"), composite("echo hi"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    // 良性反面对照 3：远端白名单 action 的步骤不在仓库里，按白名单放行。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-composite.yml"), peer("actions/checkout@v4"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+  });
+
+  it("轮二十三-3：端点/方法/请求体全进变量时按「跟不下去」响亮（A-3）", () => {
+    const SH = String.fromCharCode(10);
+    // 判据级：三个词全是变量 —— 看不见方法不等于没有方法。
+    expect(checkRunWriteSurface("gh api $EP $M $B")).toBe("check-runs");
+    // 良性反面对照：带变量的**字面量**端点仍可判，回读与别的路径照旧放行。
+    expect(
+      checkRunWriteSurface("gh api repos/$GITHUB_REPOSITORY/commits/abc/check-runs --paginate --slurp > runs.json"),
+    ).toBe(null);
+    expect(checkRunWriteSurface('gh api "repos/o/r/check-runs/$id" --jq .status')).toBe(null);
+    expect(checkRunWriteSurface("gh api repos/o/r/issues/1 --jq .title")).toBe(null);
+    const dir = mkdtempSync(join(tmpdir(), "audit-workflow-blind-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    const blind = (command) =>
+      [
+        "name: peer-blind",
+        "on: pull_request",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    env:",
+        "      EP: repos/o/r/check-runs",
+        "      M: --method PATCH",
+        "      B: -f conclusion=success",
+        "    steps:",
+        "      - run: " + command,
+        "",
+      ].join(SH);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), blind("gh api $EP $M $B"));
+    const violations = workflowWriteSurfaceViolations({ root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["peer-blind.yml"]);
+    expect(violations.map((v) => v.where)).toEqual(["check-runs"]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml", "peer-blind.yml"]);
+    // 同一份载荷从 step 入口进来也得红（不是只堵住 workflow 入口）。
+    const peerSteps = YAML.parse(readFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), "utf8")).jobs.p.steps;
+    expect(auditDirReferenceViolations(peerSteps, { root: dir }).length).toBe(1);
+    // 良性反面对照 1：别的路径的只读查询不是写面。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), blind("gh api repos/o/r/issues/1 --jq .title"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    // 良性反面对照 2：已放行的只读回读形态（分页读页数组）仍放行。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-blind.yml"),
+      blind("gh api repos/o/r/commits/abc/check-runs?filter=all&per_page=100 --paginate"),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
   });
 
   it("轮二十二-5：--paginate --slurp 是页数组 —— 只读第一页会漏判（B2）", () => {

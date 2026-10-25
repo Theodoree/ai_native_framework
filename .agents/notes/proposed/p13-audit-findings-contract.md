@@ -707,3 +707,21 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **裁决：不计分，但必须改口**。攻击前提是「在被审 ref 上跑得起一个带 `checks:write` 的第二个写者」，与已登记的信任根同源（被审对象能改判据，也能再发一条同名结论）；判据层再加厚也闭合不了它。真正需要改的是两处**说过头的话**——`audit.yml` 头段与自证步注释原先写「该形态由自证兜底」，实测只兜住一半。已改成「自证兜住回读时已存在的那一半，回读之后再写入的属 P-14 编排层」，并写明闭合它的两条路：① merge-gate 加时序判据（读到的 audit/audit-runner 晚于本次 merge-gate 开始、或 id 大于 merge-gate 自身 check → 按「未判过」阻断）；② 本次 nonce 写进 Check Run 的 `external_id` 随 artifact 发布、由 merge-gate 比对。两条都要 `scripts/merge-gate.mjs` 配合，属 `platform-rollout-plan` 的 P-14 待办，不在这轮修。
 
 **教训**：注释里的能力声明也是断言，夸大一句就等于给下一个读者一个假的「已解决」。写完「由 X 兜底」必须自己问一遍「X 的观测点在哪一刻，之后发生的事算不算」。
+
+## 二十一、轮二十三：三个入口必须收敛到同一张执行面
+
+轮二十三（审 57391e4 / fe2fcba）两家：review-b `pass`（唯一那条自证快照已裁决为 P-14 前置、降到 `info`）；review-a `needs_revision`，三条**未登记、可执行**的真绕过，全部 0 红：
+
+1. **workflow 入口不跟进被引用的脚本**：兄弟 workflow 只写 `run: node scripts/peer-evil.mjs`，真写在 `scripts/peer-evil.mjs` 里（`execSync('gh api …/check-runs -X PATCH -f conclusion=success')`）→ 178 全绿；同一行内联回 workflow → 9 failed。判据级证据：`workflowWriteSurfaceViolations()`=0 而 `auditDirReferenceViolations([同一步])`=1。
+2. **本地 composite action 完全不可见**：`.github/actions/sneak/action.yml`（`using: composite`，step 里 PATCH check-runs）+ 兄弟 workflow `uses: ./.github/actions/sneak` → 全绿。`ALLOWED_USES` 只作用于传进来的 stepList（真 audit.yml），兄弟 workflow 的 `uses` 无人判。
+3. **端点 / 方法 / 请求体一起进变量**：`gh api $EP $M $B`（env 里 `EP=repos/o/r/check-runs`、`M=--method PATCH`、`B=-f conclusion=success`）→ 全绿。三条写面判据都要求「端点可判或写意图可见」，盲实参保护又要求端点先可见 —— 三者一起进变量时整条真写静默。
+
+**三条不是三个洞，是一张面没闭合**。修法（只改 `tests/audit-findings.test.mjs`，178 → 181 例）：把「执行面」定义成 **step 载荷 + 被引用脚本的 import 闭包 + 本地 composite 的 `runs.steps`**，`stepTexts`:2421 重写成这一张闭合面并对跟不下去的情况 `noteGap`（`script-missing` / `action-missing` / `action-depth`，3 层上限），`workflowSurfaceTexts`:3542 与 `auditDirReferenceViolations` 都在这张面上判、gap 一律判成违规（`GAP_REASONS`:3566 给理由文案）；A-3 按「跟不下去必须响」补 `blindEndpointCall`:3469 —— 端点词**全部**不可解且拿不出只读证据（`-X GET` / `--jq` / `--paginate` …）即算结论写面。
+
+**我的三条探针（/tmp 副本，基线 181）**：脚本藏写 **9 红**、composite 藏写 **9 红**、三元全变量 **9 红**；良性对照 `node scripts/peer-ok.mjs`（只 console.log）、`uses: actions/checkout@v4`、`gh api repos/o/r/issues/1 --jq .title`、`echo hi` 与删掉探针后 **181 全绿**。
+
+**我的六组变异**：`noteGap` 静默 **2 红**、composite 展开关闭 **1 红**、`blindEndpointCall` 恒 false **1 红**、workflow 入口退回仅载荷文本 **3 红**、脚本跟随关闭 **8 红**、子进程包装规则关闭 **1 红**；还原 181 绿。
+
+**登记两条新的假红（不计分，仍是取舍）**：① `$GH_CLI api <非 check-runs 端点>` 因动态命令头落 overflow 被一刀切判写面；② 兄弟 workflow 里裸端点挂 env（没有调用）不判红。前者是默认拒绝方向上的误报，会在真实仓库里误伤「把 gh 别名成变量」这类写法，记下来以便将来真被误伤时有据可查。
+
+**取舍说明（修复者提出、我认可）**：被跟随脚本里的 `child_process` 不能一律判红 —— `scripts/merge-gate.mjs`、`scripts/writer-record.mjs` 都在 child_process 里调 gh，一律判红会把真仓库的 `workflowWriteSurfaceViolations() === []` 打死。所以窄口径：**同一行同时点名 `check-runs`/`graphql`** 才算跟不下去。`scriptTree().missing` 里混着 `verdict.json`/`intent.json` 这类数据文件名，只对 `SCRIPT_EXT` 命中的缺失文件记 `script-missing`。
