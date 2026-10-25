@@ -743,3 +743,23 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 整仓 `npm run check` = 13 files / **352 tests**、oxlint 0/0。
 
+
+## 二十三、轮二十五：按真实解析规则解析（静态判据在此冻结）
+
+**六条同批修复（`62c7a5a` → 本提交）**，两家审查（review-a 4 条 / review-b 2 条）各自独立复现、我也逐条复现过：
+
+| id | 形态 | 修前 | 根因 | 修法 |
+|---|---|---|---|---|
+| R25-B-1 high | 目录 local action + 同级散落 `sneak.yml` 诱饵 | **0 红** | 候选表按路径拼接，`base+".yml"` 排在 `join(base,"action.yml")` 前；GitHub 对目录 uses 只执行 `<dir>/action.yml` | `localActionSteps`:2057 按真实规则：目录只认 `ACTION_FILES`（`action.yml`/`action.yaml`）；`base` 是文件 → `action-using`（不读当正文）；空目录 → `action-missing` |
+| R25-B-2 medium | 步级 `working-directory` 不改解析基准 | 0 红 + **假红**（良性脚本只在 `tools/` 下也红） | `follow` 恒按仓库根解析 | `resolveUnderWorkDir`:1939 + `stepWorkingDir`:4153/`jobWorkingDir`:4159；基准 = 根 + step wd → job `defaults.run` → 根；变量/逃逸 → `script-missing` |
+| R25-A-1 high | 端点字面量 + `env: M/B` 供方法与请求体 | 0 红 | 赋值表只由 `simpleAssignments(run 文本)` 产出，YAML `env` 从不进表 | `envAssignments`:3161 / `surfaceAssignments`:3187（workflow → job → step 内层覆盖） |
+| R25-A-2 high | `… $EP $M $B 2>&1` 或加 `-H` | 0 红 | 守卫前置条件是「词**全盲**」，多一个无关词就整条关闭 | `stripRedirects`:1462 + `endpointPositionUndecidable`:3778（改成「端点位置不可判」+ 旗标-取值成对跳过） |
+| R25-A-3 high | `curl -sS -g "$U" $B`（小写 `-g` = `--globoff`） | 0 红 | `READ_ONLY_REQUEST` 带 `/i` | `readOnlyMethodProof`:3741：旗标 token 大小写敏感（`-G` ≠ `-g`，`--get` ≠ `--globoff`） |
+| R25-A-4 medium | `-H "X-Note: -X GET"` 取得只读证明 | 0 红 | 证明取自 `words.join(" ")` 子串 | 证明只从 token 化后的旗标位置读，header/取值一律跳过 |
+
+**我的独立复核（`/tmp/vrf-r30`，基线 192 passed）**：B-1 诱饵形态 → 10 红；B-2 `working-directory: tools` + 根诱饵 → 10 红、良性（只有 `tools/scripts/ok.mjs` 打日志）→ 192 绿；A-1/A-2/A-3/A-4 四种攻击各 10 红；良性 `gh api $EP -X GET --jq .title`、`curl --get -d filter=all` 全绿；清理后 192 绿。执行器另有 12 组变异全红（候选表回退 / base 是文件照读 / 忽略 step wd / 忽略 job defaults / 变量 wd 回落根 / env 不进表 / 不摘重定向 / `-g` 当证明 / `--globoff` 当证明 / 退回 `join(" ")` / 短旗标取值不跳 / `--header` 取值不跳）。
+
+**两轮审查共同指出的规律（写在这里备查）**：判据的洞分两种 —— ① 依据不是从「真实解析规则」来的（路径拼接顺序、`join(" ")` 子串、`/i` 大小写宽松），② 依据的**前置条件**可以被无关输入整体关掉（`2>&1` 关掉「词全盲」、`-H` 关掉端点可判）。第二种比第一种更危险：它不需要理解判据，只需要加一个合法的 shell 语法。
+
+**静态判据在此冻结（`62c7a5a`+本提交为终点）**：静态分析追的是文本，攻击面是开放集；继续加厚的边际收益已经低于它的成本（每轮都在造新规则、新替身、新变异）。真正的收口在运行时那两层 —— PR #10 已有的**自证步**（回读本 sha 上 `name=audit`、比 `name/app.slug/status/conclusion` 四字段、按 max id 判「会被读到的那条」）与 P-14 的**编排层**（从受信 ref dispatch、merge-gate 读时序）。此后新发现的静态绕过只登记进本节，不再返修。
+

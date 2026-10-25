@@ -8,6 +8,8 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1452,6 +1454,52 @@ try {
     return words;
   }
 
+  // shell 的重定向不是实参：`2>&1` / `> f` / `>> f` / `2> f` / `&> f` 的目标是文件描述符或
+  // 文件名。不摘掉它们，切词会把 `2>&1` 切成一个孤零零的 `"2"` 词落进端点候选 ——
+  // 端点位置于是被判成「可判」，整条盲端点守卫被一个最常见的写法关掉（实测 186 全绿）。
+  // 只摘引号**外**的重定向：引号里的 `>` 是普通字符（`-f body="a>b"`）。
+  const REDIRECT_HEAD = /^(?:[0-9]*>>?|&>>?|&>)/;
+  function stripRedirects(line) {
+    const text = String(line);
+    let out = "";
+    let index = 0;
+    while (index < text.length) {
+      const char = text[index];
+      if (char === "'" || char === '"') {
+        const quote = char;
+        out += char;
+        index += 1;
+        while (index < text.length && text[index] !== quote) {
+          if (quote === '"' && text[index] === "\\") {
+            out += text[index] + (text[index + 1] ?? "");
+            index += 2;
+            continue;
+          }
+          out += text[index];
+          index += 1;
+        }
+        if (index < text.length) {
+          out += text[index];
+          index += 1;
+        }
+        continue;
+      }
+      const prev = index === 0 ? " " : text[index - 1];
+      const head = /[\s;&|()]/.test(prev) ? REDIRECT_HEAD.exec(text.slice(index)) : null;
+      if (!head) {
+        out += char;
+        index += 1;
+        continue;
+      }
+      index += head[0].length;
+      while (index < text.length && /[ \t]/.test(text[index])) index += 1;
+      const target = /^(?:&[0-9]+|[0-9]+|[^\s;&|<>]+)/.exec(text.slice(index));
+      if (target) index += target[0].length;
+      out += " ";
+    }
+    return out;
+  }
+
   function shellCommands(runText) {
     const commands = [];
     for (const line of foldContinuations(runText).split("\n").map(stripShellComment)) {
@@ -1709,15 +1757,18 @@ try {
 
   // 引用解析：带扩展名直接用；无扩展名（node 照跑的 CJS）按 .mjs/.cjs/.js 补全探测；
   // 探测不到**也保留名字进 missing** —— 静默丢弃正是这一批绕过面的共同根因。
-  function resolveScriptRef(root, raw) {
+  function resolveScriptRef(root, raw, cwd = "") {
     const rel = unquote(raw).replace(/^\.\//, "");
     if (!rel || rel.startsWith("-")) return null;
     if (SCRIPT_EXT.test(rel)) return rel;
-    const abs = scriptPath(root, rel);
+    // 存在性探测要落在**生效的 working directory** 上：无扩展名的脚本坐在子目录里时，
+    // 按仓库根探测会误判「不存在」，把可跟随的引用降成跟不下去。
+    const under = (name) => scriptPath(root, cwd ? posix.join(cwd, name) : name);
+    const abs = under(rel);
     if (abs && existsSync(abs)) return rel;
     for (const ext of SCRIPT_EXTS) {
       const candidate = rel + ext;
-      const absCandidate = scriptPath(root, candidate);
+      const absCandidate = under(candidate);
       if (absCandidate && existsSync(absCandidate)) return candidate;
     }
     return rel;
@@ -1730,7 +1781,7 @@ try {
     const refs = [];
     const unfollowable = [];
     const add = (raw) => {
-      const rel = resolveScriptRef(root, raw);
+      const rel = resolveScriptRef(root, raw, options.cwd);
       if (rel && !refs.includes(rel)) refs.push(rel);
     };
     for (const words of shellCommands(runText)) {
@@ -1765,7 +1816,7 @@ try {
     const refs = [];
     const unfollowable = [];
     const add = (raw) => {
-      const rel = resolveScriptRef(root, raw);
+      const rel = resolveScriptRef(root, raw, options.cwd);
       if (rel && !refs.includes(rel)) refs.push(rel);
     };
     const visit = (body, depth) => {
@@ -1881,6 +1932,19 @@ try {
     return normalized === "." ? "" : normalized;
   }
 
+  // 相对路径落到「仓库根 + 生效 working directory」上：`..` 允许，但不许逃出仓库根；
+  // 目录里含变量（${{ … }} / $VAR）静态不可解。解不出就返回 null —— 调用方按默认拒绝判红，
+  // 不许拿仓库根顶替（顶替一次，诱饵就能换一次绿）。
+  const DYNAMIC_WORK_DIR = /\$/;
+  function resolveUnderWorkDir(workDir, rel) {
+    const raw = String(rel ?? "");
+    if (!raw || raw.startsWith("/")) return null;
+    if (DYNAMIC_WORK_DIR.test(workDir)) return null;
+    const joined = posix.normalize(posix.join(workDir === "" ? "." : workDir, raw));
+    if (joined === "." || joined === ".." || joined.startsWith("../")) return null;
+    return joined;
+  }
+
   // 一份载荷被执行到的脚本引用：shell 字段按 custom shell 命令解，其余按 shell 词法 + loader 取值。
   function payloadScriptRefs(payload, options = {}) {
     // 工作目录进引用判定（`.audit` 就是 `.audit`），但不进脚本跟随：
@@ -1933,17 +1997,19 @@ try {
         unfollowable.push({ kind: "loader-dynamic", detail: match[0].trim() });
         continue;
       }
-      const rel = resolveScriptRef(root, value);
+      const rel = resolveScriptRef(root, value, options.cwd);
       if (rel && !refs.includes(rel)) refs.push(rel);
     }
     // 短旗标不产生 unfollowable：解不出的 -r 不是 loader（见上），它该红的理由是
     // 「非写者步引用了载体」，由引用判据负责，不由「跟不下去」兜。
     for (const match of String(text).matchAll(LOADER_FLAG_SHORT)) {
-      const rel = resolveScriptRef(root, match[1]);
+      const rel = resolveScriptRef(root, match[1], options.cwd);
       // 门槛就是上面注释说的判据：解出来的路径**真实存在**才算模块取值。
       // resolveScriptRef 对不存在的路径也返回 rel（它只做归一），于是 jq -r .verdict 的
       // `.verdict` 被当成模块名落进 missing —— 红得莫名其妙，用噪音盖住真相。
-      if (rel && existsSync(scriptPath(root, rel)) && !refs.includes(rel)) refs.push(rel);
+      // 存在性同样按生效 working directory 探（options.cwd 为空时就是仓库根）。
+      const abs = rel ? scriptPath(root, options.cwd ? posix.join(options.cwd, rel) : rel) : null;
+      if (rel && abs && existsSync(abs) && !refs.includes(rel)) refs.push(rel);
     }
     return { refs, unfollowable };
   }
@@ -1982,10 +2048,26 @@ try {
   const NODE_ACTION_USING = /^node/i;
   const ACTION_ENTRY_KEYS = ["main", "pre", "post"];
   const MAX_ACTION_DEPTH = 3;
+  // `uses: ./path` 的正文**由 GitHub 的解析规则定**，不是按路径拼接顺序找一个存在的文件：
+  // path 必须是目录，正文只可能是 <dir>/action.yml（其次 <dir>/action.yaml）。
+  // 把 base + ".yml" 放进候选，就等于允许一份同名散落文件顶掉真正的正文 —— 而 GitHub 从不
+  // 执行那个散落文件，于是「诱饵写良性 composite、真正文写 node20 + execSync」的 action
+  // 在扫描面上只剩诱饵（实测 186 全绿 / 0 红）。
+  const ACTION_FILES = ["action.yml", "action.yaml"];
   function localActionSteps(root, uses) {
     const base = join(root, uses);
-    const candidates = [base, base + ".yml", base + ".yaml", join(base, "action.yml"), join(base, "action.yaml")];
-    for (const candidate of candidates) {
+    if (!existsSync(base)) return null;
+    // uses 指向一个**文件**（`./.github/actions/x.yml`）不是 local action 的形态：
+    // GitHub 不会执行它，所以它也不是正文来源 —— 记 invalid，由调用方按 action-using 判红。
+    let isDirectory = false;
+    try {
+      isDirectory = statSync(base).isDirectory();
+    } catch {
+      isDirectory = false;
+    }
+    if (!isDirectory) return { file: base, using: "", entries: [], steps: [], invalid: "not-a-directory" };
+    for (const name of ACTION_FILES) {
+      const candidate = join(base, name);
       if (!existsSync(candidate)) continue;
       let doc = null;
       try {
@@ -2005,6 +2087,7 @@ try {
         : [];
       return { file: candidate, using, entries, steps: Array.isArray(runs.steps) ? runs.steps : [] };
     }
+    // 目录在、两个 action.yml 都不在（或不成文档）：正文读不到，交给 action-missing 判红。
     return null;
   }
 
@@ -2476,8 +2559,24 @@ try {
       gaps.push(entry);
     };
     const visit = (one, depth, label) => {
-      const follow = (rel, where) => {
-        const tree = scriptTree(root, rel);
+      // 脚本引用按「仓库根 + 生效的 working directory」解析：`run:` 里的相对路径相对这一步的
+      // cwd，不是相对仓库根。取不出目录（含变量 / 逃出仓库根）就是跟不下去 —— 不许静默回落
+      // 仓库根，回落一次就等于「根上放同名良性诱饵、真文件挪进子目录」换一次全绿。
+      const workDir = stepWorkingDir(one, options);
+      // 这一步能看见的 env（step 覆盖 job、job 覆盖 workflow）：它是赋值表的一层。
+      const envMap = envAssignments([options.workflowEnv, options.jobEnv, one.env]);
+      const follow = (rel, where, base = "workdir") => {
+        const target = base === "workdir" ? resolveUnderWorkDir(workDir, rel) : rel;
+        if (target === null) {
+          noteGap({
+            step: label,
+            where,
+            kind: "script-missing",
+            detail: rel + "（脚本目录解析不出，生效 working directory：" + (workDir || "仓库根") + "）",
+          });
+          return;
+        }
+        const tree = scriptTree(root, target);
         // 只对**脚本**引用要求解析成功：扫描面还会收进 node 命令后面的数据文件名
         // （`node scripts/writer-record.mjs verdict.json`），那不是被跟随的脚本。
         for (const gone of tree.missing) {
@@ -2487,18 +2586,18 @@ try {
         }
         for (const file of tree.files) {
           const abs = scriptPath(root, file);
-          if (abs && existsSync(abs)) texts.push({ where: file, text: readFileSync(abs, "utf8") });
+          if (abs && existsSync(abs)) texts.push({ where: file, text: readFileSync(abs, "utf8"), envMap });
           else noteGap({ step: label, where, kind: "script-missing", detail: file });
         }
       };
       for (const payload of stepPayloads(one)) {
-        texts.push({ where: payload.carrier, text: payload.text });
+        texts.push({ where: payload.carrier, text: payload.text, envMap });
         // 脚本名落在被截断的命令替换里：引用看见了，词序列里只剩碎片 —— 记 gap。
         for (const gap of substitutionScriptGaps(payload.text)) {
           noteGap({ step: label, where: payload.carrier, ...gap });
         }
       }
-      for (const rel of stepScriptRefs(one, { root })) follow(rel, rel);
+      for (const rel of stepScriptRefs(one, { root, cwd: workDir })) follow(rel, rel);
       // uses 是第二类载体：本地 action 的实现在仓库里，必须跟到底；远端 action 的行为不在
       // 仓库里，只有白名单能证明它不碰写面 —— 认不出就是跟不下去（不再静默 return）。
       if (typeof one.uses !== "string") return;
@@ -2517,6 +2616,16 @@ try {
         noteGap({ step: label, where: "uses", kind: "action-missing", detail: one.uses });
         return;
       }
+      // `uses` 指到文件：不是 local action 的形态，GitHub 不会执行这个路径。
+      if (action.invalid) {
+        noteGap({
+          step: label,
+          where: "uses",
+          kind: "action-using",
+          detail: one.uses + " —— local action 必须是目录 + action.yml，这个路径 GitHub 不会执行",
+        });
+        return;
+      }
       // composite：正文就是 runs.steps。
       if (action.steps.length > 0) {
         for (const sub of action.steps) visit(sub, depth + 1, label);
@@ -2528,7 +2637,7 @@ try {
           noteGap({ step: label, where: "uses", kind: "action-using", detail: one.uses });
           return;
         }
-        for (const entry of action.entries) follow(entry, one.uses + " → " + entry);
+        for (const entry of action.entries) follow(entry, one.uses + " → " + entry, "root");
         return;
       }
       // docker / 认不出的 using / 读了 action.yml 却没有正文：执行面在这里断了。
@@ -3039,6 +3148,46 @@ try {
     return map;
   }
 
+  // ---- YAML 的 env 也是赋值表的一层 ----
+  // `env: { M: "-X POST", B: "-d @body.json" }` 与 run 里的 `M="-X POST"` 是同一件事：
+  // 方法 / 请求体从 YAML 进环境，`gh api <endpoint> $M $B` 的写意图整条藏在 env 里。
+  // 只从 run 文本收赋值时，$M / $B 既不在表里也不在 unresolved 里 —— 窄化守卫与写意图同时
+  // 失效（实测 186 全绿 / 0 红）。内层覆盖外层：step.env → job.env → workflow.env。
+  function envValueText(value) {
+    if (typeof value === "string") return value.trim();
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    return "";
+  }
+  function envAssignments(layers) {
+    const map = new Map();
+    map.unresolved = new Set();
+    map.truncated = false;
+    for (const layer of layers ?? []) {
+      if (!layer || typeof layer !== "object") continue;
+      for (const [name, value] of Object.entries(layer)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+        const text = envValueText(value);
+        if (!text) continue;
+        // 值里含变量（${{ … }} / $VAR）或命令替换：静态层展开不了 → unresolved（不是丢弃），
+        // 引用到它就按命令级默认拒绝。
+        if (/[$\x60]/.test(text)) {
+          map.delete(name);
+          map.unresolved.add(name);
+          continue;
+        }
+        map.unresolved.delete(name);
+        map.set(name, text);
+      }
+    }
+    return map;
+  }
+
+  // 一份载荷文本的赋值表：作用域内的 env 打底，run 文本里的赋值覆盖它
+  // —— shell 里 `M=… gh api $M` 就是覆盖环境变量。
+  function surfaceAssignments(text, envMap) {
+    return mergeAssignmentMaps(envMap ?? new Map(), simpleAssignments(String(text ?? "")));
+  }
+
   function expandAssignments(text, assignments) {
     if (!assignments || assignments.size === 0) return String(text);
     return String(text).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (whole, braced, plain) => {
@@ -3198,7 +3347,8 @@ try {
         return;
       }
       const expanded = expandAssignments(String(text), map);
-      for (const words of shellCommands(expanded)) {
+      // 重定向（含 `2>&1` 的残留词）先摘掉：它是 shell 的接线，不是这次调用的实参。
+      for (const words of shellCommands(stripRedirects(expanded))) {
         if (words.length === 0) continue;
         // 客户端不一定在第 0 个词：workflow 里的行常带 YAML 前缀（`- run: gh api …`、
         // `- run: |` 的正文）与赋值前缀（`id=$(gh api …)`）。按词扫，别按位置猜。
@@ -3557,13 +3707,101 @@ try {
   // 能证明「这一次是读」的只有**方法**：gh 的 -X GET / -XGET / --method GET / --method=GET，
   // curl 的 -G/--get。--jq / -q / --template / --paginate / --slurp 是响应整形与分页读取，
   // 它们不约束方法 —— 最多作为「与已证明 GET 同时出现」的附加证据，绝不能单独放行。
-  const READ_ONLY_REQUEST = /(?:^|\s)(?:-X\s*GET|--method(?:\s+|=)GET)(?=\s|$)|(?:^|\s)(?:-G|--get)(?=\s|$)/i;
+  // 「这一次是读」只能由**方法**证明，且证明必须从 token 化后的旗标位置读：
+  // 在拼好的整段文本上做子串匹配时，`-H "X-Note: -X GET"` 就冒充了读证明（实测 186 全绿）。
+  // 旗标名大小写敏感：curl 的 -G 是 --get，-g 是 --globoff —— 把 -g 读成读证明等于给写开门。
+  // 方法**取值**大小写不敏感（`-X get` 与 `-X GET` 是同一个方法）。
+  const VALUE_LONG_FLAGS = new Set([
+    "--header",
+    "--data",
+    "--data-ascii",
+    "--data-binary",
+    "--data-raw",
+    "--data-urlencode",
+    "--form",
+    "--form-string",
+    "--output",
+    "--user",
+    "--upload-file",
+    "--input",
+    "--method",
+    "--request",
+    "--raw-field",
+    "--field",
+    "--target-directory",
+    "--jq",
+    "--template",
+    "--url",
+    "--write-out",
+    "--cookie",
+    "--cookie-jar",
+  ]);
+  const ENDPOINT_VALUE_LETTERS = { gh: "fFXHq", curl: "dFTXmoHuAebc" };
+
+  function readOnlyMethodProof(call) {
+    const words = call.words;
+    const valueLetters = ENDPOINT_VALUE_LETTERS[call.head] ?? "";
+    for (let index = call.start + 1; index < words.length; index += 1) {
+      const word = String(words[index]);
+      if (word.startsWith("--")) {
+        const at = word.indexOf("=");
+        const name = at >= 0 ? word.slice(0, at) : word;
+        const inline = at >= 0 ? word.slice(at + 1) : null;
+        if (name === "--method" || name === "--request") {
+          return READ_METHODS.has(String(inline ?? words[index + 1] ?? "").toUpperCase());
+        }
+        // gh 没有 --get；curl 的 --get 把体翻成查询串，是只读证明。
+        if (name === "--get") return call.head !== "gh";
+        if (inline === null && VALUE_LONG_FLAGS.has(name)) index += 1;
+        continue;
+      }
+      const walk = shortFlagWalk(word, valueLetters);
+      if (!walk) continue;
+      if (walk.valueLetter === "X") {
+        const value = walk.value !== "" ? walk.value : (words[index + 1] ?? "");
+        return READ_METHODS.has(String(value).toUpperCase());
+      }
+      if (walk.valueLetter !== null) {
+        // 取值贴着旗标（-d@body.json）就不吃下一个词。
+        if (walk.value === "") index += 1;
+        continue;
+      }
+      // 大小写敏感的短旗标：只认大写 -G（= --get）；-g 是 --globoff，不是读证明。
+      if (walk.seen.includes("G") && call.head !== "gh") return true;
+    }
+    return false;
+  }
+
+  // 端点位置「不可判」= 跳过旗标与其取值之后，剩下的候选词**没有一个**能定出端点。
+  // 旧判据要求端点词「全部」不可解，于是多一个无关词（`2>&1` 的残留、header 取值）就把
+  // 整条守卫关掉 —— 一只手就能关掉的守卫不是守卫。
+  function endpointPositionUndecidable(state) {
+    const call = state.call;
+    const words = call.words;
+    const valueLetters = ENDPOINT_VALUE_LETTERS[call.head] ?? "";
+    for (let index = call.start + (call.head === "gh" ? 2 : 1); index < words.length; index += 1) {
+      const word = String(words[index]);
+      if (word.startsWith("--")) {
+        const at = word.indexOf("=");
+        const name = at >= 0 ? word.slice(0, at) : word;
+        if (at < 0 && VALUE_LONG_FLAGS.has(name)) index += 1;
+        continue;
+      }
+      const walk = shortFlagWalk(word, valueLetters);
+      if (walk) {
+        if (walk.valueLetter !== null && walk.value === "") index += 1;
+        continue;
+      }
+      if (!BLIND_ENDPOINT_WORD.test(unquote(word))) return false;
+    }
+    return true;
+  }
+
   function blindEndpointCall(state) {
     if (state.writeIntent) return false;
-    // 端点词**全部**不可解才算「跟不下去」：看得见的那条字面量端点已经能定这一次调用的面。
     if (state.words.length === 0) return false;
-    if (!state.words.every((word) => BLIND_ENDPOINT_WORD.test(unquote(String(word ?? ""))))) return false;
-    return !READ_ONLY_REQUEST.test(state.call.words.join(" "));
+    if (!endpointPositionUndecidable(state)) return false;
+    return !readOnlyMethodProof(state.call);
   }
 
   function checkRunWriteSurface(line, assignments) {
@@ -3643,11 +3881,17 @@ try {
     // 解析不了就没有结构可判：回落到整份文本 —— 判不了不等于没有写面。
     if (!structured) return [{ where: file, text: source }];
     const texts = [];
+    const workflowEnv = doc.env;
     for (const job of Object.values(doc.jobs)) {
       if (!job || typeof job !== "object") continue;
-      for (const payload of jobPayloads(job, doc)) texts.push({ where: payload.carrier, text: payload.text });
+      const jobForms = jobPayloads(job, doc);
+      // job 级载荷自己也在 job.env 的作用域里（`env: { M: -X POST }` + job 级 run 判同一张表）。
+      const jobEnvMap = envAssignments([workflowEnv, job.env]);
+      for (const payload of jobForms) {
+        texts.push({ where: payload.carrier, text: payload.text, envMap: jobEnvMap });
+      }
       for (const step of Array.isArray(job.steps) ? job.steps : []) {
-        texts.push(...stepTexts(step, { root, gaps }));
+        texts.push(...stepTexts(step, { root, gaps, jobPayloads: jobForms, jobEnv: job.env, workflowEnv }));
       }
     }
     // 一份 workflow 的载荷全空（结构里没有可判文本）时同样回落整份文本，避免「没载荷 = 没写面」。
@@ -3690,9 +3934,10 @@ try {
       const gaps = [];
       // 跟不下去的文件同样算「命中」：它的写面证明不了不存在。
       return (
-        workflowSurfaceTexts(file, root, gaps).some(
-          (entry) => checkRunWriteSurface(payloadSurfaceText(entry.text), assignments) !== null,
-        ) || gaps.length > 0
+        workflowSurfaceTexts(file, root, gaps).some((entry) => {
+          const text = payloadSurfaceText(entry.text);
+          return checkRunWriteSurface(text, surfaceAssignments(text, entry.envMap ?? assignments)) !== null;
+        }) || gaps.length > 0
       );
     });
   }
@@ -3725,9 +3970,11 @@ try {
       }
       for (const entry of entries) {
         const payload = payloadSurfaceText(entry.text);
+        // 这一份载荷自己的 env 作用域 + 它自己写的赋值，覆盖文件级那张表。
+        const entryAssignments = mergeAssignmentMaps(assignments, entry.envMap ?? new Map());
         for (const rawLine of payload.split("\n")) {
           const line = rawLine;
-          const surface = checkRunWriteSurface(line, assignments);
+          const surface = checkRunWriteSurface(line, surfaceAssignments(line, entryAssignments));
           if (!surface) continue;
           const key = file + "\u0000" + surface + "\u0000" + line.trim();
           if (seen.has(key)) continue;
@@ -4075,7 +4322,11 @@ try {
       const name = step.name ?? step.id;
       // cwd 随行携带：同一行文本在 cwd=.audit 与在仓库根下指的是两份不同的路径。
       const cwd = stepWorkingDir(step, options);
-      for (const { where, text } of stepTexts(step, { root, gaps })) texts.push({ name, where, text, cwd });
+      const jobEnv = options.jobEnv;
+      const workflowEnv = options.workflowEnv;
+      for (const entry of stepTexts(step, { root, gaps, jobEnv, workflowEnv })) {
+        texts.push({ name, where: entry.where, text: entry.text, cwd, envMap: entry.envMap });
+      }
     }
     // 跟不下去就响：脚本解析不到 / 本地 action 读不到 / 嵌套超限 —— 静默跳过等于给分叉留后门。
     for (const gap of gaps) {
@@ -4087,12 +4338,15 @@ try {
       });
     }
     const jobCwd = jobWorkingDir(options.jobPayloads ?? []);
+    const jobEnvMap = envAssignments([options.workflowEnv, options.jobEnv]);
     for (const { source, where, text } of jobPayloadTexts(options.jobPayloads ?? [], { root })) {
-      texts.push({ name: source, where, text, cwd: jobCwd });
+      texts.push({ name: source, where, text, cwd: jobCwd, envMap: jobEnvMap });
     }
-    for (const { name, where, text, cwd } of texts) {
-      // 同一份载荷里的简单赋值：`F="-d @body.json"` 下一行的 `$F` 必须看得见。
-      const assignments = simpleAssignments(text);
+    for (const entry of texts) {
+      const { name, where, text, cwd } = entry;
+      // 同一份载荷里的简单赋值：`F="-d @body.json"` 下一行的 `$F` 必须看得见；
+      // 作用域内的 YAML env 是同一张表的外层。
+      const assignments = surfaceAssignments(text, entry.envMap);
       // 命令替换嵌套超过 3 层的正文跟不下去 —— 响，不静默当无。
       for (const body of substitutionExpansion(String(text)).overflow) {
         violations.push({
@@ -7811,6 +8065,293 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
     // 良性反面对照 2：命令替换里没有脚本名（$(date)）也不制造假 gap。
     writeFileSync(join(dir, WORKFLOW_DIR, "peer-script.yml"), peer24(["- run: echo $(date)"]));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+  });
+
+  it("轮二十五-1：local action 只认 <dir>/action.yml —— 同级散落 yml 不能顶替正文", () => {
+    const dir = fixture24("audit-local-action-");
+    const bait = [
+      "name: sneak-bait",
+      "description: sneak-bait",
+      "runs:",
+      "  using: composite",
+      "  steps:",
+      "    - shell: bash",
+      "      run: echo benign",
+      "",
+    ].join(SH24);
+    const nodeAction = [
+      "name: sneak",
+      "description: sneak",
+      "runs:",
+      "  using: node20",
+      "  main: index.js",
+      "",
+    ].join(SH24);
+    const evilIndex = [
+      'import { execSync } from "node:child_process";',
+      'execSync("gh api repos/o/r/check-runs -X PATCH -f conclusion=success");',
+      "",
+    ].join(SH24);
+    mkdirSync(join(dir, ".github", "actions", "sneak"), { recursive: true });
+    writeFileSync(join(dir, ".github", "actions", "sneak.yml"), bait);
+    writeFileSync(join(dir, ".github", "actions", "sneak", "action.yml"), nodeAction);
+    writeFileSync(join(dir, ".github", "actions", "sneak", "index.js"), evilIndex);
+    // 判据级：正文是 <dir>/action.yml 的 runs.main，同级散落文件根本不进执行面。
+    const gaps = [];
+    const texts = stepTexts({ id: "p", uses: "./.github/actions/sneak" }, { root: dir, gaps });
+    expect(gaps).toEqual([]);
+    expect(texts.map((entry) => entry.where)).toContain(".github/actions/sneak/index.js");
+    expect(texts.some((entry) => entry.text.includes("sneak-bait"))).toBe(false);
+    // 端到端：加诱饵也红（旧候选表在这里 0 红）。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-action.yml"), peer24(["- uses: ./.github/actions/sneak"]));
+    const violations = workflowWriteSurfaceViolations({ root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["peer-action.yml"]);
+    expect(violations.map((v) => v.where)).toEqual(["check-runs"]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml", "peer-action.yml"]);
+    // 无诱饵对照：删掉散落文件仍然红 —— 红的理由是真正的正文，不是诱饵的有无。
+    rmSync(join(dir, ".github", "actions", "sneak.yml"));
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    // 诱饵挪进目录但改名 .yml：同样不许顶替 <dir>/action.yml。
+    writeFileSync(join(dir, ".github", "actions", "sneak", ".yml"), bait);
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    // uses 指到文件：GitHub 不会执行这个路径 —— 记 action-using，不许照读它的正文。
+    writeFileSync(join(dir, ".github", "actions", "sneak.yml"), bait);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-action.yml"), peer24(["- uses: ./.github/actions/sneak.yml"]));
+    const asFile = workflowWriteSurfaceViolations({ root: dir });
+    expect(asFile.map((v) => v.where)).toEqual(["action-using"]);
+    expect(asFile[0].excerpt).toContain("必须是目录 + action.yml");
+    // 目录在、两个 action.yml 都不在：跟不下去必须响（action-missing）。
+    mkdirSync(join(dir, ".github", "actions", "hollow"), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-action.yml"), peer24(["- uses: ./.github/actions/hollow"]));
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["action-missing"]);
+    // 良性反面对照：同形状的合法目录 action（无诱饵、正文只打日志）两入口都零违规。
+    mkdirSync(join(dir, ".github", "actions", "hello"), { recursive: true });
+    writeFileSync(join(dir, ".github", "actions", "hello", "action.yml"), nodeAction);
+    writeFileSync(join(dir, ".github", "actions", "hello", "index.js"), "console.log('ok');" + SH24);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-action.yml"), peer24(["- uses: ./.github/actions/hello"]));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+    expect(auditDirReferenceViolations(surfaceSteps(dir, "peer-action.yml"), { root: dir })).toEqual([]);
+  });
+
+  it("轮二十五-2：脚本解析要认 working-directory（含 job defaults）", () => {
+    const dir = fixture24("audit-workdir-");
+    mkdirSync(join(dir, "tools", "scripts"), { recursive: true });
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    // 根上的同名良性诱饵 + tools 下的真恶意脚本：按仓库根解析时跟到的是诱饵（0 红）。
+    writeFileSync(join(dir, "scripts", "x.mjs"), "console.log('bait');" + SH24);
+    writeFileSync(
+      join(dir, "tools", "scripts", "x.mjs"),
+      'execSync("gh api repos/o/r/check-runs -X PATCH -f conclusion=success");' + SH24,
+    );
+    // 判据级：step 级 working-directory 是解析基准。
+    const texts = stepTexts({ id: "p", "working-directory": "tools", run: "node scripts/x.mjs" + SH24 }, { root: dir });
+    expect(texts.map((entry) => entry.where)).toContain("tools/scripts/x.mjs");
+    expect(texts.some((entry) => entry.text.includes("check-runs"))).toBe(true);
+    // 归一：./tools/ 与写死的工作目录等价。
+    expect(
+      stepTexts({ id: "p", "working-directory": "./tools/", run: "node scripts/x.mjs" + SH24 }, { root: dir })
+        .map((entry) => entry.where)
+        .filter((where) => where.endsWith(".mjs")),
+    ).toEqual(["tools/scripts/x.mjs"]);
+    // 逃出仓库根：不许跟出去，记 script-missing（默认拒绝）。
+    const escapeGaps = [];
+    stepTexts({ id: "p", "working-directory": "../outside", run: "node scripts/x.mjs" + SH24 }, {
+      root: dir,
+      gaps: escapeGaps,
+    });
+    expect(escapeGaps.map((gap) => gap.kind)).toEqual(["script-missing"]);
+    // 端到端（step 级）：working-directory: tools + node scripts/x.mjs 必须红。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-wd.yml"),
+      peer24(["- run: node scripts/x.mjs", "  working-directory: tools"]),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    // 端到端（job 级 defaults）：同一份脚本引用换个位置写，结论不许变。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-wd.yml"),
+      [
+        "name: peer-25",
+        "on: pull_request",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    defaults:",
+        "      run:",
+        "        working-directory: tools",
+        "    steps:",
+        "      - run: node scripts/x.mjs",
+        "",
+      ].join(SH24),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    // 假红对照：只有 tools/scripts/ok.mjs（根上没有同名文件）—— 按仓库根解析会跟丢并假红。
+    rmSync(join(dir, "tools", "scripts", "x.mjs"));
+    rmSync(join(dir, "scripts", "x.mjs"));
+    writeFileSync(join(dir, "tools", "scripts", "ok.mjs"), "console.log('ok');" + SH24);
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-wd.yml"),
+      peer24(["- run: node scripts/ok.mjs", "  working-directory: tools"]),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+    expect(auditDirReferenceViolations(surfaceSteps(dir, "peer-wd.yml"), { root: dir })).toEqual([]);
+    // 目录含变量：静态层解不出 —— script-missing（默认拒绝，不许静默回落仓库根）。
+    // 根上放一份**存在且良性**的同名脚本：回落仓库根就会跟到它并静默变绿，所以这条是判据级的。
+    writeFileSync(join(dir, "scripts", "ok.mjs"), "console.log('ok');" + SH24);
+    const dynGaps = [];
+    stepTexts({ id: "p", "working-directory": "${{ github.workspace }}/tools", run: "node scripts/ok.mjs" + SH24 }, {
+      root: dir,
+      gaps: dynGaps,
+    });
+    expect(dynGaps.map((gap) => gap.kind)).toEqual(["script-missing"]);
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-wd.yml"),
+      peer24(["- run: node scripts/ok.mjs", '  working-directory: "${{ github.workspace }}/tools"']),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["script-missing"]);
+  });
+
+  it("轮二十五-3：env 也是赋值表 —— 方法 / 请求体从 YAML 进环境照样是写面", () => {
+    const dir = fixture24("audit-env-assign-");
+    const line = "gh api repos/o/r/check-runs $M $B";
+    const env = { M: "-X POST", B: "-f conclusion=success" };
+    // 判据级：只从 run 文本收赋值时 $M / $B 不可见 —— 端点字面可见、写意图为零（0 红）。
+    expect(checkRunWriteSurface(line)).toBeNull();
+    // 同一行，把作用域内的 env 并进赋值表后写面判得出来。
+    expect(checkRunWriteSurface(line, surfaceAssignments(line, envAssignments([env])))).toBe("check-runs");
+    // env 值解析不出（含 GitHub 表达式）：按 unresolved 处理，引用到它就默认拒绝。
+    const blindEnv = auditDirReferenceViolations(
+      [{ id: "p", env: { M: "${{ inputs.method }}" }, run: "gh api repos/o/r/check-runs $M" + SH24 }],
+      { root: dir },
+    );
+    expect(blindEnv.length).toBe(1);
+    expect(blindEnv[0].reason).toContain("赋值跟不下去");
+    // 端到端（step 级 env）。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-env.yml"),
+      [
+        "name: peer-env",
+        "on: pull_request",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: " + line,
+        "        env:",
+        '          M: "-X POST"',
+        '          B: "-f conclusion=success"',
+        "",
+      ].join(SH24),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    // 端到端（job 级 env 同样进表）。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-env.yml"),
+      [
+        "name: peer-env",
+        "on: pull_request",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    env:",
+        '      M: "-X POST"',
+        "    steps:",
+        "      - run: " + line,
+        "",
+      ].join(SH24),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    // 良性反面对照：env 里装的是只读参数，调用本身是显式 GET —— 不是写面。
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-env.yml"),
+      [
+        "name: peer-env",
+        "on: pull_request",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - run: gh api repos/o/r/check-runs -X GET $Q",
+        "        env:",
+        '          Q: "--jq .check_runs[].conclusion"',
+        "",
+      ].join(SH24),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+  });
+
+  it("轮二十五-4：2>&1 与 -H 不得关闭盲端点守卫", () => {
+    const dir = fixture24("audit-blind-guard-");
+    // 判据级：多一个无关词（重定向残留 / header 取值）不许把整条守卫关掉。
+    expect(checkRunWriteSurface("gh api $EP $M $B")).toBe("check-runs");
+    expect(checkRunWriteSurface("gh api $EP $M $B 2>&1")).toBe("check-runs");
+    expect(checkRunWriteSurface('gh api $EP $M $B -H "Accept: application/json"')).toBe("check-runs");
+    // 端到端：两种写法都是兄弟 workflow 里的写。
+    for (const run of ["gh api $EP $M $B 2>&1", 'gh api $EP $M $B -H "Accept: application/json"']) {
+      writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), peer24(["- run: " + run]));
+      expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where), run).toEqual(["check-runs"]);
+    }
+    // 良性反面对照：显式只读方法仍是证明（重定向与 header 只是接线，不改方法）。
+    for (const line of [
+      "gh api $EP -X GET 2>&1",
+      'gh api $EP -X GET -H "Accept: application/json"',
+      "gh api repos/o/r/check-runs --jq .title 2>&1",
+    ]) {
+      expect(checkRunWriteSurface(line), line).toBeNull();
+    }
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), peer24(["- run: gh api $EP -X GET 2>&1"]));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+  });
+
+  it("轮二十五-5：-g / --globoff 不是读证明（旗标名大小写敏感）", () => {
+    // 判据级：curl 的 -G 是 --get（把体翻成查询串），-g 是 --globoff —— 二者不是一个旗标。
+    expect(checkRunWriteSurface('curl -sS -g "$U" $B')).toBe("check-runs");
+    expect(checkRunWriteSurface('curl -sS --globoff "$U" $B')).toBe("check-runs");
+    expect(checkRunWriteSurface('curl -sS -G "$U" $B')).toBeNull();
+    expect(checkRunWriteSurface('curl -sS --get "$U" $B')).toBeNull();
+    // 良性只读必须仍绿。
+    for (const line of [
+      "gh api -X GET repos/o/r/check-runs",
+      "curl -XGET https://api.github.com/repos/o/r/check-runs",
+      "curl --get -d filter=all https://api.github.com/repos/o/r/check-runs",
+      "gh api --method GET repos/o/r/check-runs --jq '.check_runs[].conclusion'",
+    ]) {
+      expect(checkRunWriteSurface(line), line).toBeNull();
+    }
+    // 端到端：兄弟 workflow 里那两条小写旗标都是写。
+    const dir = fixture24("audit-curl-globoff-");
+    for (const flag of ["-g", "--globoff"]) {
+      writeFileSync(join(dir, WORKFLOW_DIR, "peer-curl.yml"), peer24(["- run: curl -sS " + flag + ' "$U" $B']));
+      expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where), flag).toEqual(["check-runs"]);
+    }
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-curl.yml"), peer24(["- run: curl --get -d filter=all $U"]));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
+  });
+
+  it("轮二十五-6：header 里塞 -X GET 不算读证明", () => {
+    // 判据级：证明只从 token 化后的旗标位置读，header 的取值一律跳过。
+    expect(checkRunWriteSurface('curl -sS -H "X-Note: -X GET" "$U" $B')).toBe("check-runs");
+    expect(checkRunWriteSurface('curl -sS --header "X-Note: --method GET" "$U" $B')).toBe("check-runs");
+    // 良性反面对照：真的方法位置仍是证明。
+    expect(checkRunWriteSurface('curl -sS -H "Accept: application/json" -X GET "$U"')).toBeNull();
+    expect(checkRunWriteSurface("gh api --method GET repos/o/r/check-runs --jq '.check_runs[].conclusion'")).toBeNull();
+    // 端到端。
+    const dir = fixture24("audit-curl-header-");
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-curl.yml"),
+      peer24(["- run: " + 'curl -sS -H "X-Note: -X GET" "$U" $B']),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["check-runs"]);
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer-curl.yml"),
+      peer24(["- run: " + 'curl -sS -H "Accept: application/json" -X GET "$U"']),
+    );
     expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
     expect(workflowWriteSurfaceFiles({ root: dir })).toEqual(["audit.yml"]);
   });
