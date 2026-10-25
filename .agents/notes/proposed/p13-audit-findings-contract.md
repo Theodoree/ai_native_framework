@@ -763,3 +763,23 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **静态判据在此冻结（`62c7a5a`+本提交为终点）**：静态分析追的是文本，攻击面是开放集；继续加厚的边际收益已经低于它的成本（每轮都在造新规则、新替身、新变异）。真正的收口在运行时那两层 —— PR #10 已有的**自证步**（回读本 sha 上 `name=audit`、比 `name/app.slug/status/conclusion` 四字段、按 max id 判「会被读到的那条」）与 P-14 的**编排层**（从受信 ref dispatch、merge-gate 读时序）。此后新发现的静态绕过只登记进本节，不再返修。
 
+
+## 二十四、收口：轮二十六 pass、绿证据、合并，以及 A-1 假红修复
+
+**轮二十六（审 `f01433d`）两家都判 pass**：review-a `9777594e`（24 条可执行写形态全 ≥1 红）、review-b `3f6fd89f`（32 行删除含 `expect(` 为 0，186→192 只增不减）。静态判据就此冻结（见 §二十三 的冻结声明）。
+
+**绿证据（真 findings，不是造的）**：两家交的是 findings 数组，而 `scripts/audit-slot.mjs` 要 `{verdict, findings, evidence}`——直接喂会被判 **INFRA**。所以另写槽位记录（`evidence.model: "subagent/inherited-route"`、`request_id` 记审查单号、`findings: []` + `notes` 写理由），本地先 dry-run：
+
+```
+node scripts/audit-findings.mjs --a /tmp/r26/a.json --b /tmp/r26/b.json --out /tmp/r26/result.json
+→ verdict=pass conclusion=success exit=0   agreed=0 onlyA=0 onlyB=0
+```
+
+再 dispatch：`gh workflow run audit.yml --ref feat/m4-audit-run -f pr=10 -f findings_a=@… -f findings_b=@…`（**必须带 `--ref`**，否则用默认分支上的旧 workflow 定义）→ run **40198326374** completed/success；`f01433d` 上 `name=audit` 的 Check Run **id=121183969159 conclusion=success app.slug=github-actions**（先前红的那次 id=120904983272 更小 → 自证步「会被读到的那条」判据成立，`scripts/merge-gate.mjs` 取数值最大 id 也仍然读到绿的那条）。`gh pr checks 10` 五项全 pass。
+
+**合并**：`gh pr merge 10 --squash --delete-branch` → main = `e42fc8c P-14：audit 手动触发可注入真 findings (#10)`；issue #9 由写者带到 `CLOSED state:done`。
+
+**仍 0 红的通道（登记，不返修）**：`gh api "$EP" "$M" "$B" repos/o/r/commits/x/check-runs`（删掉末尾的诱饵词即 1 红）、`gh api --hostname github.com $EP $M $B`、`--cache 1h`。成因正是 §二十三 的类别②（守卫的前置条件被无关输入整体关掉）加上「旗标取值表是开放集」。收口靠运行时自证步与 P-14 编排层，不再给静态判据加厚。
+
+**A-1 假红（审查者登记、本轮修掉）**：`tests/audit-findings.test.mjs` 的 `auditDirReferenceViolations` 调 `stepTexts` 时没转发 `options.jobPayloads` → job 级 `defaults.run.working-directory` 在这个入口丢失 → 合法脚本被判 `script-missing`，而 workflow 入口对同一份文件是绿的：**同一份代码两个入口结论相反**。修法是转发 `jobPayloads`，并加用例「轮二十六-A1」（job `defaults.run.working-directory: tools` + `tools/scripts/ok.mjs`，断言两个入口都空）。变异验证：去掉转发 → 该用例 1 failed；恢复 → 193 passed。这条的教训不是判据不够严，是**判据的输入在不同入口之间不一致**——假红和假绿都是闸门失效。
+

@@ -2033,6 +2033,7 @@ try {
   const ALLOWED_USES = [
     /^actions\/checkout(?:@|$)/,
     /^actions\/setup-node(?:@|$)/,
+    /^actions\/setup-go(?:@|$)/,
     /^actions\/upload-artifact(?:@|$)/,
   ];
 
@@ -4324,7 +4325,9 @@ try {
       const cwd = stepWorkingDir(step, options);
       const jobEnv = options.jobEnv;
       const workflowEnv = options.workflowEnv;
-      for (const entry of stepTexts(step, { root, gaps, jobEnv, workflowEnv })) {
+      // jobPayloads 必须一起转：job 级 defaults.run.working-directory 是「这一步的 cwd」的一部分，
+      // 少转一次，同一个入口就会把合法脚本判成 script-missing（与 step 入口结论相反）。
+      for (const entry of stepTexts(step, { root, gaps, jobEnv, workflowEnv, jobPayloads: options.jobPayloads })) {
         texts.push({ name, where: entry.where, text: entry.text, cwd, envMap: entry.envMap });
       }
     }
@@ -8212,6 +8215,36 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       peer24(["- run: node scripts/ok.mjs", '  working-directory: "${{ github.workspace }}/tools"']),
     );
     expect(workflowWriteSurfaceViolations({ root: dir }).map((v) => v.where)).toEqual(["script-missing"]);
+  });
+
+  // 轮二十六-A1：job 级 defaults.run.working-directory 也是「这一步的 cwd」。
+  // 两个入口（workflow 面 / 解析后的 step 列表）少传一次 jobPayloads 就会一个绿一个红，
+  // 而红的那边是假红：合法脚本被报成 script-missing。
+  it("轮二十六-A1：job 级 working-directory 两个入口结论一致", () => {
+    const dir = fixture24("audit-jobwd-");
+    mkdirSync(join(dir, "tools", "scripts"), { recursive: true });
+    writeFileSync(join(dir, "tools", "scripts", "ok.mjs"), "console.log('ok');" + SH24);
+    const workflow = [
+      "name: peer-jobwd",
+      "on: pull_request",
+      "jobs:",
+      "  p:",
+      "    runs-on: ubuntu-latest",
+      "    defaults:",
+      "      run:",
+      "        working-directory: tools",
+      "    steps:",
+      "      - run: node scripts/ok.mjs",
+      "",
+    ].join(SH24);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-jobwd.yml"), workflow);
+    const doc = YAML.parse(workflow);
+    const jobForms = jobPayloads(doc.jobs.p, doc);
+    expect(jobForms.map((form) => form.carrier)).toContain("defaults.run.working-directory");
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    expect(
+      auditDirReferenceViolations(surfaceSteps(dir, "peer-jobwd.yml"), { root: dir, jobPayloads: jobForms }),
+    ).toEqual([]);
   });
 
   it("轮二十五-3：env 也是赋值表 —— 方法 / 请求体从 YAML 进环境照样是写面", () => {
