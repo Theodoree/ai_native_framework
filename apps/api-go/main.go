@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -18,12 +21,17 @@ func main() {
 	if port == "" {
 		port = "4317"
 	}
+	subject := newApp(root)
+	// 巡检协程只在「有在途」时才排期；调度决策在 NextInspection，协程里没有 sleep。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go subject.runOutboxLoop(ctx)
 	server := &http.Server{
 		Addr:              "127.0.0.1:" + port,
-		Handler:           newApp(root),
+		Handler:           subject,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("平台已起: http://%s（根目录 %s）", server.Addr, root)
+	log.Printf("平台已起: http://%s（根目录 %s，写投递 %v）", server.Addr, root, subject.writeEnabled)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("平台起不来: %v", err)
 	}

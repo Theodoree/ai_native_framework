@@ -6,15 +6,16 @@
   "scripts": {
     "check": "npm run check:state && npm run lint && npm test && npm run check:go && npm run check:web",
     "check:state": "node scripts/state-validate.mjs --check-config",
-    "check:go": "cd apps/api-go && test -z \"$(gofmt -l .)\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
-    "check:web": "npm --prefix apps/web-vue run build",
+    "check:go": "cd apps/api-go && test -z \"$(gofmt -l .)\" && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
+    "check:web": "npm --prefix apps/web-vue run build && node scripts/copy-dist.mjs",
     "format": "prettier --write .",
     "lint": "oxlint scripts tests",
     "test": "vitest run",
-    "api": "cd apps/api-go && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go run .",
+    "api": "cd apps/api-go && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go run .",
     "platform": "npm run api",
     "web:dev": "npm --prefix apps/web-vue run dev",
-    "web:build": "npm --prefix apps/web-vue run build"
+    "web:build": "npm --prefix apps/web-vue run build",
+    "web:dist": "node scripts/copy-dist.mjs"
   },
   "dependencies": {
     "yaml": "^2.5.0"

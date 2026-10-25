@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func repoRoot(t *testing.T) string {
@@ -518,6 +519,8 @@ func TestVerifyTruncatesOutputTail(t *testing.T) {
 
 func TestUnknownRouteIs404(t *testing.T) {
 	subject := newApp(newRoot(t))
+	// 页面源默认是内嵌资源；本用例要的是「没有任何页面可出」时的 404，所以把页面源显式清空。
+	subject.dist = fstest.MapFS{}
 	for _, target := range []string{"/api/nope", "/api", "/"} {
 		recorder := call(t, subject, http.MethodGet, target, "")
 		expectStatus(t, recorder, http.StatusNotFound)
@@ -584,6 +587,8 @@ func TestStaticServesSPAFallback(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dist, "assets", "app.js"), []byte("console.log(1)"), 0o644); err != nil {
 		t.Fatalf("写 app.js 失败: %v", err)
 	}
+	// 磁盘 dist 只在开发态生效：用 PLATFORM_DIST 显式指过去，否则默认走内嵌。
+	t.Setenv("PLATFORM_DIST", dist)
 	subject := newApp(root)
 	for _, target := range []string{"/", "/board/REQ-1"} {
 		recorder := call(t, subject, http.MethodGet, target, "")

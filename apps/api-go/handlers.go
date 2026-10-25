@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,8 +20,8 @@ const (
 )
 
 type boardResponse struct {
-	Items  json.RawMessage `json:"items"`
-	Config *boardConfig    `json:"config"`
+	Items  []map[string]any `json:"items"`
+	Config *boardConfig     `json:"config"`
 }
 
 type eventsResponse struct {
@@ -33,7 +34,7 @@ type verifyResult struct {
 }
 
 func (a *app) handleBoard(w http.ResponseWriter, r *http.Request) {
-	items, err := a.ledgerJSON(r.Context(), "fold")
+	folded, err := a.foldedItems(r.Context())
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -43,7 +44,82 @@ func (a *app) handleBoard(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, boardResponse{Items: items, Config: cfg})
+	store, err := a.ensureIndex(r.Context(), false)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	defer store.close()
+	remote, entries, err := store.remoteAndOutbox()
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, boardResponse{
+		Items:  a.enrichItems(folded, remote, entries, cfg.LabelPrefix),
+		Config: cfg,
+	})
+}
+
+// enrichItems 给每个 item 补三样东西：current（label 态）、ledgerState（折叠态）、
+// divergence（两者都有且不等 —— 漂移必须显式标出，不许悄悄选一个），以及 pending。
+func (a *app) enrichItems(folded []foldItem, remote map[int]RemoteIssue, entries []*outboxEntry, prefix string) []map[string]any {
+	now := a.now()
+	pending := map[string]map[string]any{}
+	for _, entry := range entries {
+		status := entry.status(now, a.deadline())
+		if status == statusApplied {
+			continue
+		}
+		view := map[string]any{
+			"attemptId":   entry.Request.AttemptID,
+			"from":        entry.Request.From,
+			"to":          entry.Request.To,
+			"status":      status,
+			"requestedAt": entry.Request.RequestedAt,
+			"attempts":    entry.Attempts,
+		}
+		existing, ok := pending[entry.Request.Item]
+		if ok {
+			previous, _ := existing["requestedAt"].(string)
+			if previous > entry.Request.RequestedAt {
+				continue
+			}
+		}
+		pending[entry.Request.Item] = view
+	}
+
+	items := make([]map[string]any, 0, len(folded))
+	for _, item := range folded {
+		row := map[string]any{
+			"id":          item.ID,
+			"title":       item.Title,
+			"body":        item.Body,
+			"state":       item.State,
+			"ledgerState": item.State,
+			"updatedAt":   item.UpdatedAt,
+			"history":     item.History,
+			"current":     nil,
+			"divergence":  false,
+			"pending":     nil,
+		}
+		if number := issueNumberFor(item.ID); number > 0 {
+			if issue, ok := remote[number]; ok {
+				current, ambiguous := stateOf(issue.Labels, prefix)
+				row["current"] = current
+				divergent := ambiguous && item.State != nil
+				if current != nil && item.State != nil && *current != *item.State {
+					divergent = true
+				}
+				row["divergence"] = divergent
+			}
+		}
+		if view, ok := pending[item.ID]; ok {
+			row["pending"] = view
+		}
+		items = append(items, row)
+	}
+	return items
 }
 
 func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -136,7 +212,7 @@ func (a *app) handleItem(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := a.appendEvent(r.Context(), ledgerEvent{
 		ID:      id,
-		At:      nowISO(),
+		At:      a.nowISO(),
 		Title:   &title,
 		Body:    &bodyText,
 		From:    verdict.From,
@@ -216,7 +292,7 @@ func (a *app) handleVerdict(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := a.appendEvent(r.Context(), ledgerEvent{
 		ID:      id,
-		At:      nowISO(),
+		At:      a.nowISO(),
 		From:    verdict.From,
 		To:      verdict.To,
 		By:      verdict.By,
@@ -226,6 +302,11 @@ func (a *app) handleVerdict(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.fail(w, err)
 		return
+	}
+	// 状态改完了：记一条在途（默认只记不联网）。账本已经落盘，
+	// 所以这里失败不回滚、也不假装没发生 —— 留在 /api/outbox 里看得见。
+	if _, outboxErr := a.initiateOutbox(r.Context(), id, verdict.From, verdict.To, verdict.By, cfg.LabelPrefix+verdict.To); outboxErr != nil {
+		log.Printf("在途登记失败（账本已落盘）: %v", outboxErr)
 	}
 	writeJSON(w, http.StatusOK, created)
 }
@@ -270,4 +351,140 @@ func (a *app) runCheck(ctx context.Context) (*verifyResult, error) {
 		return result, nil
 	}
 	return nil, infraErr("E_CHECK_SPAWN", "起不了 npm run check: "+runErr.Error())
+}
+
+// handleSync: 触发一次只读同步。304 时缓存一个字节都不写；任何 infra 都保留旧缓存。
+func (a *app) handleSync(w http.ResponseWriter, r *http.Request) {
+	report, err := a.runSync(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// handleRemote: 读缓存快照。present=false 表示「还没同步过」，不是空仓库。
+func (a *app) handleRemote(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := a.readCache()
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Present bool `json:"present"`
+		*RemoteSnapshot
+	}{Present: snapshot.FetchedAt != "", RemoteSnapshot: snapshot})
+}
+
+type outboxView struct {
+	AttemptID      string       `json:"attemptId"`
+	Item           string       `json:"item"`
+	From           string       `json:"from"`
+	To             string       `json:"to"`
+	By             string       `json:"by"`
+	Label          string       `json:"label"`
+	Target         OutboxTarget `json:"target"`
+	RequestedAt    string       `json:"requestedAt"`
+	Attempts       int          `json:"attempts"`
+	Status         string       `json:"status"`
+	Reason         string       `json:"reason,omitempty"`
+	ObservedAt     string       `json:"observedAt,omitempty"`
+	ObservedLabels []string     `json:"observedLabels"`
+}
+
+type outboxResponse struct {
+	Entries      []outboxView `json:"entries"`
+	NextCheckAt  *string      `json:"nextCheckAt"`
+	Deadline     string       `json:"deadline"`
+	WriteEnabled bool         `json:"writeEnabled"`
+}
+
+func (a *app) outboxPayload() (*outboxResponse, error) {
+	entries, err := a.readOutbox()
+	if err != nil {
+		return nil, err
+	}
+	now := a.now()
+	views := make([]outboxView, 0, len(entries))
+	for _, entry := range entries {
+		views = append(views, outboxView{
+			AttemptID:      entry.Request.AttemptID,
+			Item:           entry.Request.Item,
+			From:           entry.Request.From,
+			To:             entry.Request.To,
+			By:             entry.Request.By,
+			Label:          entry.Request.Label,
+			Target:         entry.Request.Target,
+			RequestedAt:    entry.Request.RequestedAt,
+			Attempts:       entry.Attempts,
+			Status:         entry.status(now, a.deadline()),
+			Reason:         entry.Reason,
+			ObservedAt:     entry.ObservedAt,
+			ObservedLabels: entry.ObservedLabels,
+		})
+	}
+	payload := &outboxResponse{
+		Entries:      views,
+		Deadline:     a.deadline().String(),
+		WriteEnabled: a.writeEnabled,
+	}
+	// 在途为空时 NextInspection 返回 nil：页面据此知道「现在零请求」。
+	if next := NextInspection(a.inspectionInput(entries), now); next != nil {
+		formatted := next.UTC().Format(time.RFC3339)
+		payload.NextCheckAt = &formatted
+	}
+	return payload, nil
+}
+
+func (a *app) handleOutbox(w http.ResponseWriter, r *http.Request) {
+	payload, err := a.outboxPayload()
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+// handleOutboxRetry: 只对 stalled/failed 生效，复用同一个 attemptId（不新增 pending）。
+func (a *app) handleOutboxRetry(w http.ResponseWriter, r *http.Request) {
+	body, err := readObject(r)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	retried, err := a.retryOutbox(r.Context(), stringField(body, "attemptId"))
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	payload, err := a.outboxPayload()
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Retried []string `json:"retried"`
+		*outboxResponse
+	}{Retried: retried, outboxResponse: payload})
+}
+
+// handleIndexRebuild: 强制重算派生索引；删掉 db 文件同样会自愈。
+func (a *app) handleIndexRebuild(w http.ResponseWriter, r *http.Request) {
+	store, err := a.ensureIndex(r.Context(), true)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	defer store.close()
+	counts, err := store.counts()
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		OK            bool   `json:"ok"`
+		SchemaVersion string `json:"schemaVersion"`
+		Path          string `json:"path"`
+		indexCounts
+	}{OK: true, SchemaVersion: schemaVersion, Path: a.indexPath(), indexCounts: counts})
 }
