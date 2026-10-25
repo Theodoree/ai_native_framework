@@ -80,7 +80,7 @@
 
 - P-12 路由真源（逻辑名 → 模型只在 `routing.yml`）· **已完成**（note 已进 implemented/）
 - P-13 findings 契约执行层（schema + verdict 归一 + 双执行器比对 + Check Run 回写）· **执行层已完成**；`conclusion: neutral` 的假设已被证伪并改用 `action_required`
-- P-14 把 `audit` 真跑一轮并挂成 required check · 待上游执行器（网关 + 沙盒）产出真 findings
+- P-14 把 `audit` 真跑一轮并挂成 required check · **已完成并改判**：真跑与红绿证据都拿到，但**不挂 required**——自动触发拿不到结论，只会让每个 PR 自锁（理由见 `.agents/notes/implemented/p14-audit-manual-gate.md`）
 
 为什么现在做：审计此前延后的理由正是「没有真 PR 与真门时只能拿编造数据自证」。真 PR #2 / #4 / #6 跑过门之后，这个理由不再成立。
 顺序理由：先有「逻辑名怎么映射到模型」的真源，判据才不会被写进两处；先有 findings 的 schema 与归一，Check Run 才有东西可写。
