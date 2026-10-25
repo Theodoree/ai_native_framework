@@ -1,7 +1,7 @@
 # 滚动计划 · 从声明到能跑
 
 - **日期**：2026-10-20
-- **状态**：M0 / M0.5 / M1 / M2 / M3 已完成（均经真事件验收）；M4 审计机制侧已落地（P-12 完成、P-13 执行层完成），只剩 P-14 真跑；L4 接入层按计划延后
+- **状态**：M0 / M0.5 / M1 / M2 / M3 已完成（均经真事件验收）；M4 审计侧已落地（P-12 路由真源、P-13 findings 执行层、P-14 真跑与红绿证据均完成），**P-14 收口为手动触发、不挂 required**（理由见 `p14-audit-manual-gate.md`）；L4 接入层按计划延后
 
 ## 背景
 
@@ -109,6 +109,6 @@
 | P-10 | 知识库汇入 | M3 |
 | P-12 | 路由真源 | M4 |
 | P-13 | findings 契约执行层 | M4 |
-| P-14 | audit 上 required check | M4 |
+| P-14 | audit 真跑 + 收口（手动触发，不挂 required） | M4 · **已完成** |
 | P-11 | 平台形态：单进程 JavaScript，不做前后端分离 | M0.5 · **已完成** |
 **P-14 的两条前置（轮二十三登记）**：① 自证是快照，回读之后写入的同名结论会盖掉真结论 → `scripts/merge-gate.mjs` 需加时序判据（读到的 audit / audit-runner 晚于本次 merge-gate 开始、或 id 大于 merge-gate 自身 check，按「未判过」阻断）；② 或把本次 nonce 写进 Check Run 的 `external_id` 随 artifact 发布、由 merge-gate 比对。二者任选其一，都要在「audit 挂 required + 打开 pull_request 触发」之前落地；在此之前，信任根未解决时它们也只是抬高门槛。
