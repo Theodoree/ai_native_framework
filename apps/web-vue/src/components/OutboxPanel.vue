@@ -9,9 +9,14 @@ function refresh(): void {
   void reloadOutbox();
 }
 
-function targetText(entry: { target: { repo: string | null; issue: number | null } }): string {
+function targetText(entry: {
+  target: { repo: string | null; issue: number | null };
+}): string {
   const repo = entry.target.repo ?? "(无 repo)";
-  const issue = entry.target.issue === null ? "(无 issue)" : "#" + String(entry.target.issue);
+  const issue =
+    entry.target.issue === null
+      ? "(无 issue)"
+      : "#" + String(entry.target.issue);
   return repo + " " + issue;
 }
 </script>
@@ -21,10 +26,17 @@ function targetText(entry: { target: { repo: string | null; issue: number | null
     <v-card-title class="d-flex align-center text-body-2 py-2">
       <span class="font-weight-bold">在途台账</span>
       <span class="text-caption text-medium-emphasis ms-2">
-        共 {{ state.outbox.entries.length }} 条 · deadline={{ state.outbox.deadline ?? "(缺失)" }}
+        共 {{ state.outbox.entries.length }} 条 · deadline={{
+          state.outbox.deadline ?? "(缺失)"
+        }}
       </span>
       <v-spacer />
-      <v-btn size="small" variant="tonal" :loading="state.outboxLoading" @click="refresh">
+      <v-btn
+        size="small"
+        variant="tonal"
+        :loading="state.outboxLoading"
+        @click="refresh"
+      >
         刷新
       </v-btn>
     </v-card-title>
@@ -49,7 +61,10 @@ function targetText(entry: { target: { repo: string | null; issue: number | null
         nextCheckAt={{ state.outbox.nextCheckAt ?? "null（当前零在途请求）" }}
       </p>
 
-      <p v-if="state.outbox.entries.length === 0" class="text-caption text-medium-emphasis">
+      <p
+        v-if="state.outbox.entries.length === 0"
+        class="text-caption text-medium-emphasis"
+      >
         还没有在途记录：每次状态变更成功后会写一条 attempt。
       </p>
       <v-table v-else density="compact" class="outbox-table">
@@ -67,10 +82,15 @@ function targetText(entry: { target: { repo: string | null; issue: number | null
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(entry, index) in state.outbox.entries" :key="entry.attemptId ?? 'entry-' + index">
+          <tr
+            v-for="(entry, index) in state.outbox.entries"
+            :key="entry.attemptId ?? 'entry-' + index"
+          >
             <td class="text-caption">{{ entry.attemptId ?? "(缺失)" }}</td>
             <td class="text-caption">{{ entry.item ?? "(缺失)" }}</td>
-            <td class="text-caption">{{ (entry.from ?? "?") + " → " + (entry.to ?? "?") }}</td>
+            <td class="text-caption">
+              {{ (entry.from ?? "?") + " → " + (entry.to ?? "?") }}
+            </td>
             <td class="text-caption">{{ entry.by ?? "(缺失)" }}</td>
             <td class="text-caption">
               <div>{{ entry.label ?? "(缺失)" }}</div>
@@ -82,7 +102,9 @@ function targetText(entry: { target: { repo: string | null; issue: number | null
             <td class="text-caption">
               <div>{{ entry.reason ?? "(无 reason)" }}</div>
               <div v-if="entry.observedAt" class="text-medium-emphasis">
-                observedAt={{ entry.observedAt }} · labels={{ entry.observedLabels.join(", ") || "(空)" }}
+                observedAt={{ entry.observedAt }} · labels={{
+                  entry.observedLabels.join(", ") || "(空)"
+                }}
               </div>
             </td>
           </tr>

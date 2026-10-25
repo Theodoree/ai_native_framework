@@ -47,12 +47,27 @@ onMounted(() => {
           state:* 是唯一状态；前端只呈现，不判定
         </span>
       </div>
-      <v-tabs v-model="view" color="primary" density="compact" aria-label="视图">
-        <v-tab v-for="tab in tabs" :key="tab.key" :value="tab.key">{{ tab.label }}</v-tab>
+      <v-tabs
+        v-model="view"
+        color="primary"
+        density="compact"
+        aria-label="视图"
+      >
+        <v-tab v-for="tab in tabs" :key="tab.key" :value="tab.key">{{
+          tab.label
+        }}</v-tab>
       </v-tabs>
       <v-spacer />
-      <span v-if="loading" class="text-caption text-medium-emphasis me-3">加载中…</span>
-      <v-btn variant="tonal" size="small" class="me-2" :disabled="loading" @click="refresh">
+      <span v-if="loading" class="text-caption text-medium-emphasis me-3"
+        >加载中…</span
+      >
+      <v-btn
+        variant="tonal"
+        size="small"
+        class="me-2"
+        :disabled="loading"
+        @click="refresh"
+      >
         刷新全部
       </v-btn>
     </v-app-bar>

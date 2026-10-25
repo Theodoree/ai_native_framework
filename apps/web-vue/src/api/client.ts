@@ -2,7 +2,8 @@
 // kind / code / message / extra 原样保留，交给界面照抄，不做翻译与改写。
 import { asLoose, readString, type ApiFailure } from "../types";
 
-export type ApiResult<T> = { ok: true; data: T } | { ok: false; failure: ApiFailure };
+export type ApiResult<T> =
+  { ok: true; data: T } | { ok: false; failure: ApiFailure };
 
 const BASE = "/api";
 
@@ -13,7 +14,11 @@ export interface VerdictInput {
   comment: string;
 }
 
-function failureOf(status: number | null, payload: unknown, fallback: string): ApiFailure {
+function failureOf(
+  status: number | null,
+  payload: unknown,
+  fallback: string,
+): ApiFailure {
   const loose = asLoose(payload);
   return {
     kind: readString(loose, "kind") ?? (status === 409 ? "rejected" : "infra"),
@@ -24,12 +29,17 @@ function failureOf(status: number | null, payload: unknown, fallback: string): A
   };
 }
 
-export async function request<T>(method: string, path: string, payload?: unknown): Promise<ApiResult<T>> {
+export async function request<T>(
+  method: string,
+  path: string,
+  payload?: unknown,
+): Promise<ApiResult<T>> {
   let response: Response;
   try {
     response = await fetch(BASE + path, {
       method,
-      headers: payload === undefined ? {} : { "content-type": "application/json" },
+      headers:
+        payload === undefined ? {} : { "content-type": "application/json" },
       body: payload === undefined ? undefined : JSON.stringify(payload),
     });
   } catch (error) {
@@ -60,7 +70,11 @@ export async function request<T>(method: string, path: string, payload?: unknown
   if (!response.ok) {
     return {
       ok: false,
-      failure: failureOf(response.status, parsed, "HTTP " + String(response.status)),
+      failure: failureOf(
+        response.status,
+        parsed,
+        "HTTP " + String(response.status),
+      ),
     };
   }
   if (!isJson && text.trim() !== "") {
@@ -94,7 +108,10 @@ export function putConfig(text: string): Promise<ApiResult<unknown>> {
   return request<unknown>("PUT", "/config", { text });
 }
 
-export function postItem(title: string, body: string): Promise<ApiResult<unknown>> {
+export function postItem(
+  title: string,
+  body: string,
+): Promise<ApiResult<unknown>> {
   return request<unknown>("POST", "/item", { title, body });
 }
 
@@ -122,7 +139,9 @@ export function getOutbox(): Promise<ApiResult<unknown>> {
   return request<unknown>("GET", "/outbox");
 }
 
-export function postOutboxRetry(attemptId: string): Promise<ApiResult<unknown>> {
+export function postOutboxRetry(
+  attemptId: string,
+): Promise<ApiResult<unknown>> {
   return request<unknown>("POST", "/outbox/retry", { attemptId });
 }
 

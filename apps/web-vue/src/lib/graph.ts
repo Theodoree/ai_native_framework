@@ -77,9 +77,13 @@ function labelAnchor(
   const point = pointOnCurve(at, start, c1, c2, end);
   const rest = 1 - at;
   const tangentX =
-    3 * rest * rest * (c1.x - start.x) + 6 * rest * at * (c2.x - c1.x) + 3 * at * at * (end.x - c2.x);
+    3 * rest * rest * (c1.x - start.x) +
+    6 * rest * at * (c2.x - c1.x) +
+    3 * at * at * (end.x - c2.x);
   const tangentY =
-    3 * rest * rest * (c1.y - start.y) + 6 * rest * at * (c2.y - c1.y) + 3 * at * at * (end.y - c2.y);
+    3 * rest * rest * (c1.y - start.y) +
+    6 * rest * at * (c2.y - c1.y) +
+    3 * at * at * (end.y - c2.y);
   const length = Math.hypot(tangentX, tangentY) || 1;
   let normalX = -tangentY / length;
   let normalY = tangentX / length;
@@ -90,19 +94,29 @@ function labelAnchor(
   return { x: point.x + normalX * 11, y: point.y + normalY * 11 };
 }
 
-function anchorTo(node: GraphNode, target: { x: number; y: number }): { x: number; y: number } {
+function anchorTo(
+  node: GraphNode,
+  target: { x: number; y: number },
+): { x: number; y: number } {
   const center = centerOf(node);
   const dx = target.x - center.x;
   const dy = target.y - center.y;
   if (dx === 0 && dy === 0) return center;
-  const limitX = dx === 0 ? Number.POSITIVE_INFINITY : node.width / 2 / Math.abs(dx);
-  const limitY = dy === 0 ? Number.POSITIVE_INFINITY : node.height / 2 / Math.abs(dy);
+  const limitX =
+    dx === 0 ? Number.POSITIVE_INFINITY : node.width / 2 / Math.abs(dx);
+  const limitY =
+    dy === 0 ? Number.POSITIVE_INFINITY : node.height / 2 / Math.abs(dy);
   const scale = Math.min(limitX, limitY);
   return { x: center.x + dx * scale, y: center.y + dy * scale };
 }
 
-export function buildGraph(states: BoardState[], transitions: BoardTransition[]): GraphLayout {
-  const needsNone = transitions.some((transition) => transition.from === NONE_ID);
+export function buildGraph(
+  states: BoardState[],
+  transitions: BoardTransition[],
+): GraphLayout {
+  const needsNone = transitions.some(
+    (transition) => transition.from === NONE_ID,
+  );
   const needsAny = transitions.some((transition) => transition.from === ANY_ID);
 
   const nodeIds: string[] = [];
@@ -119,7 +133,8 @@ export function buildGraph(states: BoardState[], transitions: BoardTransition[])
     if (!known.has(transition.from) || !known.has(transition.to)) continue;
     if (transition.from === transition.to) continue;
     const bucket = outgoing.get(transition.from);
-    if (bucket !== undefined && !bucket.includes(transition.to)) bucket.push(transition.to);
+    if (bucket !== undefined && !bucket.includes(transition.to))
+      bucket.push(transition.to);
   }
 
   const level = new Map<string, number>();
@@ -129,7 +144,11 @@ export function buildGraph(states: BoardState[], transitions: BoardTransition[])
     let hasIncoming = false;
     for (const transition of transitions) {
       if (transition.from === ANY_ID) continue;
-      if (transition.to === id && transition.from !== id && known.has(transition.from)) {
+      if (
+        transition.to === id &&
+        transition.from !== id &&
+        known.has(transition.from)
+      ) {
         hasIncoming = true;
         break;
       }
@@ -200,14 +219,23 @@ export function buildGraph(states: BoardState[], transitions: BoardTransition[])
   for (const transition of transitions) {
     if (!known.has(transition.from) || !known.has(transition.to)) continue;
     if (transition.from === transition.to) continue;
-    const key = transition.from + "->" + transition.to + "|" + transition.by + "|" + transition.event;
+    const key =
+      transition.from +
+      "->" +
+      transition.to +
+      "|" +
+      transition.by +
+      "|" +
+      transition.event;
     if (seen.has(key)) continue;
     seen.add(key);
     const from = nodes.find((node) => node.id === transition.from);
     const to = nodes.find((node) => node.id === transition.to);
     if (from === undefined || to === undefined) continue;
 
-    const parallel = edges.filter((edge) => edge.from === from.id && edge.to === to.id).length;
+    const parallel = edges.filter(
+      (edge) => edge.from === from.id && edge.to === to.id,
+    ).length;
     const start = anchorTo(from, centerOf(to));
     const end = anchorTo(to, centerOf(from));
     const sameColumn = Math.abs(from.x - to.x) < 1;
@@ -231,16 +259,34 @@ export function buildGraph(states: BoardState[], transitions: BoardTransition[])
     }
 
     const path =
-      "M " + round(start.x) + " " + round(start.y) +
-      " C " + round(c1x) + " " + round(c1y) +
-      " " + round(c2x) + " " + round(c2y) +
-      " " + round(end.x) + " " + round(end.y);
+      "M " +
+      round(start.x) +
+      " " +
+      round(start.y) +
+      " C " +
+      round(c1x) +
+      " " +
+      round(c1y) +
+      " " +
+      round(c2x) +
+      " " +
+      round(c2y) +
+      " " +
+      round(end.x) +
+      " " +
+      round(end.y);
 
     // 同一对节点常有正反两条边，标签都放中点会叠成一行：正向靠 38%、反向靠 62%，
     // 并沿法线推开一点。事件名不在默认视图里显示（太长，一定会压到别的元素），
     // 点节点高亮后才出 —— 详情见 StateMachineGraph。
     const at = backward ? 0.62 : 0.38;
-    const anchor = labelAnchor(at, start, { x: c1x, y: c1y }, { x: c2x, y: c2y }, end);
+    const anchor = labelAnchor(
+      at,
+      start,
+      { x: c1x, y: c1y },
+      { x: c2x, y: c2y },
+      end,
+    );
     const labelX = anchor.x;
     const labelY = anchor.y;
     const labelText = transition.by === "" ? "(未声明 by)" : transition.by;
@@ -250,7 +296,10 @@ export function buildGraph(states: BoardState[], transitions: BoardTransition[])
       from: from.id,
       to: to.id,
       path,
-      label: transition.event === "" ? labelText : labelText + " · " + transition.event,
+      label:
+        transition.event === ""
+          ? labelText
+          : labelText + " · " + transition.event,
       labelX: round(labelX),
       labelY: round(labelY),
     });

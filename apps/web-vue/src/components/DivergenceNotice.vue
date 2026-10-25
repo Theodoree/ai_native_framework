@@ -2,7 +2,10 @@
 // 漂移只显式呈现后端给的 current / ledgerState 两个值，不做「哪个是对的」的判断。
 import { computed } from "vue";
 
-const props = defineProps<{ current: string | null; ledgerState: string | null }>();
+const props = defineProps<{
+  current: string | null;
+  ledgerState: string | null;
+}>();
 
 const text = computed<string>(
   () =>
@@ -15,7 +18,12 @@ const text = computed<string>(
 </script>
 
 <template>
-  <v-alert type="warning" density="compact" variant="tonal" class="divergence-notice py-1">
+  <v-alert
+    type="warning"
+    density="compact"
+    variant="tonal"
+    class="divergence-notice py-1"
+  >
     <span class="text-caption">{{ text }}</span>
   </v-alert>
 </template>

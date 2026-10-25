@@ -3,7 +3,10 @@ import { computed, ref } from "vue";
 import { buildGraph } from "../lib/graph";
 import type { BoardState, BoardTransition } from "../types";
 
-const props = defineProps<{ states: BoardState[]; transitions: BoardTransition[] }>();
+const props = defineProps<{
+  states: BoardState[];
+  transitions: BoardTransition[];
+}>();
 
 const active = ref<string | null>(null);
 const layout = computed(() => buildGraph(props.states, props.transitions));
@@ -19,7 +22,10 @@ function toggle(id: string): void {
 }
 
 function isEdgeActive(edge: { from: string; to: string }): boolean {
-  return active.value !== null && (edge.from === active.value || edge.to === active.value);
+  return (
+    active.value !== null &&
+    (edge.from === active.value || edge.to === active.value)
+  );
 }
 
 function edgeClass(edge: { from: string; to: string }): string {
@@ -44,7 +50,10 @@ function shortenEvent(event: string): string {
 function labelParts(edge: { label: string }): { head: string; tail: string } {
   const index = edge.label.indexOf(" · ");
   if (index < 0) return { head: edge.label, tail: "" };
-  return { head: edge.label.slice(0, index), tail: shortenEvent(edge.label.slice(index + 3)) };
+  return {
+    head: edge.label.slice(0, index),
+    tail: shortenEvent(edge.label.slice(index + 3)),
+  };
 }
 
 function nodeClass(id: string): string {
@@ -56,7 +65,10 @@ function nodeClass(id: string): string {
 <template>
   <!-- 几何全部来自 lib/graph.ts；这里只画，不动坐标。配色/圆角/字号由 main.css 对齐主题变量。 -->
   <div class="graph-wrap">
-    <p v-if="layout.nodes.length === 0" class="text-caption text-medium-emphasis">
+    <p
+      v-if="layout.nodes.length === 0"
+      class="text-caption text-medium-emphasis"
+    >
       config 里没有 states，画不出图。
     </p>
     <template v-else>
@@ -89,16 +101,31 @@ function nodeClass(id: string): string {
             markerHeight="7"
             orient="auto-start-reverse"
           >
-            <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head arrow-head-active" />
+            <path
+              d="M 0 0 L 10 5 L 0 10 z"
+              class="arrow-head arrow-head-active"
+            />
           </marker>
         </defs>
-        <g v-for="edge in layout.edges" :key="edge.key" class="edge" :class="edgeClass(edge)">
+        <g
+          v-for="edge in layout.edges"
+          :key="edge.key"
+          class="edge"
+          :class="edgeClass(edge)"
+        >
           <path
             :d="edge.path"
             class="edge-line"
-            :marker-end="isEdgeActive(edge) ? 'url(#arrow-active)' : 'url(#arrow)'"
+            :marker-end="
+              isEdgeActive(edge) ? 'url(#arrow-active)' : 'url(#arrow)'
+            "
           />
-          <text :x="edge.labelX" :y="edge.labelY" class="edge-label" text-anchor="middle">
+          <text
+            :x="edge.labelX"
+            :y="edge.labelY"
+            class="edge-label"
+            text-anchor="middle"
+          >
             <tspan :x="edge.labelX">{{ labelParts(edge).head }}</tspan>
             <tspan
               v-if="active !== null && labelParts(edge).tail !== ''"
@@ -114,7 +141,10 @@ function nodeClass(id: string): string {
           v-for="node in layout.nodes"
           :key="node.id"
           class="node"
-          :class="[nodeClass(node.id), { terminal: node.terminal, pseudo: node.pseudo }]"
+          :class="[
+            nodeClass(node.id),
+            { terminal: node.terminal, pseudo: node.pseudo },
+          ]"
           role="button"
           tabindex="0"
           :aria-pressed="active === node.id"
@@ -141,9 +171,15 @@ function nodeClass(id: string): string {
         </g>
       </svg>
       <p class="legend text-caption text-medium-emphasis">
-        <span class="legend-item"><i class="swatch swatch-terminal"></i>终态</span>
-        <span class="legend-item"><i class="swatch swatch-pseudo"></i>none / * 伪节点</span>
-        <span v-if="activeLabel !== null">当前高亮：{{ activeLabel }}（再点一次取消）</span>
+        <span class="legend-item"
+          ><i class="swatch swatch-terminal"></i>终态</span
+        >
+        <span class="legend-item"
+          ><i class="swatch swatch-pseudo"></i>none / * 伪节点</span
+        >
+        <span v-if="activeLabel !== null"
+          >当前高亮：{{ activeLabel }}（再点一次取消）</span
+        >
         <span v-else>点节点高亮相关信息</span>
       </p>
     </template>

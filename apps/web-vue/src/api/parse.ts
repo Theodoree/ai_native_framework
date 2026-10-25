@@ -48,7 +48,8 @@ function normalizeTransition(raw: unknown): BoardTransition {
     to: readString(loose, "to") ?? "",
     by: readString(loose, "by") ?? "",
     event: readString(loose, "event") ?? "",
-    commentRequired: readFlag(loose, "comment_required") || readFlag(loose, "commentRequired"),
+    commentRequired:
+      readFlag(loose, "comment_required") || readFlag(loose, "commentRequired"),
     raw: loose,
   };
 }
@@ -64,7 +65,8 @@ function normalizeConfig(raw: unknown): BoardConfig {
 }
 
 function normalizePending(raw: unknown): PendingAttempt | null {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+    return null;
   const loose = asLoose(raw);
   return {
     attemptId: readString(loose, "attemptId"),
@@ -122,7 +124,9 @@ export function parseBoard(payload: unknown): BoardSnapshot {
 }
 
 export function parseEvents(payload: unknown): PlatformEvent[] {
-  const source = Array.isArray(payload) ? payload : readList(asLoose(payload)["events"]);
+  const source = Array.isArray(payload)
+    ? payload
+    : readList(asLoose(payload)["events"]);
   return source.map(normalizeEvent);
 }
 
@@ -138,7 +142,8 @@ export function parseVerify(payload: unknown): VerifySnapshot {
   const loose = asLoose(payload);
   const rawExit = loose["exitCode"];
   return {
-    exitCode: typeof rawExit === "number" && Number.isFinite(rawExit) ? rawExit : null,
+    exitCode:
+      typeof rawExit === "number" && Number.isFinite(rawExit) ? rawExit : null,
     output: readString(loose, "output") ?? "",
   };
 }
@@ -185,7 +190,8 @@ function normalizeRemoteIssue(raw: unknown): RemoteIssue {
     title: readString(loose, "title"),
     state: readString(loose, "state"),
     labels: readStringList(loose["labels"]),
-    updatedAt: readString(loose, "updated_at") ?? readString(loose, "updatedAt"),
+    updatedAt:
+      readString(loose, "updated_at") ?? readString(loose, "updatedAt"),
   };
 }
 

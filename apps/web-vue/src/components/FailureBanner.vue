@@ -19,14 +19,27 @@ const extraText = computed<string>(() => {
 
 <template>
   <div v-if="failure" class="mb-3">
-    <v-alert type="error" variant="tonal" density="compact" role="alert" class="failure">
+    <v-alert
+      type="error"
+      variant="tonal"
+      density="compact"
+      role="alert"
+      class="failure"
+    >
       <template #title>
         <span class="me-2">{{ title }}</span>
-        <v-chip size="x-small" color="error" variant="flat">kind={{ failure.kind }}</v-chip>
+        <v-chip size="x-small" color="error" variant="flat"
+          >kind={{ failure.kind }}</v-chip
+        >
         <v-chip size="x-small" color="error" variant="flat" class="ms-1">
           code={{ failure.code }}
         </v-chip>
-        <v-chip v-if="failure.status !== null" size="x-small" variant="outlined" class="ms-1">
+        <v-chip
+          v-if="failure.status !== null"
+          size="x-small"
+          variant="outlined"
+          class="ms-1"
+        >
           HTTP {{ failure.status }}
         </v-chip>
       </template>
