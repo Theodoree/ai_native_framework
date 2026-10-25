@@ -3464,8 +3464,10 @@ try {
   // 只认「整词就是变量」：`repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs` 这类带变量的
   // 字面量仍然可判（回读形态照旧放行），否则良性回读会被一起打死。
   const BLIND_ENDPOINT_WORD = /^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\([^)]*\)|`[^`]*`)$/;
-  // 能证明「这一次是读」的请求形态：显式 GET、只读输出（--jq/--template）、分页读。
-  const READ_ONLY_REQUEST = /(?:^|\s)(?:-X|--method)\s+GET\b|(?:^|\s)(?:--jq|-q|--template|--paginate|--slurp)(?:\s|=|$)/i;
+  // 能证明「这一次是读」的只有**方法**：gh 的 -X GET / -XGET / --method GET / --method=GET，
+  // curl 的 -G/--get。--jq / -q / --template / --paginate / --slurp 是响应整形与分页读取，
+  // 它们不约束方法 —— 最多作为「与已证明 GET 同时出现」的附加证据，绝不能单独放行。
+  const READ_ONLY_REQUEST = /(?:^|\s)(?:-X\s*GET|--method(?:\s+|=)GET)(?=\s|$)|(?:^|\s)(?:-G|--get)(?=\s|$)/i;
   function blindEndpointCall(state) {
     if (state.writeIntent) return false;
     // 端点词**全部**不可解才算「跟不下去」：看得见的那条字面量端点已经能定这一次调用的面。
@@ -6552,7 +6554,9 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     // 面判据同理：任何 workflow 里的写意图都是违规，不看端点拼写。
     expect(checkRunWriteSurface('gh api --method POST --input body.json "$ep"')).toBe("check-runs");
     // 反面对照：同一个变量端点的**只读**调用不是写面（放行的读形态仍绑在自证步上）。
-    expect(checkRunWriteSurface('gh api --jq .id "$ep"')).toBeNull();
+    // 只读靠的是显式方法本身，--jq 只是整形：没有 -X GET 时同一个变量端点回到「不可判」。
+    expect(checkRunWriteSurface('gh api -X GET --jq .id "$ep"')).toBeNull();
+    expect(checkRunWriteSurface('gh api --jq .id "$ep"')).toBe("check-runs");
   });
 
   it("轮十八-3：显式只读方法不是写 —— -X GET 放行，-X PATCH 仍红，文案分得清两种原因", () => {
@@ -7453,6 +7457,64 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     });
     expect(selfCheck(single).status, String(selfCheck(single).stdout)).toBe(0);
     expect(single.summary).toBe("");
+  });
+
+  it("轮二十三-4：盲端点的放行条件是『方法被证明为只读』—— 输出整形旗标不证明方法", () => {
+    const SH = String.fromCharCode(10);
+    // 判据级：--jq / -q / --template / --paginate / --slurp 是响应整形与分页读取，
+    // 它们不约束方法 —— 把「整形」当成「这一次是读」的证明，等于给盲端点留一条后门。
+    for (const flag of ["--jq .id", "-q .id", "--template .id", "--paginate", "--slurp"]) {
+      expect(checkRunWriteSurface("gh api $EP $M $B " + flag), flag).toBe("check-runs");
+    }
+    // 能证明「这一次是读」的只有显式方法：-X GET / -XGET / --method GET / --method=GET，
+    // 以及 curl 自己的 -G/--get。整形旗标可以与它们同时出现，但不能单独放行。
+    expect(checkRunWriteSurface("gh api $EP -X GET --jq .title")).toBe(null);
+    expect(checkRunWriteSurface("gh api $EP -XGET --jq .title")).toBe(null);
+    expect(checkRunWriteSurface("gh api $EP --method GET --jq .title")).toBe(null);
+    expect(checkRunWriteSurface("gh api $EP --method=GET --jq .title")).toBe(null);
+    expect(checkRunWriteSurface("curl -sS -G -d per_page=100 $URL")).toBe(null);
+    // 反面对照：同一份 curl 去掉 -G 就没有方法证明，-d 是写形态 —— 照样红。
+    expect(checkRunWriteSurface("curl -sS -d per_page=100 $URL")).toBe("check-runs");
+    // 良性反面对照：带变量的字面量端点仍可判，只读回读照旧放行。
+    expect(checkRunWriteSurface("gh api repos/o/r/commits/abc/check-runs --jq .conclusion")).toBe(null);
+    expect(checkRunWriteSurface("gh api repos/o/r/issues/1 --jq .title")).toBe(null);
+    const dir = mkdtempSync(join(tmpdir(), "audit-workflow-blind-readonly-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    // 端点 / 方法 / 请求体一起走 env：写形态与方法都被变量藏起来，只剩一个整形旗标在明面上。
+    const blind = (command) =>
+      [
+        "name: peer-blind",
+        "on: push",
+        "permissions:",
+        "  checks: write",
+        "jobs:",
+        "  p:",
+        "    runs-on: ubuntu-latest",
+        "    env:",
+        "      EP: repos/${{ github.repository }}/check-runs",
+        "      M: --method POST",
+        "      B: --input p.json",
+        "    steps:",
+        "      - name: p",
+        "        run: " + command,
+        "",
+      ].join(SH);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), blind("gh api $EP $M $B --jq .id"));
+    const violations = workflowWriteSurfaceViolations({ root: dir });
+    expect(violations.map((v) => v.step)).toEqual(["peer-blind.yml"]);
+    expect(violations.some((v) => v.where === "check-runs")).toBe(true);
+    // 端到端：同一份删掉整形旗标 → 同样非空（旗标不是证明，删掉它不该改变结论）。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), blind("gh api $EP $M $B"));
+    expect(workflowWriteSurfaceViolations({ root: dir }).length).toBeGreaterThan(0);
+    // 端到端：换成分页 / 模板同样是整形，不是方法证明。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), blind("gh api $EP $M $B --paginate"));
+    expect(workflowWriteSurfaceViolations({ root: dir }).length).toBeGreaterThan(0);
+    // 端到端良性反面对照：显式 GET 才是证明 —— 同一条盲端点调用判得下去。
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), blind("gh api $EP -X GET --jq .title"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    writeFileSync(join(dir, WORKFLOW_DIR, "peer-blind.yml"), blind("gh api repos/o/r/issues/1 --jq .title"));
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
   });
 
 });
