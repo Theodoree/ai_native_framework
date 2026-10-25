@@ -21,10 +21,19 @@ type Deliverer interface {
 type httpDeliverer struct {
 	client *http.Client
 	token  func() string
+	// baseURL 可注入：测试拿 httptest.Server 顶替真 GitHub，生产留空走 remoteEndpoint。
+	baseURL string
 }
 
 func newHTTPDeliverer(token func() string) Deliverer {
 	return &httpDeliverer{client: &http.Client{Timeout: 20 * time.Second}, token: token}
+}
+
+func (d *httpDeliverer) base() string {
+	if d.baseURL != "" {
+		return d.baseURL
+	}
+	return remoteEndpoint
 }
 
 func (d *httpDeliverer) AddLabel(ctx context.Context, target OutboxTarget, label string) error {
@@ -35,7 +44,7 @@ func (d *httpDeliverer) AddLabel(ctx context.Context, target OutboxTarget, label
 	if err != nil {
 		return err
 	}
-	address := fmt.Sprintf("%s/repos/%s/issues/%d/labels", remoteEndpoint, target.Repo, target.Issue)
+	address := fmt.Sprintf("%s/repos/%s/issues/%d/labels", d.base(), target.Repo, target.Issue)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, address, bytes.NewReader(payload))
 	if err != nil {
 		return err

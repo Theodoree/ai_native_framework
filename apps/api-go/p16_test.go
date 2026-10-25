@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -171,8 +175,9 @@ func TestSyncNotModifiedWritesNothing(t *testing.T) {
 	if !ok {
 		t.Fatal("fetcher 没被调用")
 	}
-	if sent.ETag != seed.ETag || sent.Since != seed.FetchedAt {
-		t.Fatalf("条件请求没带上 ETag/since: %+v", sent)
+	// 「没变」的唯一判据是 ETag；since 已随字段一起删掉（见 TestFetchRequestHasNoSinceField）。
+	if sent.ETag != seed.ETag {
+		t.Fatalf("条件请求没带上 ETag: %+v", sent)
 	}
 
 	afterBytes, err := os.ReadFile(cacheFile(root))
@@ -621,3 +626,311 @@ func TestRemoteReportsPresence(t *testing.T) {
 }
 
 var _ = json.Marshal
+
+// ---- 真 HTTP 层：httptest 顶替 GitHub，条件请求/分页/状态码/写投递都能在本地验证 ----
+
+func newTestFetcher(server *httptest.Server) *httpFetcher {
+	return &httpFetcher{client: server.Client(), baseURL: server.URL}
+}
+
+func newTestDeliverer(server *httptest.Server, token string) *httpDeliverer {
+	return &httpDeliverer{client: server.Client(), token: func() string { return token }, baseURL: server.URL}
+}
+
+// 条件请求的唯一判据是 ETag：URL 里不允许出现 since（ETag 随 URL 变，304 就永不命中）。
+func TestSyncSendsETagWithoutSince(t *testing.T) {
+	root := p16Root(t)
+	subject := newApp(root)
+	seed := &RemoteSnapshot{ETag: `"etag-seed"`, FetchedAt: "2024-01-01T00:00:00.000Z", Repo: "ted/example",
+		Issues: []RemoteIssue{{Number: 1, Labels: []string{"state:accepted"}}}}
+	if err := subject.writeCache(seed); err != nil {
+		t.Fatalf("写种子缓存失败: %v", err)
+	}
+
+	received := make(chan *http.Request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Clone(context.Background())
+		w.Header().Set("etag", `"etag-new"`)
+		_, _ = w.Write([]byte(`[{"number":7,"title":"新快照","state":"open","labels":[{"name":"state:review"}],"updated_at":"2024-01-02T00:00:00Z"}]`))
+	}))
+	defer server.Close()
+	subject.fetcher = newTestFetcher(server)
+
+	recorder := call(t, subject, http.MethodPost, "/api/sync", "")
+	expectStatus(t, recorder, http.StatusOK)
+
+	var sent *http.Request
+	select {
+	case sent = <-received:
+	default:
+		t.Fatal("假远端没收到请求")
+	}
+	if strings.Contains(strings.ToLower(sent.URL.RawQuery), "since") {
+		t.Fatalf("请求 URL 还带 since: %s", sent.URL.String())
+	}
+	if got := sent.Header.Get("if-none-match"); got != seed.ETag {
+		t.Fatalf("if-none-match = %q，想要 %q", got, seed.ETag)
+	}
+	cache, err := subject.readCache()
+	if err != nil {
+		t.Fatalf("读缓存失败: %v", err)
+	}
+	// 缓存语义是整份快照：新结果整份替换，不是叠加，更不是半份。
+	if cache.ETag != `"etag-new"` || len(cache.Issues) != 1 || cache.Issues[0].Number != 7 {
+		t.Fatalf("缓存没被整份替换: %+v", cache)
+	}
+}
+
+// FetchRequest 不许再长出 since：加回增量参数就是把局部结果当快照，对账随后把未结在途全判 pending。
+func TestFetchRequestHasNoSinceField(t *testing.T) {
+	if _, ok := reflect.TypeOf(FetchRequest{}).FieldByName("Since"); ok {
+		t.Fatal("FetchRequest 又有 Since 字段了：缓存语义必须是整份快照")
+	}
+}
+
+// 304 → NotModified 且缓存文件一个字节都不动（真发请求，不靠假 fetcher）。
+func TestHTTPFetcherNotModifiedKeepsCacheBytes(t *testing.T) {
+	root := p16Root(t)
+	subject := newApp(root)
+	seed := &RemoteSnapshot{ETag: `"etag-seed"`, FetchedAt: "2024-01-01T00:00:00.000Z", Repo: "ted/example",
+		Issues: []RemoteIssue{{Number: 1, Labels: []string{"state:accepted"}}}}
+	if err := subject.writeCache(seed); err != nil {
+		t.Fatalf("写种子缓存失败: %v", err)
+	}
+	beforeBytes, err := os.ReadFile(cacheFile(root))
+	if err != nil {
+		t.Fatalf("读种子缓存失败: %v", err)
+	}
+	beforeStat, err := os.Stat(cacheFile(root))
+	if err != nil {
+		t.Fatalf("stat 种子缓存失败: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("if-none-match"); got != `"etag-seed"` {
+			t.Errorf("条件请求没带缓存 ETag: %q", got)
+		}
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer server.Close()
+	subject.fetcher = newTestFetcher(server)
+
+	recorder := call(t, subject, http.MethodPost, "/api/sync", "")
+	expectStatus(t, recorder, http.StatusOK)
+	var report syncReport
+	decode(t, recorder, &report)
+	if report.Status != "notModified" || report.Issues != 1 {
+		t.Fatalf("304 应回报旧缓存事实: %+v", report)
+	}
+
+	afterBytes, err := os.ReadFile(cacheFile(root))
+	if err != nil {
+		t.Fatalf("读缓存失败: %v", err)
+	}
+	afterStat, err := os.Stat(cacheFile(root))
+	if err != nil {
+		t.Fatalf("stat 缓存失败: %v", err)
+	}
+	if string(afterBytes) != string(beforeBytes) {
+		t.Fatalf("304 改写了缓存内容: %s", afterBytes)
+	}
+	if !afterStat.ModTime().Equal(beforeStat.ModTime()) {
+		t.Fatalf("304 重写了缓存文件（mtime 变了）: %v -> %v", beforeStat.ModTime(), afterStat.ModTime())
+	}
+}
+
+// 第一页带 Link: rel="next" → 跟到第二页，合并成完整列表，快照 ETag 取第一页。
+func TestHTTPFetcherFollowsNextLink(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "":
+			next := "http://" + r.Host + r.URL.Path + "?state=all&per_page=100&page=2"
+			w.Header().Set("etag", `"etag-page1"`)
+			// last 在前、next 在后：解析必须按 rel 找，不能按位置取。
+			w.Header().Set("link", "<"+next+"&page=9>; rel=\"last\", <"+next+">; rel=\"next\"")
+			_, _ = w.Write([]byte(`[{"number":1,"title":"第一页","labels":[{"name":"state:accepted"}]}]`))
+		case "2":
+			w.Header().Set("etag", `"etag-page2"`)
+			_, _ = w.Write([]byte(`[{"number":2,"title":"第二页","labels":[{"name":"state:review"}]}]`))
+		default:
+			t.Errorf("意外的 page 参数: %q", r.URL.Query().Get("page"))
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	result, err := newTestFetcher(server).Fetch(context.Background(), FetchRequest{Repo: "ted/example", Token: "test-token"})
+	if err != nil {
+		t.Fatalf("分页取数失败: %v", err)
+	}
+	if len(result.Issues) != 2 {
+		t.Fatalf("拿到 %d 条（分页没跟完，超过 100 条就会被静默截断）: %+v", len(result.Issues), result.Issues)
+	}
+	if result.Issues[0].Number != 1 || result.Issues[1].Number != 2 {
+		t.Fatalf("合并顺序不对: %+v", result.Issues)
+	}
+	if result.ETag != `"etag-page1"` {
+		t.Fatalf("快照 ETag = %q，想要第一页的 ETag", result.ETag)
+	}
+}
+
+// 分页没有尽头时报 E_REMOTE_PAGING：宁可失败，也不静默截断成半份快照。
+func TestHTTPFetcherPagingCapReportsError(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		next := "http://" + r.Host + r.URL.Path + "?page=" + itoa(hits+1)
+		w.Header().Set("link", "<"+next+">; rel=\"next\"")
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer server.Close()
+
+	_, err := newTestFetcher(server).Fetch(context.Background(), FetchRequest{Repo: "ted/example"})
+	if err == nil {
+		t.Fatal("分页成环却没报错")
+	}
+	var typed *apiError
+	if !errors.As(err, &typed) || typed.Code != "E_REMOTE_PAGING" {
+		t.Fatalf("错误码不对: %v", err)
+	}
+	if hits > remotePageCap+1 {
+		t.Fatalf("请求次数 = %d，超过上限 %d", hits, remotePageCap+1)
+	}
+}
+
+// 分页地址由远端给出：只跟本端点下的地址，别的主机一次都不该被访问（否则等于把 token 送出去）。
+func TestHTTPFetcherRejectsForeignPagingHost(t *testing.T) {
+	evilHits := 0
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		evilHits++
+		_, _ = w.Write([]byte(`[{"number":2,"title":"不该出现","state":"open","labels":[],"updated_at":"2024-01-02T00:00:00Z"}]`))
+	}))
+	defer evil.Close()
+
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("link", "<"+evil.URL+"/repos/o/r/issues?page=2>; rel=\"next\"")
+		_, _ = w.Write([]byte(`[{"number":1,"title":"甲","state":"open","labels":[],"updated_at":"2024-01-02T00:00:00Z"}]`))
+	}))
+	defer server.Close()
+
+	_, err := newTestFetcher(server).Fetch(context.Background(), FetchRequest{Repo: "ted/example"})
+	if err == nil {
+		t.Fatal("分页指向别的主机却没报错")
+	}
+	var typed *apiError
+	if !errors.As(err, &typed) || typed.Code != "E_REMOTE_PAGING" {
+		t.Fatalf("错误码不对: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("本端点请求次数 = %d，想要 1 次（第一页拿到跨主机 Link 就该停）", hits)
+	}
+	if evilHits != 0 {
+		t.Fatalf("evil 主机被访问了 %d 次，token 有外送风险", evilHits)
+	}
+}
+
+// 401/403/429 各自映射：都不能被当成「远端没数据」。
+func TestHTTPFetcherStatusMapping(t *testing.T) {
+	cases := []struct {
+		status int
+		code   string
+	}{
+		{http.StatusUnauthorized, "E_REMOTE_UNAUTHORIZED"},
+		{http.StatusForbidden, "E_REMOTE_RATE_LIMIT"},
+		{http.StatusTooManyRequests, "E_REMOTE_RATE_LIMIT"},
+	}
+	for _, item := range cases {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(item.status)
+		}))
+		_, err := newTestFetcher(server).Fetch(context.Background(), FetchRequest{Repo: "ted/example"})
+		server.Close()
+		var typed *apiError
+		if !errors.As(err, &typed) || typed.Code != item.code {
+			t.Fatalf("%d 的映射不对: %v", item.status, err)
+		}
+	}
+}
+
+// issues 端点会混着 PR：它的状态是 open/closed，不是 state:* label，必须剔除。
+func TestHTTPFetcherDropsPullRequests(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[
+			{"number":1,"title":"真 issue","state":"open","labels":[{"name":"state:accepted"}],"updated_at":"2024-01-01T00:00:00Z"},
+			{"number":2,"title":"其实是个 PR","state":"open","labels":[],"pull_request":{"url":"https://example.test/pr/2"}}
+		]`))
+	}))
+	defer server.Close()
+
+	result, err := newTestFetcher(server).Fetch(context.Background(), FetchRequest{Repo: "ted/example"})
+	if err != nil {
+		t.Fatalf("取数失败: %v", err)
+	}
+	if len(result.Issues) != 1 || result.Issues[0].Number != 1 {
+		t.Fatalf("PR 条目没被剔除: %+v", result.Issues)
+	}
+}
+
+// 写投递的请求形状与结果判定：2xx 才算成功，4xx 是失败。
+func TestHTTPDelivererAddLabel(t *testing.T) {
+	type seenRequest struct {
+		method        string
+		path          string
+		authorization string
+		contentType   string
+		body          string
+	}
+	received := make(chan seenRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- seenRequest{
+			method:        r.Method,
+			path:          r.URL.Path,
+			authorization: r.Header.Get("authorization"),
+			contentType:   r.Header.Get("content-type"),
+			body:          string(body),
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"labels":[{"name":"state:rejected"}]}`))
+	}))
+	defer server.Close()
+
+	deliverer := newTestDeliverer(server, "test-token")
+	if err := deliverer.AddLabel(context.Background(), OutboxTarget{Repo: "ted/example", Issue: 5}, "state:rejected"); err != nil {
+		t.Fatalf("2xx 却报错: %v", err)
+	}
+	sent := <-received
+	if sent.method != http.MethodPost || sent.path != "/repos/ted/example/issues/5/labels" {
+		t.Fatalf("请求不对: %+v", sent)
+	}
+	if sent.authorization != "Bearer test-token" {
+		t.Fatalf("authorization = %q", sent.authorization)
+	}
+	if sent.contentType != "application/json" {
+		t.Fatalf("content-type = %q", sent.contentType)
+	}
+	var payload struct {
+		Labels []string `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(sent.body), &payload); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v (%q)", err, sent.body)
+	}
+	if len(payload.Labels) != 1 || payload.Labels[0] != "state:rejected" {
+		t.Fatalf("请求体不对: %q", sent.body)
+	}
+
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed"}`))
+	}))
+	defer rejecting.Close()
+	err := newTestDeliverer(rejecting, "test-token").AddLabel(context.Background(), OutboxTarget{Repo: "ted/example", Issue: 5}, "state:rejected")
+	if err == nil {
+		t.Fatal("4xx 却当成成功")
+	}
+	if !strings.Contains(err.Error(), "422") {
+		t.Fatalf("错误里没带状态码: %v", err)
+	}
+}

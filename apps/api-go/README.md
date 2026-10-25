@@ -7,7 +7,7 @@
 - 用 Go 标准库 §net/http§ 复刻 §scripts/server.mjs§ 的 JSON API（行为等价，不照抄实现）
 - 多一条事件时间线：§GET /api/events§
 - 单二进制：构建期把 §apps/web-vue/dist§ 复制进 §apps/api-go/dist§，用 §//go:embed all:dist§ 内嵌；运行期不依赖磁盘 dist
-- 远端同步：§POST /api/sync§ 只读拉 issue 列表（number/title/state/labels/updated_at），条件请求（§If-None-Match§ + §since§），304 一个字节都不写盘
+- 远端同步：§POST /api/sync§ 只读拉 issue 列表（number/title/state/labels/updated_at），条件请求只靠 §If-None-Match§ + ETag，304 一个字节都不写盘
 - 派生索引：§.agents/platform/index.db§（SQLite）存折叠结果、事件时间线、远端快照、在途记录，纯派生、删了自愈
 - 在途台账：§.agents/platform/outbox.jsonl§ 记「本地改了状态、还没确认远端生效」的外发，只有它能回答「这条是不是还在路上」
 - 判定与账本全部经两个 Node 入口（见「Node 入口契约」）
@@ -95,7 +95,8 @@ cd ../.. && npm run check   # 链尾的 check:go = gofmt 干净 + go vet + go te
   "reconciled": { "applied": 0, "conflict": 0, "pending": 1 } }
 ```
 
-- 请求侧带 §If-None-Match§（缓存 ETag）与 §since§（缓存 §fetchedAt§）；§304§ 时**一个字节都不写盘**，只对账
+- 请求侧只带 §If-None-Match§（缓存 ETag），**不带 §since§**：URL 里有 since 时 ETag 会随 URL 变，304 永不命中；§304§ 时**一个字节都不写盘**，只对账
+- 分页跟 §Link: rel="next"§ 逐页取完再合并（上限 50 页，超限报 §E_REMOTE_PAGING§，绝不静默截断）；缓存永远是**整份快照**，任何一页失败都不写盘
 - 缺 token → 500 §{"kind":"infra","code":"E_NO_TOKEN"}§，且不发请求
 - 网络错误 / §401§ §E_REMOTE_UNAUTHORIZED§ / §403§·§429§ §E_REMOTE_RATE_LIMIT§ / 其他 §E_REMOTE_STATUS§ → 500 §infra§，**旧缓存原样保留**（旧缓存 + 明确 §fetchedAt§ 比清空更诚实）
 
