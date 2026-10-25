@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 超过 1MB 的请求体不解析：与原型同一条边界。
@@ -24,6 +26,20 @@ type app struct {
 	root string
 	// 账本与声明都是「先读后写」：串行化，避免两个请求抢同一个 next-id 或同一份 tmp。
 	mu sync.Mutex
+
+	// dist 是页面来源：默认内嵌，PLATFORM_DIST 可覆盖（开发态）。
+	dist fs.FS
+	// now / fetcher / deliverer 全部可注入：测试不碰真时钟、不碰网络。
+	now          func() time.Time
+	fetcher      Fetcher
+	deliverer    Deliverer
+	writeEnabled bool
+
+	// indexMu: 索引重建唯一入口；probeMu/probes: 巡检次数只在内存里（重启即归零）。
+	indexMu sync.Mutex
+	probeMu sync.Mutex
+	probes  map[string]int
+	wake    chan struct{}
 }
 
 // newApp 先把根解析成真实路径：判定器入口按字面路径比对自己的位置，
@@ -33,7 +49,22 @@ func newApp(root string) *app {
 	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
 		cleaned = resolved
 	}
-	return &app{root: cleaned}
+	subject := &app{
+		root:         cleaned,
+		dist:         resolveDist(),
+		now:          time.Now,
+		probes:       map[string]int{},
+		wake:         make(chan struct{}, 1),
+		writeEnabled: writeEnabledFromEnv(),
+	}
+	subject.fetcher = newHTTPFetcher()
+	subject.deliverer = newHTTPDeliverer(subject.token)
+	return subject
+}
+
+// nowISO 是所有时间戳的唯一格式：测试注入时钟后，时间也可复算。
+func (a *app) nowISO() string {
+	return a.now().UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 func (a *app) configPath() string {
@@ -74,6 +105,31 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/verify":
 		if r.Method == http.MethodPost {
 			a.handleVerify(w, r)
+			return
+		}
+	case "/api/sync":
+		if r.Method == http.MethodPost {
+			a.handleSync(w, r)
+			return
+		}
+	case "/api/remote":
+		if r.Method == http.MethodGet {
+			a.handleRemote(w, r)
+			return
+		}
+	case "/api/outbox":
+		if r.Method == http.MethodGet {
+			a.handleOutbox(w, r)
+			return
+		}
+	case "/api/outbox/retry":
+		if r.Method == http.MethodPost {
+			a.handleOutboxRetry(w, r)
+			return
+		}
+	case "/api/index/rebuild":
+		if r.Method == http.MethodPost {
+			a.handleIndexRebuild(w, r)
 			return
 		}
 	}
