@@ -42,6 +42,7 @@ export const EXECUTORS = ["sandbox", "github"];
 const PLACEHOLDER = new Set([
   "",
   "unknown",
+  "pending",
   "todo",
   "tbd",
   "n/a",
@@ -55,11 +56,33 @@ const PLACEHOLDER = new Set([
   "placeholder",
 ]);
 
+// 本仓自己声明的占位值写在 .agents/platform/routing.yml：`model: pending-review-a` 之类。
+// 该文件的原话是「model 当前是占位值（pending-*），只是把结构声明清楚」——即 pending-*
+// 就是「还没接真模型」的标记。不把它算占位符，evidence.model="pending-review-a" 就会让
+// 「没跑到」写成「跑到并通过」，而这正是本表存在的唯一理由。
+const PLACEHOLDER_PREFIX = "pending-";
+
 const isText = (value) => typeof value === "string" && value.trim() !== "";
-const isPlaceholder = (value) =>
-  !isText(value) || PLACEHOLDER.has(value.trim().toLowerCase());
+const isPlaceholder = (value) => {
+  if (!isText(value)) return true;
+  const text = value.trim().toLowerCase();
+  return PLACEHOLDER.has(text) || text.startsWith(PLACEHOLDER_PREFIX);
+};
 
 const show = (value) => JSON.stringify(value === undefined ? null : value);
+
+// ---- 输出面：stdout 就是 Actions 的注解面 ----
+// GitHub Actions 把每一行以 "::" 开头的输出当成 workflow command（::error:: / ::warning:: …）。
+// report() 打的每个字段都来自上游输入，所以「一句判据」里塞一个换行就能伪造一条 ::error::。
+// 中和放在唯一的写出口上，而不是散在 N 个字段上：漏掉哪个字段，哪个字段就是注入面。
+// 只中和**来自输入的文本**；本文件自己不发注解（::warning:: 由 workflow 的 run 块发）。
+const LINE_BREAK = /[\r\n\u2028\u2029]/g;
+const oneLine = (value) => String(value).replace(LINE_BREAK, " ");
+const outLine = (line) => {
+  const safe = oneLine(line);
+  // 换行已经压掉，正常到不了这里；到了就是别处漏了，也不许让这一行变成注解。
+  return safe.startsWith("::") ? "audit-findings " + safe : safe;
+};
 
 export function validateResult(input) {
   const errors = [];
@@ -166,6 +189,13 @@ const findingsOf = (value) => {
   return [];
 };
 
+// findings 是上游给的 JSON，不保证元素是对象（null / 字符串 / 数组都见过）。
+// 非对象元素不是「一条缺陷」，没有 path/line/criterion 可比，硬解引用就是整脚本崩。
+// 它们的信息不该在这里丢：validateResult 会把 findings[i]: 必须是对象 报到 schema 错误里，
+// 该槽照样落 INFRA。这里只负责让比对不崩。
+const isFindingObject = (value) =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
 const keyOf = (finding) =>
   [finding?.path, finding?.line, finding?.criterion].join("\u0000");
 
@@ -175,12 +205,14 @@ const keyOf = (finding) =>
 export function compareFindings(a, b) {
   const slots = new Map();
   for (const finding of findingsOf(a)) {
+    if (!isFindingObject(finding)) continue;
     const key = keyOf(finding);
-    slots.set(key, { ...(slots.get(key) ?? {}), a: finding });
+    slots.set(key, { ...slots.get(key), a: finding });
   }
   for (const finding of findingsOf(b)) {
+    if (!isFindingObject(finding)) continue;
     const key = keyOf(finding);
-    slots.set(key, { ...(slots.get(key) ?? {}), b: finding });
+    slots.set(key, { ...slots.get(key), b: finding });
   }
   const agreed = [];
   const onlyA = [];
@@ -283,6 +315,19 @@ export function assess({ a, b } = {}) {
     ["b", b],
   ].filter(([, raw]) => raw !== undefined);
   const executors = inputs.map(([slot, raw]) => accountFor(slot, raw));
+  // 槽内已经校验「自报的执行器 == 所在槽」，但槽间没有人管：两个槽都自报同一个执行器时，
+  // 双执行器独立比对的前提就没了 —— 一份意见会被记成两票，比对永远是 agreed。
+  // 这条不变式原先只写在 audit-slot.mjs 的注释里，注释拦不住一次配置改动，所以这里也判一次。
+  const claimants = executors
+    .map((e) => (e.evidence && typeof e.evidence.executor === "string" ? e.evidence.executor : null))
+    .filter((x) => x !== null);
+  const duplicated = claimants.find((x, i) => claimants.indexOf(x) !== i) ?? null;
+  if (duplicated) {
+    for (const e of executors) {
+      e.effective = "INFRA";
+      e.reason = "两个槽自报同一个执行器 " + duplicated + "：双执行器独立比对的前提消失";
+    }
+  }
   const verdict = normalizeVerdict(executors.map((e) => e.effective));
   const comparison =
     a !== undefined && b !== undefined ? compareFindings(a, b) : null;
@@ -295,9 +340,25 @@ export function assess({ a, b } = {}) {
   };
 }
 
+// 渲染一条 finding。字段可能缺（非对象元素已在 compareFindings 里跳过，这里只是不信任形状），
+// 有值就必须是一行：换行/行首 :: 的中和在 out() 上，这里不重复做。
+const findingLine = (finding, middle = "") =>
+  [
+    finding?.path ?? "?",
+    ":" + (finding?.line ?? "?"),
+    String(finding?.severity ?? "?"),
+    middle,
+    String(finding?.criterion ?? "?"),
+  ]
+    .filter((part) => part !== "")
+    .join(" ");
+
 function report(paths, result) {
-  const out = (line) => process.stdout.write(line + "\n");
+  // 唯一的写出口：所有来自输入的字段都从这里出去，中和一次就够（见 outLine）。
+  const out = (line) => process.stdout.write(outLine(line) + "\n");
   out("audit-findings a=" + (paths.a ?? "-") + " b=" + (paths.b ?? "-"));
+  // 兜底结论自带 reason：那是唯一一处「为什么判成 INFRA」的人话，不能只留在 result.json 里。
+  if (result.reason) out("audit-findings reason - " + result.reason);
   for (const executor of result.executors) {
     const evidence = executor.evidence;
     const who = evidence
@@ -346,39 +407,13 @@ function report(paths, result) {
     );
     // 不一致本身就是信号：逐条摊开，不做多数决。
     for (const finding of result.comparison.onlyA)
-      out(
-        "audit-findings onlyA " +
-          finding.path +
-          ":" +
-          finding.line +
-          " " +
-          finding.severity +
-          " " +
-          finding.criterion,
-      );
+      out("audit-findings onlyA " + findingLine(finding));
     for (const finding of result.comparison.onlyB)
-      out(
-        "audit-findings onlyB " +
-          finding.path +
-          ":" +
-          finding.line +
-          " " +
-          finding.severity +
-          " " +
-          finding.criterion,
-      );
+      out("audit-findings onlyB " + findingLine(finding));
     for (const finding of result.comparison.severityMismatch)
       out(
         "audit-findings severityMismatch " +
-          finding.path +
-          ":" +
-          finding.line +
-          " a=" +
-          finding.severityA +
-          " b=" +
-          finding.severityB +
-          " " +
-          finding.criterion,
+          findingLine(finding, "a=" + finding?.severityA + " b=" + finding?.severityB),
       );
   } else out("audit-findings compare skipped（只跑了一个执行器）");
   out(
@@ -391,35 +426,79 @@ function report(paths, result) {
   );
 }
 
-function main(argv) {
+// result.json 里有两个码，两个读者，别混：
+//   exit_code —— 本进程自己的码，与文件头那张三分表一致（0 pass / 1 判不合格 / 3 INFRA）。
+//   exit      —— 给 workflow「判定」步骤读的码。job 级 check 不是第二个结论写者，它只回答
+//                「这个 job 有没有跑错」：只有真失败才红（1）。INFRA 是「判不了」，红由 POST
+//                出去的 audit Check Run（conclusion=action_required）去红；让 job 也红，
+//                merge-gate 就会把一个「未判过」读成「不合格」——两件事被说成一件。
+export const workflowExitFor = (conclusion) => (conclusion === "failure" ? 1 : 0);
+
+const CRASH_REASON = "口径层崩溃，没有产出结论";
+
+const crashResult = (error) => ({
+  verdict: "INFRA",
+  conclusion: "action_required",
+  exitCode: 3,
+  executors: [],
+  comparison: null,
+  reason: CRASH_REASON + "：" + (error instanceof Error ? error.message : String(error)),
+});
+
+function writeResult(out, result) {
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(
+    out,
+    JSON.stringify(
+      {
+        verdict: result.verdict,
+        conclusion: result.conclusion,
+        exit_code: result.exitCode,
+        exit: workflowExitFor(result.conclusion),
+        executors: result.executors,
+        comparison: result.comparison,
+        reason: result.reason ?? null,
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+}
+
+// 崩溃不是可接受的行为。没有 result.json，workflow 既写不出 Check Run 也没有 INFRA 留痕，
+// 上一个 sha 上的 success 会原样留着 —— 那一次失败就变成了一次假绿。所以任何未预期异常
+// 都要落成「没判过」的结论文件，而不是让 node 带着栈退出。
+export function run(argv) {
   const paths = { a: arg(argv, "--a"), b: arg(argv, "--b") };
   const out = arg(argv, "--out");
-  const inputs = { a: paths.a ? loadResult(paths.a) : undefined };
-  if (paths.b) inputs.b = loadResult(paths.b);
-  const result = assess(inputs);
-  report(paths, result);
-  if (out) {
-    mkdirSync(dirname(out), { recursive: true });
-    writeFileSync(
-      out,
-      JSON.stringify(
-        {
-          verdict: result.verdict,
-          conclusion: result.conclusion,
-          exit_code: result.exitCode,
-          executors: result.executors,
-          comparison: result.comparison,
-        },
-        null,
-        2,
-      ) + "\n",
-    );
+  let result;
+  try {
+    const inputs = { a: paths.a ? loadResult(paths.a) : undefined };
+    if (paths.b) inputs.b = loadResult(paths.b);
+    result = assess(inputs);
+    report(paths, result);
+  } catch (error) {
+    result = crashResult(error);
+    process.stderr.write("audit-findings crash: " + (error?.stack ?? error) + "\n");
+    try {
+      report(paths, result);
+    } catch {
+      // 报告面再挂一次也不许吃掉结论文件：留痕是次要的，结论是必须的。
+    }
   }
-  process.exit(result.exitCode);
+  if (out) {
+    try {
+      writeResult(out, result);
+    } catch (error) {
+      process.stderr.write("audit-findings 写不出 " + out + "：" + error.message + "\n");
+      return 3;
+    }
+  }
+  return result.exitCode;
 }
 
 // 入口判定走 realpath：worktree / 软链下 argv[1] 与 import.meta.url 不是同一条字面路径，
 // 认不出自己就会静默退出 0 —— 对门来说那是最坏的失败形态（看起来绿）。
 const invoked = process.argv[1] ? realpathSync(process.argv[1]) : undefined;
 if (invoked === realpathSync(fileURLToPath(import.meta.url)))
-  main(process.argv.slice(2));
+  process.exit(run(process.argv.slice(2)));

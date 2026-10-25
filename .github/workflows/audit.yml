@@ -4,20 +4,87 @@ name: audit
 # 「校验 schema -> 合并多个执行器 -> 逐条比对 -> 回写 Check Run」。
 # 评论不算门：合并判据是名为 audit 的 Check Run，而不是 PR 里的一条评论。
 # 取数与判定之间只有一个接口：findings 文件。两个「落盘」步骤把上游执行器的
-# 结论写到 .audit/review-a.json / .audit/review-b.json（AUDIT_FINDINGS_A/B 由上游 job
-# 或仓库变量注入，本 workflow 不自己跑模型）。上游什么都没给时写的是 INFRA 记录，
+# 结论写到 .audit/review-a.json / .audit/review-b.json（dispatch inputs 注入，
+# 本 workflow 不自己跑模型）。上游什么都没给时写的是 INFRA 记录，
 # 不是「空 findings 的 pass」—— 没跑到不能写成跑到并通过。
 #
 # 路由（哪家模型）不在 CI 里：本文件只出现逻辑名 review-a / review-b，真源在
 # .agents/platform/routing.yml（docs/audit-contract.md 四）。
+#
+# 判定步骤的退出码有三个写者，口径必须一致（success -> 0、failure -> 1、
+# action_required -> 0）：
+#   1) POST 出去的 audit Check Run 的 conclusion —— 结论的唯一载体；
+#   2) job 级 check audit-runner 的 exit code —— 冗余信号：只回答「这个 job 有没有出
+#      逻辑故障」，不回答「代码合不合格」。所以 action_required 不给它染红：
+#      让它红，merge-gate 的 G3 就会把「未判过」读成「代码不合格」，
+#      同一事实两个写者互相矛盾；
+#   3) merge-gate G3 读到的 conclusion —— 真失败（failure / timed_out /
+#      startup_failure / cancelled）与未判过（action_required / neutral /
+#      skipped / stale）分两档，两档都阻断合并，区别只在责任方向。
+# 「一致」的定义不是「都红」，而是「不会互相矛盾」：Check Run 说判不了时，
+# job 级 check 不许说这一笔不合格。
+#
+# 服务器上一定有一条 audit Check Run：口径层崩了 / 没跑也一样。缺结论的形态是
+# 「结论兜底」补一条 action_required —— 缺结论绝不等于通过（P-13 的 schema 不合格、
+# 脚本崩溃都落在这条路径上）。
+#
+# 上面三条（口径层判定 / 结论兜底 / 判不了：回写 INFRA）都是**静态判据**：它们列举的是
+# 已知的执行形态（哪一步、哪种命令行、哪个 YAML 键）。静态判据只能收口它认得出来的形态——
+# 换一个载体（github-script 的 with.script、兄弟 workflow、解包后改文件）就能在同一 sha 上
+# 再发一条同名结论，而本文件一字未改。所以「会被读到的是哪一条」由运行时**自证**兜底——
+# 但它只是一次快照，兜住的是「回读那一刻已经存在的同名结论」：「结论自证：回读 Check Run」
+# 回读这个 sha 上所有 name=audit 的 Check Run，要求刚 POST 出去的那条在其中、是本 sha 上
+# id 最大的那条、且内容与本次 payload 一致。判据不是「恰好一条」：
+# 同一个 commit 上的旧 dispatch / rerun 会留下 id 更小的同名结论，那是 GitHub 的正常操作，
+# 不是第二个写者，把它读成「判不了」就会让正确结论被旧记录掩盖。
+# 静态判据管已知形态，回读直接观测事实；两者不互相替代。
+#
+# 自证管不到的那一半（**已经写明，不要读成已解决**）：回读之后再写入的同名结论 ——
+# 「自证通过 → merge-gate 读取」这段时间里，另一个带 checks:write 的写者补发一条 id 更大的
+# name=audit（以及补一条 audit-runner），本次真结论会被 G3 的「同名取 id 最大」盖掉。
+# 这不是判据写漏，是一次快照在时间轴上的固有边界。闭合它有两条路，都落在 P-14 编排层
+# （audit 挂 required + 打开 pull_request 触发时一起做）：① merge-gate 加时序判据（读到的
+# audit/audit-runner 晚于本次 merge-gate 开始、或 id 大于 merge-gate 自身 check → 按「未判过」
+# 阻断）；② 本次 nonce 写进 Check Run 的 external_id 并随 artifact 发布，由 merge-gate 比对。
+# 在信任根未解决（audit 用的是被 dispatch 那个 ref 的 YAML 与被审对象自己的 scripts/）之前，
+# 这两条都只是抬高门槛，不改变「被审对象能改判据」这个前提。登记出处：
+# .agents/notes/proposed/p13-audit-findings-contract.md §二十、platform-rollout-plan 的 P-14 待办。
+#
+# 上面那句的前提是 payload 的 head_sha 非空：空 sha 会被 GitHub 拒收，于是**一条
+# Check Run 都没有**，「一定有一条」当场不成立。三条写 payload 的路径各自兜住这一点：
+# 判定 / 兜底只在 ctx 解析成功（ok=1）时跑，落点由 ctx 给出；「判不了」用 ctx 给出的 sha，
+# 为空时退到 github.sha（本次运行的提交）。所以 checkout / node 先挂了、ctx 整步被跳过时，
+# 仍然是一条落在 github.sha 上的 action_required。
+# 那种「判不了」的成因是管线自己坏了（不是这个 PR 的问题），与「PR 上下文解不出」必须
+# 分开说：后者去改 PR / 重试，前者去修管线。
+#
+# 触发面刻意只有手动：手动 dispatch 时由 inputs 注入两个执行器的 findings（真跑用），
+# 不注入就落 INFRA。不挂 pull_request 的理由是 merge-gate 的 G3 要求每个非自身 check 都
+# success，于是一个可能产出 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
+# 那是结构性死锁，而且会训练人忽略红灯。等上游真执行器能保证「PR 事件一律有结论」之后再
+# 打开 pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
+#
+# 手动触发的硬约束：**从 PR 的 head 分支 dispatch**。dispatch 的 ref 决定 job 的 GITHUB_SHA，
+# 与 PR head 无关。能解出 PR head sha 时，判定落点永远是那个 sha（与 ref 无关）；
+# 解不出来时只能退回 GITHUB_SHA，那时落点才是 dispatch ref 的提交 —— ref 不是 head 分支，
+# 留痕就落在别的提交上，PR head 上上一轮的结论原样保留。
+# 这条不靠注释兜着：「判不了：回写 INFRA」把落点 sha 写进 Check Run 标题，并用 ::error:: 喊出来。
+# 该窗口在 audit 被挂成 required check 之前没有消费者（P-14 全量时才关上）。
 
-# 触发面刻意只有手动：在 AUDIT_FINDINGS_A/B 有真注入源之前，本 workflow 只能产出
-# action_required（「审计还没真跑」）。而 merge-gate 的 G3 要求每个非自身 check 都是
-# success，于是一个只会 action_required 的 check 会把**每一次**合并都挡死——那不是诚实，
-# 那是结构性死锁，而且会训练人忽略红灯。所以等 P-14 接上真执行器之后再打开
-# pull_request 触发；届时同步改掉 tests/audit-findings.test.mjs 里钉住触发面的那个用例。
 on:
   workflow_dispatch:
+    inputs:
+      pr:
+        description: "要审计的 PR 号"
+        required: true
+      findings_a:
+        description: "review-a 的 findings（JSON；留空则该执行器记 INFRA）"
+        required: false
+        default: ""
+      findings_b:
+        description: "review-b 的 findings（JSON；留空则该执行器记 INFRA）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -25,12 +92,15 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: audit-${{ github.event.pull_request.number }}
+  group: audit-${{ inputs.pr }}
   cancel-in-progress: true
 
 jobs:
-  audit:
-    name: audit
+  # job 自己的 Check Run 叫 audit-runner：判定结论由下面 POST 的那条 audit 承载。
+  # 两者若同名，同一事实就有两个写者，而 GitHub 按 name 只留最新一条——
+  # INFRA 的 action_required 会被 job 的 failure 盖掉，读的人就分不清「判不了」和「真没过」。
+  audit-runner:
+    name: audit-runner
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -43,47 +113,65 @@ jobs:
         with:
           node-version: 20
 
-      - name: 变更路径
+      # 这一步永不失败：解不出 PR 上下文本身就是一种结论（判不了），
+      # 而失败的 step 会让后面所有 step 被跳过、连 Check Run 都写不出去——
+      # 于是同一个 sha 上上一轮的 success 原样留着，「这次判不了」退化成「上次判过了」。
+      # 所以失败只体现在 ok=0，由后面两步按 ok 分流：要么正常判定，要么回写 INFRA。
+      - name: 解析 PR 上下文
+        id: ctx
+        env:
+          PR_INPUT: ${{ inputs.pr }}
         run: |
-          mkdir -p .audit
-          gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path' > .audit/changed-paths.txt
+          pr="$PR_INPUT"
+          # PR 号只允许是数字：它要进 $GITHUB_OUTPUT 和注解，一个换行就能伪造一条注解。
+          case "$pr" in
+            '' | *[!0-9]*) pr="" ;;
+          esac
+          sha=""
+          if [ -n "$pr" ]; then
+            sha=$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          if [ -n "$sha" ]; then
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "PR=#$pr head=$sha"
+          else
+            # 落到本次运行的提交上：宁可落在一个明确的位置，也不留在「以为写过」上。
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::取不到 PR #${pr:-?} 的 head sha：本次判不了，按 INFRA 回写"
+          fi
 
+      # 值只经 env 进入脚本：JSON 里的引号/换行由 env 原样传递，
+      # 绝不在 run 里内联输入（那是一次 shell 拼接）。
+      # 「输入自称的执行器」与「它所在的槽」是否一致，由 scripts/audit-slot.mjs 判，
+      # 规则不在这两份 run 块里各写一遍。
       - name: 落盘 review-a
+        if: steps.ctx.outputs.ok == '1'
+        env:
+          AUDIT_FINDINGS_A: ${{ inputs.findings_a }}
         run: |
-          mkdir -p .audit
-          AUDIT_SLOT=review-a AUDIT_EXECUTOR=sandbox AUDIT_INPUT="$AUDIT_FINDINGS_A" node -e '
-            const fs = require("node:fs");
-            const input = process.env.AUDIT_INPUT;
-            const body = input && input.trim() !== "" ? input : JSON.stringify({
-              verdict: "INFRA",
-              findings: [],
-              evidence: { executor: process.env.AUDIT_EXECUTOR, agent: process.env.AUDIT_SLOT },
-              reason: "上游未注入 findings（AUDIT_FINDINGS_A 为空）：判不了，不是通过",
-            });
-            fs.writeFileSync(".audit/" + process.env.AUDIT_SLOT + ".json", body);
-          '
+          AUDIT_INPUT="$AUDIT_FINDINGS_A" node scripts/audit-slot.mjs --slot review-a --executor sandbox --out .audit/review-a.json
 
       - name: 落盘 review-b
+        if: steps.ctx.outputs.ok == '1'
+        env:
+          AUDIT_FINDINGS_B: ${{ inputs.findings_b }}
         run: |
-          mkdir -p .audit
-          AUDIT_SLOT=review-b AUDIT_EXECUTOR=github AUDIT_INPUT="$AUDIT_FINDINGS_B" node -e '
-            const fs = require("node:fs");
-            const input = process.env.AUDIT_INPUT;
-            const body = input && input.trim() !== "" ? input : JSON.stringify({
-              verdict: "INFRA",
-              findings: [],
-              evidence: { executor: process.env.AUDIT_EXECUTOR, agent: process.env.AUDIT_SLOT },
-              reason: "上游未注入 findings（AUDIT_FINDINGS_B 为空）：判不了，不是通过",
-            });
-            fs.writeFileSync(".audit/" + process.env.AUDIT_SLOT + ".json", body);
-          '
+          AUDIT_INPUT="$AUDIT_FINDINGS_B" node scripts/audit-slot.mjs --slot review-b --executor github --out .audit/review-b.json
 
-      - name: verdict
+      # 这一步永不失败（set +e + 最后 exit 0）：口径层的判不了是一种结论，
+      # 不是一种故障。失败只体现在 result.json / check-run.json 有没有落地，
+      # 由「结论兜底」补、由「判定」按结论定 job 的红绿 —— 混在一步里做，
+      # 就会重演「脚本崩了但步骤绿、且没有 conclusion」。
+      - name: 口径层判定
         id: decide
+        if: steps.ctx.outputs.ok == '1'
         run: |
           set +e
           node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json
-          code=$?
+          set -e
           node -e '
             const fs = require("node:fs");
             const r = JSON.parse(fs.readFileSync(".audit/result.json", "utf8"));
@@ -91,8 +179,15 @@ jobs:
             const lines = [];
             for (const e of r.executors) lines.push(e.slot + ": 申报=" + e.declared + " 计入=" + e.effective + " schema=" + (e.valid ? "ok" : "不合格") + " findings=" + e.findings.length);
             if (r.comparison) lines.push("agreed=" + r.comparison.counts.agreed + " onlyA=" + r.comparison.counts.onlyA + " onlyB=" + r.comparison.counts.onlyB + " severityMismatch=" + r.comparison.counts.severityMismatch);
+            // 三个写者的口径（见文件头）：success->0、failure->1、action_required->0。
+            // action_required 不给 job 染红 —— 结论的红已经由 audit Check Run 承载，
+            // job 再红一次，G3 就会把「未判过」读成「代码不合格」。
+            // 认不出的 conclusion 退 3：那是口径层坏了，管线故障不能装作没事。
+            const JOB_EXIT = { success: 0, failure: 1, action_required: 0 };
+            const exit = Object.hasOwn(JOB_EXIT, r.conclusion) ? JOB_EXIT[r.conclusion] : 3;
             fs.appendFileSync(out, "verdict=" + r.verdict + "\n");
             fs.appendFileSync(out, "conclusion=" + r.conclusion + "\n");
+            fs.appendFileSync(out, "exit=" + exit + "\n");
             fs.writeFileSync(".audit/check-run.json", JSON.stringify({
               name: "audit",
               head_sha: process.env.AUDIT_SHA,
@@ -101,14 +196,248 @@ jobs:
               output: { title: "audit " + r.verdict, summary: lines.join("\n").slice(0, 60000) },
             }));
           '
-          echo "exit=$code" >> "$GITHUB_OUTPUT"
           exit 0
         env:
-          AUDIT_SHA: ${{ github.event.pull_request.head.sha }}
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
 
-      - name: Check Run
+      # 口径层崩了 / 没跑 / 写到一半，都不能让「没有结论」变成「看起来没有坏消息」。
+      # 这里补写的 result.json 只有 verdict/conclusion/exit/reason 四个字段，是**给人看的**
+      # （谁 cat 谁读整段文本），刻意不做成第二份口径层数据：读字段的唯一读者是上面
+      # 「口径层判定」里的内联 JS，而那一步在本步之前、且只跑一次 —— 本步补出来的文件
+      # 不会再被任何脚本解引 executors / comparison。要加读者，先把字段补齐。
+      # 这里补的是**同一条结论**（action_required），不是第二套判据：
+      # 服务器上必须存在一条 audit Check Run，缺结论绝不等价于通过。
+      # 也正因为如此，job 级 check 不为这条补的记录染红（exit=0）——
+      # 结论的红由 Check Run 承载，同一事实只该有一个写者。
+      - name: 结论兜底
+        id: fallback
+        if: always() && steps.ctx.outputs.ok == '1'
+        env:
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
         run: |
-          gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
+          set +e
+          node -e '
+            const fs = require("node:fs");
+            const read = (p) => {
+              try {
+                const v = JSON.parse(fs.readFileSync(p, "utf8"));
+                return v && typeof v === "object" ? v : null;
+              } catch {
+                return null;
+              }
+            };
+            const reason = "口径层没有产出结论（脚本崩溃或未运行）";
+            let repaired = false;
+            const result = read(".audit/result.json");
+            if (!result || typeof result.conclusion !== "string") {
+              fs.mkdirSync(".audit", { recursive: true });
+              fs.writeFileSync(".audit/result.json", JSON.stringify({
+                verdict: "INFRA",
+                conclusion: "action_required",
+                exit: 0,
+                reason: reason,
+              }, null, 2) + "\n");
+              repaired = true;
+            }
+            const payload = read(".audit/check-run.json");
+            if (!payload || typeof payload.conclusion !== "string") {
+              fs.writeFileSync(".audit/check-run.json", JSON.stringify({
+                name: "audit",
+                head_sha: process.env.AUDIT_SHA,
+                status: "completed",
+                conclusion: "action_required",
+                output: {
+                  title: "audit INFRA（口径层没有产出结论）",
+                  summary: reason + "：按 INFRA 留痕，别把它读成通过。",
+                },
+              }));
+              repaired = true;
+            }
+            if (!repaired) process.exit(0);
+            // 补出来的结论是 action_required，与口径层同一条口径：job 不染红。
+            if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, "exit=0\n");
+            process.exit(9);
+          '
+          wrote=$?
+          set -e
+          if [[ $wrote -ne 0 ]]; then
+            {
+              echo '## audit: 口径层没有产出结论 → 按 INFRA 留痕，别把它读成通过'
+              echo ''
+              echo '口径层脚本崩溃或没跑到，.audit/result.json 与 Check Run payload 至少有一个没落地。'
+              echo '这里补的是一条 action_required 的 audit Check Run：缺结论不等于通过。'
+              echo 'job 级 check 不为它染红 —— 结论的红由 audit Check Run 承载。'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '::error title=audit INFRA::口径层没有产出结论'
+          fi
+
+      # 不吞错误：POST 失败 = 该留痕没留成，这是一次真故障，步骤必须红。
+      # 前置步骤红了也要照跑（always()）：Check Run 才是结论的唯一载体，
+      # 一个红步骤把它跳过去，就等于「这次判不了」退化成「上次判过了」。
+      - name: 回写 Check Run
+        id: post
+        if: always() && steps.ctx.outputs.ok == '1'
+        run: |
+          id=$(gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id')
+          printf '%s\n' "$id"
+          # id 要进 $GITHUB_OUTPUT：一个换行就能多写一个 output，所以只收纯数字。
+          case "$id" in
+            '' | *[!0-9]*)
+              echo '::error title=audit 回写::Check Run 的 id 不是数字'
+              exit 1
+              ;;
+          esac
+          echo "check_run_id=$id" >> "$GITHUB_OUTPUT"
+
+      # 静态判据只能列举**已知的执行形态**：github-script 的 with.script、兄弟 workflow、
+      # 解包后改文件，都能在同一 sha 上再发一条同名结论，而本文件一字未改
+      # （实测：peer.yml 用 actions/github-script@v7 发一条 name=audit / conclusion=success，
+      # 静态判据全绿）。回读直接观测事实，不猜形态。
+      # 只读：不产生结论。判的是「平台上会被读到的那一条」，不是「只有一条」：
+      #   * 同一个 commit 上的旧 dispatch / rerun 会留下 id 更小的同名结论 —— GitHub 的正常操作，
+      #     不是第二个写者；把它读成「判不了」就等于用一条正常的历史留痕掩盖正确结论。
+      #   * 「会被读到」有唯一出处：scripts/merge-gate.mjs 的 G3 对同名 check 取 id 最大者。
+      #     所以本次这条必须是本 sha 上 id 最大的那条；被更新的结论盖过才算红。
+      # 再比这一条**写着什么**：id 只证明「是谁」，PATCH 改写既有那条不换 id，只比 id 结构上
+      # 看不见它（实测 checks.update 全绿）。
+      - name: 结论自证：回读 Check Run
+        if: always() && steps.ctx.outputs.ok == '1'
+        env:
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
+        run: |
+          expected='${{ steps.post.outputs.check_run_id }}'
+          # 端点只认 commits/<ref>/check-runs：/check-runs?head_sha= 这个形态不存在（实测 404）。
+          # filter=all 必须显式写：默认 filter=latest 是按 name 去重后的视图，
+          # 同名多条不许被默认视图藏起来。--slurp 与 --jq 互斥（gh 直接拒绝），
+          # 所以整页落盘再交给 node 解；也不经 env 传：真仓 4 条 check run 就 14KB，多几条就撞上限。
+          runs_file="$(mktemp)"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$AUDIT_SHA/check-runs?filter=all&per_page=100" --paginate --slurp > "$runs_file"
+          # 内容回读：id 只证明「是谁」，不证明「写着什么」。PATCH 改写既有那条不换 id。
+          # 普通 GET 用 --jq 没问题（只有 --slurp 与 --jq 互斥）。回读失败单独记一笔：
+          # 拿不到内容也是「证不了」，与「内容对不上」要分辨得开。
+          config=""
+          config_ok="1"
+          if [[ -n "$expected" ]]; then
+            if ! config=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$expected" --jq '.name + "|" + (.app.slug // "") + "|" + .status + "|" + .conclusion'); then
+              config_ok="0"
+            fi
+          fi
+          RUNS_FILE="$runs_file" CONFIG="$config" CONFIG_OK="$config_ok" EXPECTED="$expected" node -e '
+            const fs = require("node:fs");
+            // 分页形态是「页数组」：单页也是数组套一页。
+            const pages = JSON.parse(fs.readFileSync(process.env.RUNS_FILE, "utf8"));
+            const runs = (Array.isArray(pages) ? pages : [pages]).flatMap((page) => (page && page.check_runs) || []);
+            // 过滤是这一步的事：真 API 只回原始页，不替我们筛 name。
+            const ids = runs.filter((run) => run && run.name === "audit").map((run) => String(run.id));
+            const expected = String(process.env.EXPECTED || "");
+            const fail = (kind, detail) => {
+              fs.appendFileSync(
+                process.env.GITHUB_STEP_SUMMARY,
+                [
+                  "## audit 自证失败：" + kind,
+                  "",
+                  detail,
+                  "",
+                  "判据不是「本 sha 上只有一条 name=audit」，而是「平台上会被读到的就是本次这条」：",
+                  "合并判据（scripts/merge-gate.mjs 的 G3）对同名 check 取 id 最大者。所以本次 POST 出去的",
+                  "这条必须同时成立：仍在本 sha 上、是本 sha 上 id 最大的那条 audit、且回读到的内容",
+                  "（name/app.slug/status/conclusion）与本次 payload 一致。",
+                  "同一 sha 上更旧的同名结论（id 更小）不影响判定：那是 dispatch / rerun 的正常留痕；",
+                  "比本次更新的那条会盖掉本次结论，合并判据读到的就不是这一条。",
+                  "五类失败各自点名：本次结论不在本 sha 上 / 被更新的结论盖过 / id 无法比较 / 内容被改 / 内容无从比对。",
+                  "静态判据只能列举已知形态，这几类写形态由这一条兜住。",
+                  "",
+                ].join("\n"),
+              );
+              console.log("::error title=audit 自证失败::" + kind + "：" + detail);
+              process.exit(1);
+            };
+            // 没有 id 就没有「同一条」可比：fail-closed。
+            if (!expected) {
+              fail(
+                "POST 步没有交出 check_run_id",
+                "回写步没跑、或没把 output 写出来：没有可比对的 id，自证无从谈起（fail-closed）。",
+              );
+            }
+            // 本次这条必须真的落在平台上：回读里找不到它 = 这次没留痕。
+            if (!ids.includes(expected)) {
+              fail(
+                "本次结论不在本 sha 上",
+                "本 sha 上 name=audit 的 Check Run 回读到 id：" + (ids.length ? ids.join("、") : "（无）") +
+                  "；本步 POST 出去的是 id=" + expected + "：平台上读不到这一条，等于这次没留痕。",
+              );
+            }
+            // 「会被读到」有唯一出处：merge-gate 的 G3 对同名 check 取 id 最大者。
+            // 非十进制 id 按「无法比较」排到最大（fail-closed）：不能因为排不进去就放过它。
+            const rank = (id) => (/^[0-9]+$/.test(id) ? Number(id) : Infinity);
+            let latest = ids[0];
+            for (const id of ids) if (rank(id) > rank(latest)) latest = id;
+            if (latest !== expected) {
+              // 读不懂的 id 与「被更新的结论盖过」处置相同（都判红），但诊断不同：
+              // 排不进去就放过是松；把读不懂的 id 说成「被更新的盖过」是把原因指反。
+              if (!/^[0-9]+$/.test(latest) || !/^[0-9]+$/.test(expected)) {
+                fail(
+                  "id 无法比较",
+                  "本 sha 上 name=audit 回读到无法比较的 id（" + latest + "），本次 POST 出去的是 id=" + expected +
+                    "：拿不到数值序就判不了 merge-gate 的 G3 会读到哪一条；非十进制 id 一律按更严处理（fail-closed），不能因为排不进去就放过它。",
+                );
+              }
+              fail(
+                "被更新的结论盖过",
+                "本 sha 上 id 最大的 name=audit 是 id=" + latest + "，本次 POST 出去的是 id=" + expected +
+                  "：scripts/merge-gate.mjs 的 G3 对同名 check 取 id 最大者，merge-gate 会读到 id=" + latest +
+                  " 那条 —— 本次结论已被更新的那条盖掉，合并判据读到的不是这一条。",
+              );
+            }
+            // 单条回读本身就失败了：没有内容可比，也是「证不了」。
+            if (process.env.CONFIG_OK !== "1") {
+              fail("内容无从比对", "按 id 回读单条（GET repos/{owner}/{repo}/check-runs/<id>）非 0：拿不到这一条的内容。");
+            }
+            // 回读成功但内容是空的：同样是「证不了」，而且是最危险的一种 ——
+            // 只要给空内容补一个默认值，「回读为空」就地变成「伪造通过」。
+            if (!process.env.CONFIG) {
+              fail(
+                "内容无从比对",
+                "按 id 回读单条成功，但回读内容是空的（拿不到 name/app.slug/status/conclusion）：没有内容可比就不叫自证（fail-closed）。",
+              );
+            }
+            // 内容从载体读（不经 env 传：env 有长度上限），读不到也进失败分支。
+            let payload = null;
+            try {
+              payload = JSON.parse(fs.readFileSync(".audit/check-run.json", "utf8"));
+            } catch {
+              payload = null;
+            }
+            const wantConclusion = payload && typeof payload.conclusion === "string" ? payload.conclusion : "";
+            // 空串也是「读不到」：结论兜底只补「非字符串」的 payload，空串能一路穿到这里 ——
+            // 那时若拿实得内容与空期望比，「conclusion」两边都空就「相等」，用空内容冒充通过。
+            if (!wantConclusion) {
+              fail("内容无从比对", "本次 payload 里读不到 conclusion（载体 = 本步 POST 出去的那份）：不比内容就不叫自证（fail-closed）。");
+            }
+            // POST 用的是 GITHUB_TOKEN，app 恒为 github-actions：换了 app 就是别人发的。
+            const got = String(process.env.CONFIG || "").split("|");
+            const fields = [
+              ["name", "audit", got[0]],
+              ["app.slug", "github-actions", got[1]],
+              ["status", "completed", got[2]],
+              ["conclusion", wantConclusion, got[3]],
+            ];
+            for (const [field, wantValue, gotValue] of fields) {
+              if (gotValue !== wantValue) {
+                fail(
+                  "内容被改",
+                  field + " 期望 " + wantValue + "、实得 " + (gotValue || "（空）") +
+                    "：这条 Check Run 的结论与本次 payload 不一致（id 没变、内容变了）。",
+                );
+              }
+            }
+            console.log(
+              "audit 自证通过：本 sha 上 id 最大的 name=audit 就是本次 POST 的 id=" + expected +
+                "（未被更新的结论盖过），内容一致（name/app.slug/status/conclusion 与 payload 相同，conclusion=" +
+                wantConclusion + "）。",
+            );
+            process.exit(0);
+          '
 
       - name: INFRA 留痕
         if: steps.decide.outputs.conclusion == 'action_required'
@@ -117,13 +446,113 @@ jobs:
             echo '## audit: INFRA（判不了，不是通过）'
             echo ''
             echo '上游执行器没有给出可用结论（超时 / 额度耗尽 / 模型不可达，或 schema 不合格）。'
-            echo 'INFRA 不计入合并判据，但必须落在这里，不许静默当通过。'
+            echo 'INFRA 计入「未判过」，因此不放行合并；但也不许把它读成「代码不合格」。'
             echo ''
-            echo '```'
-            cat .audit/result.json
-            echo '```'
+            # 围栏长度按内容算，固定 3 个是错的：result.json 里的 findings[].path 是外部输入，
+            # 一个 ``` 就能提前闭合围栏，把「## audit: pass（伪造）」和外部图片
+            # ![](http://…) 放到围栏外，被 CI 摘要页当 Markdown 渲染。
+            # 内容一字不改（证据不许改写），改的是围栏：内容里最长的连续反引号串是 N，
+            # 围栏就用 N+1 个 —— Markdown 里更长的围栏无法被内容闭合。
+            fence='```'
+            body=$(cat .audit/result.json 2>/dev/null || true)
+            while [[ "$body" == *"$fence"* ]]; do fence="$fence"'`'; done
+            echo "$fence"
+            printf '%s\n' "$body"
+            echo "$fence"
           } >> "$GITHUB_STEP_SUMMARY"
           echo '::warning title=audit INFRA::判不了，不是通过；详情见本次运行摘要'
 
+      # 判不了也要在 sha 上留下 action_required：不写等于让对方继续沿用上一轮的绿。
+      # 落点有两个来源，但**一定非空**：ctx 解出的 sha（ctx 自己已经退到 GITHUB_SHA），
+      # ctx 整步没跑起来时再退到 github.sha。空 head_sha 会被 GitHub 拒收，那时
+      # 服务器上一条 Check Run 都没有 —— 正是这条要防的形态。
+      # 落点仍然是**猜的**（不是 PR head），所以标题与摘要都写明这一点，
+      # 别写成「已经在正确的位置留过痕」。
+      # 「判不了」有两种来历，责任方向相反：ctx 跑过但解不出 PR head 是 PR 侧的事；
+      # ctx 根本没跑起来（checkout / node 先挂了）是管线自己坏了，与这个 PR 无关。
+      - name: 判不了：回写 INFRA
+        if: always() && steps.ctx.outputs.ok != '1'
+        env:
+          AUDIT_SHA: ${{ steps.ctx.outputs.sha }}
+          RUN_SHA: ${{ github.sha }}
+          CTX_OK: ${{ steps.ctx.outputs.ok }}
+        run: |
+          mkdir -p .audit
+          node -e '
+            const fs = require("node:fs");
+            // 落点非空是不变式：空 head_sha 会被 GitHub 拒收，一条 Check Run 都写不出去。
+            const fromCtx = process.env.AUDIT_SHA;
+            const sha = fromCtx || process.env.RUN_SHA;
+            if (!sha) throw new Error("判不了也要有个落点：ctx 与 github.sha 都是空的");
+            // ctx 有没有跑起来，看它有没有写出 ok：空串 = 这一步被跳过（前置步骤先红了）。
+            const pipeline = !process.env.CTX_OK;
+            const why = pipeline
+              ? "解析 PR 上下文的步骤没有跑起来（checkout / node 之类的前置步骤先失败了）：这是管线自己的故障，不是这个 PR 的问题。"
+              : "解析 PR 上下文跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。";
+            const traced = fromCtx
+              ? "落点 " + sha + " 来自 ctx 步（它已退到本次运行的提交）"
+              : "落点 " + sha + " 退到了 github.sha（本次 workflow 运行的提交）";
+            fs.writeFileSync(".audit/check-run.json", JSON.stringify({
+              name: "audit",
+              head_sha: sha,
+              status: "completed",
+              conclusion: "action_required",
+              output: {
+                title:
+                  "audit INFRA（" +
+                  (pipeline ? "管线没跑起来" : "PR 上下文解不出") +
+                  "；落点 " +
+                  sha +
+                  "：不是 PR head）",
+                summary:
+                  why + " " + traced + "，不保证等于 PR head —— dispatch 的 ref 不是 head 分支时，PR head 上的旧结论仍然保留。",
+              },
+            }));
+          '
+          gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/check-run.json --jq '.id'
+          case "${CTX_OK:-}" in
+            '')
+              cause='ctx 步没有跑起来（checkout / node 之类的前置步骤先失败了）：这是管线自己的故障，不是这个 PR 的问题。'
+              ;;
+            *)
+              cause='ctx 步跑过，但取不到这个 PR 的 head sha：审计没有对象，判不了。'
+              ;;
+          esac
+          {
+            echo '## audit: INFRA（判不了 → 按「未判过」留痕）'
+            echo ''
+            echo "$cause"
+            echo ''
+            echo '**落点不一定是 PR head**：写到的 sha 是本次 workflow 运行的提交。'
+            echo 'dispatch 的 ref 不是这个 PR 的 head 分支时，这条留痕落在别的提交上，'
+            echo 'PR head 上的旧结论原样保留——别把「看见过 audit 的红」当成「这个 PR 判过」。'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo '::error title=audit INFRA::判不了：落点是本次运行的提交，不是 PR head'
+
+      # job 级 check 只回答「这个 job 有没有出逻辑故障」：
+      # 0 = 跑完了（不论结论是 success 还是 action_required；结论的红由 Check Run 承载）
+      # 1 = 结论是 failure（代码不合格，红线一致）
+      # 3 = 口径层与兜底都没给出退出码 —— 结论没落地，绝不能绿
       - name: 判定
-        run: exit ${{ steps.decide.outputs.exit }}
+        if: always() && steps.ctx.outputs.ok == '1'
+        run: |
+          code='${{ steps.decide.outputs.exit }}'
+          # 口径层被跳过（前一步红了）或崩在写 outputs 之前：退出码由兜底步给。
+          # 它补的是同一条结论（action_required -> 0），不是另一套判据。
+          if [[ -z "$code" ]]; then code='${{ steps.fallback.outputs.exit }}'; fi
+          case "$code" in
+            0 | 1) exit "$code" ;;
+            *)
+              echo '::error title=audit 判定::没有拿到退出码：口径层与兜底都没有落地，不能当作通过'
+              exit 3
+              ;;
+          esac
+
+      # 这条路径的结论同样是 action_required（由「判不了：回写 INFRA」POST 出去），
+      # 所以 job 级 check 也是绿的：结论的红由 Check Run 承载。
+      # 真出故障（POST 失败）时红的是那一步本身，不是这里补的一刀。
+      - name: 判定（判不了）
+        if: always() && steps.ctx.outputs.ok != '1'
+        run: |
+          echo '判不了：结论已由「判不了：回写 INFRA」POST 成 action_required；job 级 check 只回答「有没有出逻辑故障」。'
+          exit 0

@@ -332,21 +332,74 @@ test("(c) 还在跑 ≠ 不合格：in_progress/queued 归未就绪（exit 3）"
   expect(q.line("G3")).toContain("audit(id 88) queued/null");
 });
 
-test("(c) 跑完是红的才是真失败：skipped/neutral/cancelled 都不给背书（exit 1）", () => {
-  const withConclusion = (conclusion) => (head) =>
-    green(head).map((r) => (r.name === "audit" ? { ...r, conclusion } : r));
+// 同一个 conclusion 现在只落一档：判成不合格（去改代码）与没有判过（去看管线）
+// 都阻断合并，但混成一档就会让「未判过」被读成「这一笔不合格」。
+const withConclusion = (conclusion) => (head) =>
+  green(head).map((r) => (r.name === "audit" ? { ...r, conclusion } : r));
+
+test("(c) 真失败档：failure/timed_out/startup_failure/cancelled → FAIL E_CHECK_NOT_GREEN，exit 1", () => {
   for (const conclusion of [
-    "skipped",
-    "neutral",
-    "cancelled",
-    "timed_out",
     "failure",
+    "timed_out",
+    "startup_failure",
+    "cancelled",
   ]) {
     const g = gate({ checks: withConclusion(conclusion) });
     expect(g.status).toBe(1);
     expect(g.line("G3")).toContain("FAIL E_CHECK_NOT_GREEN");
+    expect(g.line("G3")).toContain("不是绿的 1 项");
     expect(g.line("G3")).toContain("audit(id 11) completed/" + conclusion);
+    // 真失败档不许带上「没有判过」的措辞：两档的措辞就是责任方向。
+    expect(g.line("G3")).not.toContain("没有判过");
+    expect(g.last).toBe("merge-gate FAIL 1/4 真失败=1(G3) 未就绪=0");
   }
+});
+
+test("(c) 未判过档：action_required/neutral/skipped/stale → INFRA E_CHECK_NOT_JUDGED，exit 3", () => {
+  for (const conclusion of [
+    "action_required",
+    "neutral",
+    "skipped",
+    "stale",
+  ]) {
+    const g = gate({ checks: withConclusion(conclusion) });
+    // 不绿，但也不许说成「代码不合格」：责任方向是去看管线。
+    expect(g.status).toBe(3);
+    expect(g.line("G3")).toContain("INFRA E_CHECK_NOT_JUDGED");
+    expect(g.line("G3")).toContain(
+      "1 项没有判过（不是判成不合格，但未判过不允许合并）",
+    );
+    expect(g.line("G3")).toContain("audit(id 11) completed/" + conclusion);
+    expect(g.line("G3")).not.toContain("E_CHECK_NOT_GREEN");
+    expect(g.last).toBe("merge-gate INFRA 1/4 真失败=0 未就绪=1(G3)");
+  }
+});
+
+test("(c) 认不出的 completed 结论：归未判过，不许读成通过也不许说成不合格", () => {
+  const g = gate({ checks: withConclusion("mystery_state") });
+  expect(g.status).toBe(3);
+  expect(g.line("G3")).toContain("INFRA E_CHECK_NOT_JUDGED");
+  expect(g.line("G3")).toContain("audit(id 11) completed/mystery_state");
+});
+
+test("(c) 两档同时存在：真失败优先（exit 1），但两档分开数、分开点名", () => {
+  const mixed = (head) =>
+    green(head).map((r) =>
+      r.name === "audit"
+        ? { ...r, conclusion: "action_required" }
+        : r.name === "check"
+          ? { ...r, conclusion: "failure" }
+          : r,
+    );
+  const g = gate({ checks: mixed });
+  expect(g.status).toBe(1);
+  expect(g.line("G3")).toContain("FAIL E_CHECK_NOT_GREEN");
+  expect(g.line("G3")).toContain("不是绿的 1 项: check(id 10) completed/failure");
+  expect(g.line("G3")).toContain("另有 1 项没有判过");
+  expect(g.line("G3")).toContain("audit(id 11) completed/action_required");
+  // 汇总行按守卫计（一条守卫一个结论）：两类分开数发生在守卫之间，
+  // 守卫内部的分类写在明细里（「不是绿的 1 项 …；另有 1 项没有判过 …」）。
+  expect(g.last).toBe("merge-gate FAIL 1/4 真失败=1(G3) 未就绪=0");
 });
 
 test("(e) 检查项属于另一个 commit：绿也不算数", () => {
@@ -363,12 +416,15 @@ test("(e) 检查项根本没跑：INFRA 退出 3，绝不当通过", () => {
   expect(g.last).toBe("merge-gate INFRA 3/4 真失败=0 未就绪=3(G2,G3,G4)");
 });
 
-test("(a3) 只坏 G3：还有未结 INFRA 记录", () => {
+test("(a3) 只坏 G3：还有未结 INFRA 记录 → 判不了（exit 3），不是代码不合格", () => {
   const g = gate({ infra: [{ id: "infra#7", title: "kb export 失败" }] });
-  expect(g.status).toBe(1);
-  expect(g.line("G3")).toContain("FAIL E_INFRA_OPEN");
+  // 未结 INFRA 是「某件事还没有结论」，不是「这一笔写错了」：
+  // 两类 INFRA 都阻断合并，区别只在责任方向。
+  expect(g.status).toBe(3);
+  expect(g.line("G3")).toContain("INFRA E_INFRA_OPEN");
   expect(g.line("G3")).toContain("infra#7");
   expect(g.line("G4")).toContain("PASS OK");
+  expect(g.last).toBe("merge-gate INFRA 1/4 真失败=0 未就绪=1(G3)");
 });
 
 test("缺输入（没给 --infra）：INFRA 退出 3，不当通过", () => {
