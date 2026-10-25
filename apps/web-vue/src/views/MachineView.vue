@@ -9,11 +9,15 @@ const { state } = usePlatform();
 <template>
   <v-container fluid class="pa-3">
     <v-card variant="flat" class="mb-3">
-      <v-card-title class="text-body-2 py-2 font-weight-bold">状态机图</v-card-title>
+      <v-card-title class="text-body-2 py-2 font-weight-bold"
+        >状态机图</v-card-title
+      >
       <v-card-subtitle class="text-caption">
         由 config.states + config.transitions 生成（手写 SVG）；defaultFlow =
         {{ state.config.defaultFlow ?? "(未声明)" }} · labelPrefix =
-        {{ state.config.labelPrefix === "" ? "(空)" : state.config.labelPrefix }}
+        {{
+          state.config.labelPrefix === "" ? "(空)" : state.config.labelPrefix
+        }}
       </v-card-subtitle>
       <v-card-text class="pa-3">
         <StateMachineGraph

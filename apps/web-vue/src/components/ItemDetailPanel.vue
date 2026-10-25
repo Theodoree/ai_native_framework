@@ -11,7 +11,8 @@ const pendingText = computed<string>(() => {
   if (pending === null) return "null（无在途）";
   return [
     "status=" + (pending.status ?? "(缺失)"),
-    "attempts=" + (pending.attempts === null ? "(缺失)" : String(pending.attempts)),
+    "attempts=" +
+      (pending.attempts === null ? "(缺失)" : String(pending.attempts)),
     "attemptId=" + (pending.attemptId ?? "(缺失)"),
     (pending.from ?? "?") + " → " + (pending.to ?? "?"),
     "requestedAt=" + (pending.requestedAt ?? "(缺失)"),
@@ -49,7 +50,9 @@ const retryable = computed<boolean>(() => {
 });
 
 const retryBusy = computed<boolean>(
-  () => state.retry.pending && state.retry.attemptId === (selectedItem.value?.pending?.attemptId ?? null),
+  () =>
+    state.retry.pending &&
+    state.retry.attemptId === (selectedItem.value?.pending?.attemptId ?? null),
 );
 
 async function retry(): Promise<void> {
@@ -79,7 +82,9 @@ function close(): void {
     <v-card-title class="d-flex align-center text-body-2 py-2">
       <span class="font-weight-bold">详情</span>
       <v-spacer />
-      <v-btn v-if="selectedItem" size="small" variant="text" @click="close">关闭</v-btn>
+      <v-btn v-if="selectedItem" size="small" variant="text" @click="close"
+        >关闭</v-btn
+      >
     </v-card-title>
     <v-card-text class="pa-3 pt-0">
       <p v-if="selectedItem === null" class="text-caption text-medium-emphasis">
@@ -89,14 +94,21 @@ function close(): void {
         <v-table density="compact" class="detail-fields">
           <tbody>
             <tr v-for="field in fields" :key="field.key">
-              <th class="text-left text-caption text-medium-emphasis">{{ field.key }}</th>
+              <th class="text-left text-caption text-medium-emphasis">
+                {{ field.key }}
+              </th>
               <td class="text-caption text-left">{{ field.value }}</td>
             </tr>
           </tbody>
         </v-table>
         <div v-if="selectedItem.pending" class="mt-3">
           <FailureBanner :failure="state.retry.failure" title="重试投递失败" />
-          <v-alert v-if="state.retry.ok" type="success" density="compact" class="mt-2">
+          <v-alert
+            v-if="state.retry.ok"
+            type="success"
+            density="compact"
+            class="mt-2"
+          >
             <span class="text-caption">{{ state.retry.ok }}</span>
           </v-alert>
           <div class="d-flex align-center">

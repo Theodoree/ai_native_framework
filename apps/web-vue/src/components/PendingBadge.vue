@@ -21,7 +21,9 @@ const color = computed<string>(() => {
 });
 
 const attemptsText = computed<string>(() =>
-  props.pending.attempts === null ? "尝试 ? 次" : "尝试 " + String(props.pending.attempts) + " 次",
+  props.pending.attempts === null
+    ? "尝试 ? 次"
+    : "尝试 " + String(props.pending.attempts) + " 次",
 );
 </script>
 

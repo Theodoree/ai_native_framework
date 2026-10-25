@@ -21,7 +21,9 @@ const ordered = computed(() => {
 const visible = computed(() => {
   const needle = filter.value.trim().toLowerCase();
   if (needle === "") return ordered.value;
-  return ordered.value.filter((event) => (event.id ?? "").toLowerCase().includes(needle));
+  return ordered.value.filter((event) =>
+    (event.id ?? "").toLowerCase().includes(needle),
+  );
 });
 
 function flowText(event: { from: string | null; to: string | null }): string {
@@ -61,7 +63,10 @@ function refresh(): void {
       </v-card-title>
       <v-card-text class="pa-3 pt-0">
         <FailureBanner :failure="state.eventsFailure" title="事件加载失败" />
-        <p v-if="visible.length === 0" class="text-caption text-medium-emphasis">
+        <p
+          v-if="visible.length === 0"
+          class="text-caption text-medium-emphasis"
+        >
           没有匹配的事件。
         </p>
         <ol v-else class="timeline">
@@ -71,18 +76,30 @@ function refresh(): void {
             class="timeline-item"
           >
             <div class="timeline-head">
-              <span class="text-caption font-weight-medium">{{ event.id ?? "(无 id)" }}</span>
+              <span class="text-caption font-weight-medium">{{
+                event.id ?? "(无 id)"
+              }}</span>
               <span class="flow">{{ flowText(event) }}</span>
               <v-chip size="x-small" variant="tonal" color="secondary">
                 {{ event.by ?? "(无 by)" }}
               </v-chip>
-              <v-chip v-if="event.flow !== null" size="x-small" variant="outlined">
+              <v-chip
+                v-if="event.flow !== null"
+                size="x-small"
+                variant="outlined"
+              >
                 flow={{ event.flow }}
               </v-chip>
-              <time class="text-caption text-medium-emphasis">{{ event.at ?? "(无时间)" }}</time>
+              <time class="text-caption text-medium-emphasis">{{
+                event.at ?? "(无时间)"
+              }}</time>
             </div>
             <p class="comment">
-              {{ event.comment === null || event.comment === "" ? "(无 comment)" : event.comment }}
+              {{
+                event.comment === null || event.comment === ""
+                  ? "(无 comment)"
+                  : event.comment
+              }}
             </p>
           </li>
         </ol>

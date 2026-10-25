@@ -52,9 +52,15 @@ function rebuildIndex(): void {
     <v-card-text class="pa-3 pt-0">
       <FailureBanner :failure="state.remoteFailure" title="远端快照读取失败" />
 
-      <v-alert v-if="!state.remote.present" type="info" density="compact" class="mb-2">
+      <v-alert
+        v-if="!state.remote.present"
+        type="info"
+        density="compact"
+        class="mb-2"
+      >
         <span class="text-caption">
-          还没同步过（present=false）：本地只有空缓存，这不代表远端仓库没有 issue。
+          还没同步过（present=false）：本地只有空缓存，这不代表远端仓库没有
+          issue。
         </span>
       </v-alert>
       <template v-else>
@@ -69,11 +75,17 @@ function rebuildIndex(): void {
               <td class="text-caption">{{ state.remote.etag ?? "(缺失)" }}</td>
             </tr>
             <tr>
-              <th class="text-left text-caption text-medium-emphasis">fetchedAt</th>
-              <td class="text-caption">{{ state.remote.fetchedAt ?? "(缺失)" }}</td>
+              <th class="text-left text-caption text-medium-emphasis">
+                fetchedAt
+              </th>
+              <td class="text-caption">
+                {{ state.remote.fetchedAt ?? "(缺失)" }}
+              </td>
             </tr>
             <tr>
-              <th class="text-left text-caption text-medium-emphasis">issues</th>
+              <th class="text-left text-caption text-medium-emphasis">
+                issues
+              </th>
               <td class="text-caption">{{ state.remote.issues.length }}</td>
             </tr>
           </tbody>
@@ -88,7 +100,10 @@ function rebuildIndex(): void {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(issue, index) in state.remote.issues" :key="String(issue.number ?? index)">
+            <tr
+              v-for="(issue, index) in state.remote.issues"
+              :key="String(issue.number ?? index)"
+            >
               <td class="text-caption">{{ issue.number ?? "(缺失)" }}</td>
               <td class="text-caption">{{ issue.title ?? "(无标题)" }}</td>
               <td class="text-caption">
@@ -101,7 +116,11 @@ function rebuildIndex(): void {
                 >
                   {{ label }}
                 </v-chip>
-                <span v-if="issue.labels.length === 0" class="text-medium-emphasis">(无 label)</span>
+                <span
+                  v-if="issue.labels.length === 0"
+                  class="text-medium-emphasis"
+                  >(无 label)</span
+                >
               </td>
               <td class="text-caption">{{ issue.updatedAt ?? "(缺失)" }}</td>
             </tr>
@@ -115,30 +134,47 @@ function rebuildIndex(): void {
       <FailureBanner :failure="state.sync.failure" title="同步失败" />
       <v-alert v-if="report" type="success" density="compact" class="mb-2 mt-2">
         <div class="text-caption">
-          status={{ report.status ?? "(缺失)" }} · issues={{ report.issues ?? "(缺失)" }} ·
-          reconciled(applied={{ report.reconciled.applied ?? "(缺失)" }}, conflict={{
-            report.reconciled.conflict ?? "(缺失)"
-          }}, pending={{ report.reconciled.pending ?? "(缺失)" }})
+          status={{ report.status ?? "(缺失)" }} · issues={{
+            report.issues ?? "(缺失)"
+          }}
+          · reconciled(applied={{ report.reconciled.applied ?? "(缺失)" }},
+          conflict={{ report.reconciled.conflict ?? "(缺失)" }}, pending={{
+            report.reconciled.pending ?? "(缺失)"
+          }})
         </div>
         <div class="text-caption text-medium-emphasis">
-          repo={{ report.repo ?? "(缺失)" }} · etag={{ report.etag ?? "(缺失)" }} · fetchedAt={{
-            report.fetchedAt ?? "(缺失)"
+          repo={{ report.repo ?? "(缺失)" }} · etag={{
+            report.etag ?? "(缺失)"
           }}
+          · fetchedAt={{ report.fetchedAt ?? "(缺失)" }}
         </div>
       </v-alert>
 
-      <FailureBanner :failure="state.indexRebuild.failure" title="重建索引失败" />
-      <v-alert v-if="state.indexRebuild.report" type="success" density="compact" class="mt-2">
+      <FailureBanner
+        :failure="state.indexRebuild.failure"
+        title="重建索引失败"
+      />
+      <v-alert
+        v-if="state.indexRebuild.report"
+        type="success"
+        density="compact"
+        class="mt-2"
+      >
         <div class="text-caption">
-          ok={{ state.indexRebuild.report.ok }} · items={{ state.indexRebuild.report.items ?? "(缺失)" }} ·
-          events={{ state.indexRebuild.report.events ?? "(缺失)" }} · remoteIssues={{
+          ok={{ state.indexRebuild.report.ok }} · items={{
+            state.indexRebuild.report.items ?? "(缺失)"
+          }}
+          · events={{ state.indexRebuild.report.events ?? "(缺失)" }} ·
+          remoteIssues={{
             state.indexRebuild.report.remoteIssues ?? "(缺失)"
-          }} · outbox={{ state.indexRebuild.report.outbox ?? "(缺失)" }}
+          }}
+          · outbox={{ state.indexRebuild.report.outbox ?? "(缺失)" }}
         </div>
         <div class="text-caption text-medium-emphasis">
-          schemaVersion={{ state.indexRebuild.report.schemaVersion ?? "(缺失)" }} · path={{
-            state.indexRebuild.report.path ?? "(缺失)"
+          schemaVersion={{
+            state.indexRebuild.report.schemaVersion ?? "(缺失)"
           }}
+          · path={{ state.indexRebuild.report.path ?? "(缺失)" }}
         </div>
       </v-alert>
     </v-card-text>

@@ -9,41 +9,41 @@
 
 ## 目录
 
-| 路径 | 用途 |
-| --- | --- |
-| `src/main.ts` | 挂载入口：装 Vuetify 插件，挂全局样式 |
-| `src/plugins/vuetify.ts` | Vuetify 装配：浅色主题（沿用原手写调色板）、图标集、组件默认密度 |
-| `src/plugins/icons.ts` | 内联 SVG 字形（下拉/关闭/勾选/提示等），不引图标字体 |
-| `src/App.vue` | 外壳：`v-app` + `v-app-bar` + `v-tabs`（看板 / 状态机 / 时间线） |
-| `src/types.ts` | 宽松契约类型（`Record<string, unknown>`）+ 容错读取小工具 |
-| `src/api/client.ts` | 唯一请求层：泛型 `request<T>`，失败折成 `ApiFailure`（不抛异常） |
-| `src/api/parse.ts` | 把后端 JSON 折成可渲染模型；缺字段给占位，不崩 |
-| `src/stores/platform.ts` | 唯一状态家（reactive）；所有读写动作都在这里 |
-| `src/lib/graph.ts` | 纯几何：states + transitions → SVG 节点/边/坐标（与主题无关） |
-| `src/components/FailureBanner.vue` | 失败原样呈现：`v-alert` 里贴 kind / code / message / extra |
-| `src/components/ItemCard.vue` | 看板卡片（`v-card`） |
-| `src/components/CreateItemForm.vue` | 提需求（`v-text-field` / `v-textarea` / `v-btn`） |
-| `src/components/ItemDetailPanel.vue` | 详情：已知字段 + 完整 JSON |
-| `src/components/TransitionForm.vue` | 流转：目标状态 / actor_role / comment（`v-select` + `v-combobox`） |
-| `src/components/VerifyPanel.vue` | 验证证据：exitCode + output 原文 |
-| `src/components/ConfigEditor.vue` | 声明（state-machine.yml）编辑与保存（等宽 `v-textarea`） |
-| `src/components/StateMachineGraph.vue` | 手写 SVG 状态机图，点节点高亮相关边 |
-| `src/views/BoardView.vue` | 看板视图（`v-row`/`v-col` 分列 + 详情侧栏 + 提需求 + 验证） |
-| `src/views/MachineView.vue` | 状态机视图（图 + 声明编辑） |
-| `src/views/TimelineView.vue` | 事件时间线（倒序 + 按 id 过滤） |
-| `src/styles/main.css` | 只剩 Vuetify 不管的三块（见下「CSS：删了什么、留了什么」） |
+| 路径                                   | 用途                                                               |
+| -------------------------------------- | ------------------------------------------------------------------ |
+| `src/main.ts`                          | 挂载入口：装 Vuetify 插件，挂全局样式                              |
+| `src/plugins/vuetify.ts`               | Vuetify 装配：浅色主题（沿用原手写调色板）、图标集、组件默认密度   |
+| `src/plugins/icons.ts`                 | 内联 SVG 字形（下拉/关闭/勾选/提示等），不引图标字体               |
+| `src/App.vue`                          | 外壳：`v-app` + `v-app-bar` + `v-tabs`（看板 / 状态机 / 时间线）   |
+| `src/types.ts`                         | 宽松契约类型（`Record<string, unknown>`）+ 容错读取小工具          |
+| `src/api/client.ts`                    | 唯一请求层：泛型 `request<T>`，失败折成 `ApiFailure`（不抛异常）   |
+| `src/api/parse.ts`                     | 把后端 JSON 折成可渲染模型；缺字段给占位，不崩                     |
+| `src/stores/platform.ts`               | 唯一状态家（reactive）；所有读写动作都在这里                       |
+| `src/lib/graph.ts`                     | 纯几何：states + transitions → SVG 节点/边/坐标（与主题无关）      |
+| `src/components/FailureBanner.vue`     | 失败原样呈现：`v-alert` 里贴 kind / code / message / extra         |
+| `src/components/ItemCard.vue`          | 看板卡片（`v-card`）                                               |
+| `src/components/CreateItemForm.vue`    | 提需求（`v-text-field` / `v-textarea` / `v-btn`）                  |
+| `src/components/ItemDetailPanel.vue`   | 详情：已知字段 + 完整 JSON                                         |
+| `src/components/TransitionForm.vue`    | 流转：目标状态 / actor_role / comment（`v-select` + `v-combobox`） |
+| `src/components/VerifyPanel.vue`       | 验证证据：exitCode + output 原文                                   |
+| `src/components/ConfigEditor.vue`      | 声明（state-machine.yml）编辑与保存（等宽 `v-textarea`）           |
+| `src/components/StateMachineGraph.vue` | 手写 SVG 状态机图，点节点高亮相关边                                |
+| `src/views/BoardView.vue`              | 看板视图（`v-row`/`v-col` 分列 + 详情侧栏 + 提需求 + 验证）        |
+| `src/views/MachineView.vue`            | 状态机视图（图 + 声明编辑）                                        |
+| `src/views/TimelineView.vue`           | 事件时间线（倒序 + 按 id 过滤）                                    |
+| `src/styles/main.css`                  | 只剩 Vuetify 不管的三块（见下「CSS：删了什么、留了什么」）         |
 
 ## 依赖与许可证
 
-| 包 | 版本 | 许可证 | 作用 |
-| --- | --- | --- | --- |
-| `vue` | ^3.5.44 | MIT | 运行时 |
-| `vuetify` | ^3.13.7 | MIT | 唯一 UI 框架：外壳、栅格、卡片、表单、告警、表格 |
-| `vite` | ^7.3.7 | MIT | 构建（devDep） |
-| `@vitejs/plugin-vue` | ^6.0.10 | MIT | SFC 编译（devDep） |
-| `vite-plugin-vuetify` | ^2.1.3 | MIT | 按需引入 Vuetify 组件与指令（devDep） |
-| `typescript` | ~5.9.3 | Apache-2.0 | 类型检查（devDep） |
-| `vue-tsc` | ^3.3.13 | MIT | `--noEmit` 类型闸门（devDep） |
+| 包                    | 版本    | 许可证     | 作用                                             |
+| --------------------- | ------- | ---------- | ------------------------------------------------ |
+| `vue`                 | ^3.5.44 | MIT        | 运行时                                           |
+| `vuetify`             | ^3.13.7 | MIT        | 唯一 UI 框架：外壳、栅格、卡片、表单、告警、表格 |
+| `vite`                | ^7.3.7  | MIT        | 构建（devDep）                                   |
+| `@vitejs/plugin-vue`  | ^6.0.10 | MIT        | SFC 编译（devDep）                               |
+| `vite-plugin-vuetify` | ^2.1.3  | MIT        | 按需引入 Vuetify 组件与指令（devDep）            |
+| `typescript`          | ~5.9.3  | Apache-2.0 | 类型检查（devDep）                               |
+| `vue-tsc`             | ^3.3.13 | MIT        | `--noEmit` 类型闸门（devDep）                    |
 
 运行时依赖只有 `vue` + `vuetify` 两个。没有 vue-router（三视图是内存里的 tab）、
 没有图表库（状态机图是手写 SVG，见 `src/lib/graph.ts`）、没有图标字体
@@ -70,12 +70,13 @@
 
 `npm run build` 的实测（2025-10，Vuetify 3.13.7）：
 
-| 产物 | 迁前 | 迁后 | gzip 迁后 |
-| --- | --- | --- | --- |
-| `dist/assets/*.js` | 128 kB | 407.43 kB | 138.75 kB |
-| `dist/assets/*.css` | 9.26 kB | 389.57 kB | 48.78 kB |
+| 产物                | 迁前    | 迁后      | gzip 迁后 |
+| ------------------- | ------- | --------- | --------- |
+| `dist/assets/*.js`  | 128 kB  | 407.43 kB | 138.75 kB |
+| `dist/assets/*.css` | 9.26 kB | 389.57 kB | 48.78 kB  |
 
 为什么这么大：几乎全在 Vuetify 侧。
+
 - JS 主体是 Vuetify 的组件实现与组合式工具（`v-app`/`v-app-bar`/`v-tabs`/`v-card`/`v-form` 系列、
   `v-table`、`v-expansion-panels`、`v-dialog` 及其依赖的 `useDisplay`、主题、口播/焦点辅助逻辑）；
   `vite-plugin-vuetify` 的 autoImport 只剔掉没用的组件，留着用到的组件本身仍然是这个量级。
@@ -102,15 +103,15 @@ npm run dev -- --port 5399
 
 ## 后端契约（前端只按这个说话）
 
-| 方法 | 路径 | 请求 | 响应 |
-| --- | --- | --- | --- |
-| GET | `/api/board` | — | `{ items, config: { defaultFlow, labelPrefix, states, transitions } }` |
-| GET | `/api/events` | — | `{ events }` |
-| GET | `/api/config` | — | `{ text }` |
-| PUT | `/api/config` | `{ text }` | `{ ok: true }` |
-| POST | `/api/item` | `{ title, body }` | 事件对象 |
-| POST | `/api/verdict` | `{ id, to, actor_role, comment }` | 事件对象 |
-| POST | `/api/verify` | `{}` | `{ exitCode, output }` |
+| 方法 | 路径           | 请求                              | 响应                                                                   |
+| ---- | -------------- | --------------------------------- | ---------------------------------------------------------------------- |
+| GET  | `/api/board`   | —                                 | `{ items, config: { defaultFlow, labelPrefix, states, transitions } }` |
+| GET  | `/api/events`  | —                                 | `{ events }`                                                           |
+| GET  | `/api/config`  | —                                 | `{ text }`                                                             |
+| PUT  | `/api/config`  | `{ text }`                        | `{ ok: true }`                                                         |
+| POST | `/api/item`    | `{ title, body }`                 | 事件对象                                                               |
+| POST | `/api/verdict` | `{ id, to, actor_role, comment }` | 事件对象                                                               |
+| POST | `/api/verify`  | `{}`                              | `{ exitCode, output }`                                                 |
 
 错误统一 `{ kind: "rejected" | "infra", code, message, extra }`：rejected → HTTP 409，infra → 500。
 

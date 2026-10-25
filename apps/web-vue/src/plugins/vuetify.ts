@@ -38,7 +38,11 @@ export const vuetify = createVuetify({
     VBtn: { rounded: "lg", class: "text-none" },
     VCard: { rounded: "lg" },
     VAlert: { variant: "tonal", density: "compact" },
-    VTextField: { variant: "outlined", density: "compact", hideDetails: "auto" },
+    VTextField: {
+      variant: "outlined",
+      density: "compact",
+      hideDetails: "auto",
+    },
     VTextarea: { variant: "outlined", density: "compact", hideDetails: "auto" },
     VSelect: { variant: "outlined", density: "compact", hideDetails: "auto" },
     VCombobox: { variant: "outlined", density: "compact", hideDetails: "auto" },

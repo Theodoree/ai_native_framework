@@ -133,7 +133,13 @@ const state = reactive<PlatformState>({
   createFailure: null,
   createOk: null,
   verdict: { pending: false, failure: null, ok: null },
-  verify: { running: false, ranAt: null, exitCode: null, output: "", failure: null },
+  verify: {
+    running: false,
+    ranAt: null,
+    exitCode: null,
+    output: "",
+    failure: null,
+  },
   remote: emptyRemote(),
   remoteLoading: false,
   remoteFailure: null,
@@ -163,7 +169,9 @@ const columns = computed<BoardColumn[]>(() => {
     meaning: entry.meaning,
     items: state.items.filter((item) => item.state === entry.name),
   }));
-  const orphans = state.items.filter((item) => item.state === null || !names.has(item.state));
+  const orphans = state.items.filter(
+    (item) => item.state === null || !names.has(item.state),
+  );
   if (orphans.length > 0) {
     result.push({
       key: "__orphan__",
@@ -187,7 +195,8 @@ function transitionsFor(currentState: string | null): BoardTransition[] {
 const roles = computed<string[]>(() => {
   const list: string[] = [];
   for (const transition of state.config.transitions) {
-    if (transition.by !== "" && !list.includes(transition.by)) list.push(transition.by);
+    if (transition.by !== "" && !list.includes(transition.by))
+      list.push(transition.by);
   }
   if (list.length === 0) list.push("owner");
   return list;
@@ -256,7 +265,13 @@ async function reloadOutbox(): Promise<void> {
 }
 
 async function reloadAll(): Promise<void> {
-  await Promise.all([reloadBoard(), reloadEvents(), reloadConfig(), reloadRemote(), reloadOutbox()]);
+  await Promise.all([
+    reloadBoard(),
+    reloadEvents(),
+    reloadConfig(),
+    reloadRemote(),
+    reloadOutbox(),
+  ]);
 }
 
 function selectItem(id: string | null): void {
@@ -278,7 +293,12 @@ async function createItem(title: string, body: string): Promise<boolean> {
   }
   const event = parseEvent(result.data);
   state.createOk =
-    (event.id ?? "(无 id)") + " 已落 " + (event.to ?? "(无 to)") + "（by " + (event.by ?? "?") + "）";
+    (event.id ?? "(无 id)") +
+    " 已落 " +
+    (event.to ?? "(无 to)") +
+    "（by " +
+    (event.by ?? "?") +
+    "）";
   await Promise.all([reloadBoard(), reloadEvents()]);
   return true;
 }
@@ -306,7 +326,12 @@ async function submitVerdict(input: {
   }
   const event = parseEvent(result.data);
   state.verdict.ok =
-    (event.from ?? "?") + " → " + (event.to ?? "?") + "（by " + (event.by ?? "?") + "）";
+    (event.from ?? "?") +
+    " → " +
+    (event.to ?? "?") +
+    "（by " +
+    (event.by ?? "?") +
+    "）";
   await Promise.all([reloadBoard(), reloadEvents()]);
   return true;
 }

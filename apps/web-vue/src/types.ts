@@ -167,11 +167,23 @@ export interface IndexRebuildReport {
 }
 
 export function emptyOutbox(): OutboxSnapshot {
-  return { entries: [], nextCheckAt: null, deadline: null, writeEnabled: false, retried: [] };
+  return {
+    entries: [],
+    nextCheckAt: null,
+    deadline: null,
+    writeEnabled: false,
+    retried: [],
+  };
 }
 
 export function emptyRemote(): RemoteSnapshot {
-  return { present: false, etag: null, fetchedAt: null, repo: null, issues: [] };
+  return {
+    present: false,
+    etag: null,
+    fetchedAt: null,
+    repo: null,
+    issues: [],
+  };
 }
 
 export function readNumber(source: Loose, key: string): number | null {
