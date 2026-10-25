@@ -534,8 +534,6 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 账本与 payload 的路径在**生成时**就写死成绝对路径，不看 $PWD：
     // 某个 step 先 `cd sub` 再调 gh 时，`$PWD/calls.log` 会把条目写进子目录，
     // 根账本于是「存在但 0 行」—— 「账本在、0 行 = 零调用」这条担保被空过。
-    const LEDGER = join(dir, "calls.log");
-    const PAYLOAD = join(dir, "payload.json");
     // 假 gh 是**行为仿真**，不是「已经过滤好的答案」：
     //   * --slurp 与 --jq 同现时真 gh 直接拒绝（请求都不发），假 gh 必须照样拒绝；
     //   * 未登记的 (method, path) 一律 404 + 非 0 —— 端点拼错必须响，不能被 exit 0 吞掉；
@@ -683,9 +681,15 @@ try {
     if (!input) notFound();
     fs.copyFileSync(input, PAYLOAD);
     const payload = JSON.parse(fs.readFileSync(input, "utf8"));
+    // id 可覆写：夹具默认 4242 是等长 4 位，同页面里再放一条 4 位 id 时
+    // 数值序与字典序碰巧一致 —— 排序写法的两种错法（sort()、取末位）都红不了。
+    const rawPostId = Object.prototype.hasOwnProperty.call(process.env, "FAKE_GH_POST_ID")
+      ? String(process.env.FAKE_GH_POST_ID)
+      : "4242";
+    const postId = /^[0-9]+$/.test(rawPostId) ? Number(rawPostId) : rawPostId;
     // 服务端状态由 payload 长出来：app 恒为 github-actions（POST 用的是 GITHUB_TOKEN）。
     const run = {
-      id: 4242,
+      id: postId,
       name: payload.name,
       status: payload.status,
       conclusion: payload.conclusion,
@@ -693,7 +697,7 @@ try {
       app: { slug: "github-actions" },
     };
     fs.writeFileSync(STATE, JSON.stringify({ total_count: 1, check_runs: [run] }));
-    emit({ id: 4242 });
+    emit({ id: postId });
     process.exit(0);
   }
   if (method === "GET" && LIST_RUNS.test(rawPath)) {
@@ -2590,19 +2594,124 @@ try {
   //   * curl/wget 用 `-d` / `--data-binary` / `-F` 就能在**不写方法**的情况下 POST。
   // 于是判据反过来：端点一旦命中，只有「纯只读」才不是写面 ——
   // 没有方法标志（gh api 默认 GET）且没有任何取值/请求体标志。
-  const REQUEST_BODY_FLAGS =
-    /(?:^|\s)(?:-X|--method|-f|--field|--raw-field|-F|--input|-d|--data(?:-\S+)?|--post(?:-\S+)?|--json|-T|--upload-file|--body)(?=[\s=]|$)/i;
-
   // 方法标志归一化：`--method PATCH` / `--method=PATCH` / `-X PATCH` / `-Xpatch` 一律大写。
   function ghApiMethod(text) {
     const m = /(?:--method|-X)\s*=?\s*([A-Za-z]+)/.exec(String(text));
     return m ? m[1].toUpperCase() : null;
   }
 
-  // 只读放行：没有方法标志，且没有任何取值/请求体标志。
-  // 显式 `--method GET` 也算写（默认拒绝）：真 workflow 不需要它，少一种拼写就少一个洞。
+  // 写意图按**命令**判，不按词形枚举，也不看端点拼写：端点可以是变量
+  // （ep="repos/o/r/check-runs"; gh api --method POST --input body.json "$ep"），
+  // 也可以拆到多行。判据反过来：这个 http 客户端调用**有没有**写意图 ——
+  //   * 方法标志不是读方法（gh api 默认 GET）；
+  //   * 任何请求体 / 字段 / 输入标志，含短标志的**簇写**（-sSd '…'）与**贴值**
+  //     （-d@body.json / -d'{…}' / -Fname=audit）。按 shellWords 切词后看短标志簇里的字母：
+  //     继续按词形枚举只会漏掉下一种拼法（实测：这四种写法在旧判据下一条不红）。
+  const HTTP_CLIENTS = new Set(["gh", "curl", "wget", "http", "https", "httpie", "xh"]);
+  const HTTPIE_CLIENTS = new Set(["http", "https", "httpie", "xh"]);
+  const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+  const HTTP_METHOD_VERBS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
+  // 请求体 / 字段 / 输入：curl 的 -d / -F / -T 与 gh 的 -f / -F。
+  // curl 的小写 -f 是 --fail（只读），不在这一族里 —— 否则 `curl -fsSL` 会被读成写。
+  const BODY_SHORT_LETTERS = { gh: "fF", curl: "dFT" };
+  const BODY_LONG_FLAGS = new Set([
+    "--data",
+    "--data-ascii",
+    "--data-binary",
+    "--data-raw",
+    "--data-urlencode",
+    "--form",
+    "--form-string",
+    "--upload-file",
+    "--post-data",
+    "--post-file",
+    "--body",
+    "--body-file",
+    "--input",
+    "--field",
+    "--raw-field",
+    "--json",
+    "--method",
+  ]);
+
+  // `--opt=value` 与 `--opt value` 是同一个选项（大小写不敏感同上）。
+  function longFlagName(word) {
+    const text = String(word);
+    if (!text.startsWith("--")) return null;
+    const at = text.indexOf("=");
+    return (at >= 0 ? text.slice(0, at) : text).toLowerCase();
+  }
+
+  // 短标志簇只认「单个短横线 + 字母开头」：-sSd / -d@body.json / -Fname=audit / -Xpatch。
+  function shortFlagLetters(word) {
+    const m = /^-([A-Za-z]+)/.exec(String(word));
+    return m ? m[1] : "";
+  }
+
+  function isWriteMethod(value) {
+    return value !== undefined && !READ_METHODS.has(String(value).toUpperCase());
+  }
+
+  function commandWriteIntent(line) {
+    for (const words of shellCommands(String(line))) {
+      if (words.length === 0) continue;
+      // 客户端不一定在第 0 个词：workflow 里的行常带 YAML 前缀（`- run: gh api …`、
+      // `- run: |` 的正文）与赋值前缀（`id=$(gh api …)`）。按词扫，别按位置猜。
+      for (let start = 0; start < words.length; start += 1) {
+        const head = String(words[start] ?? "").replace(/^.*\//, "");
+        if (!HTTP_CLIENTS.has(head)) continue;
+        // gh 只有 `gh api` 是 http 调用（gh pr view --json 是读，不在这条面上）。
+        if (head === "gh" && String(words[start + 1] ?? "") !== "api") continue;
+        if (commandWriteIntentAt(head, words, start)) return true;
+      }
+    }
+    return false;
+  }
+
+  function commandWriteIntentAt(head, words, start) {
+    {
+      const letters = BODY_SHORT_LETTERS[head] ?? "";
+      for (let i = start + 1; i < words.length; i += 1) {
+        const word = String(words[i]);
+        const long = longFlagName(word);
+        if (long !== null) {
+          if (!BODY_LONG_FLAGS.has(long)) continue;
+          if (long === "--method") {
+            const at = word.indexOf("=");
+            const value = at >= 0 ? word.slice(at + 1) : words[i + 1];
+            if (isWriteMethod(value)) return true;
+            continue;
+          }
+          return true;
+        }
+        // -X 是方法（curl / gh 的方言）：值可以贴（-Xpatch）也可以分开（-X PATCH）。
+        if (word.startsWith("-X")) {
+          const value = word.length > 2 ? word.slice(2) : words[i + 1];
+          if (isWriteMethod(value)) return true;
+          continue;
+        }
+        if (letters === "") continue;
+        for (const letter of shortFlagLetters(word)) if (letters.includes(letter)) return true;
+      }
+      // httpie：方法词在位置参数里（http POST url name=audit），`key=value` 本身就是体。
+      if (HTTPIE_CLIENTS.has(head)) {
+        for (const word of words.slice(start + 1)) {
+          const text = String(word);
+          if (text.startsWith("-")) continue;
+          const upper = text.toUpperCase();
+          if (READ_METHODS.has(upper)) continue;
+          if (HTTP_METHOD_VERBS.has(upper)) return true;
+          if (text.includes("=")) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // 只读放行：没有任何写意图。显式只读方法（-X GET / --method GET / -X HEAD）放行 ——
+  // 「默认拒绝」拒绝的是写，不是拒绝「写出了方法名」；把纯读读成写会把方向读反。
   function isReadOnlyApiCall(text) {
-    return ghApiMethod(text) === null && !REQUEST_BODY_FLAGS.test(String(text));
+    return !commandWriteIntent(text);
   }
 
   // REST 的 checks.create（octokit / github-script 的 github.rest.checks.create）与 REST 的
@@ -2610,6 +2719,21 @@ try {
   // checks.update / updateCheckRun / PATCH check-runs/{id} 是同一个写面的改写形态。
   const CHECKS_CREATE_CALL =
     /(?:\bchecks\s*\.\s*(?:create|update)|\b(?:create|update)CheckRun\b|\[\s*["']checks["']\s*\]|check-runs\s*\/\s*\{)/;
+
+  // 结论写面违规的三种原因后缀：都以老句子为前缀（既有断言断言这句），后缀负责分辨
+  // 「写形态」「写形态但端点不是字面量（命令级默认拒绝）」「不可判形态」——
+  // 纯读被拦时文案不能把方向指反（旧文案把 `-X GET` 说成 --input POST 的写面）。
+  const CHECK_RUNS_REASON = "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读";
+  const CHECK_RUNS_REASON_WRITE = CHECK_RUNS_REASON + "（原因：写形态 —— 方法 / 请求体 / 字段 / 输入）";
+  const CHECK_RUNS_REASON_WRITE_BLIND =
+    CHECK_RUNS_REASON + "（原因：写形态 —— 方法 / 请求体 / 字段 / 输入；端点不是字面量，按命令级默认拒绝）";
+  const CHECK_RUNS_REASON_UNKNOWN =
+    CHECK_RUNS_REASON + "（原因：不可判形态 —— 端点不是放行的回读形态，也看不出写意图）";
+
+  function checkRunReason(line, writeIntent) {
+    if (!writeIntent) return CHECK_RUNS_REASON_UNKNOWN;
+    return CHECK_RUNS_ENDPOINT.test(String(line)) ? CHECK_RUNS_REASON_WRITE : CHECK_RUNS_REASON_WRITE_BLIND;
+  }
 
   // check-runs 端点在 audit.yml 内的合法形态只有两种：
   //   1) 那两步的 --input .audit/check-run.json POST；
@@ -2632,9 +2756,10 @@ try {
     if (CHECKS_CREATE_CALL.test(text)) return "checks.create";
     // gh api graphql 与 https://api.github.com/graphql 是同一个端点，写法不同不改面。
     if (/\bgraphql\b/.test(text)) return "/graphql";
-    if (!/\bcheck-runs\b/.test(text)) return null;
-    // 命中端点就默认算写：只有纯只读形态（带请求体/方法标志以外的一切）才不是写面。
-    return isReadOnlyApiCall(text) ? null : "check-runs";
+    // 命令级默认拒绝：只要这个 http 调用带写意图就算结论写面，**不看端点是不是字面量**。
+    // 旧判据要求「端点字面量 + 写形态同现」，于是 `ep="repos/o/r/check-runs"; gh api --method POST
+    // --input body.json "$ep"` 全绿（端点只有变量，字面量判据看不见）。端点字面量只用于白名单放行。
+    return commandWriteIntent(text) ? "check-runs" : null;
   }
 
   function workflowFiles(options = {}) {
@@ -3022,13 +3147,15 @@ try {
       for (const rawLine of foldContinuations(String(text)).split("\n")) {
         const line = stripShellComment(rawLine);
         if (!line.trim() || COMMENT_ONLY_LINE.test(line)) continue;
-        // 结论写面先判：命中任一面就必须是「那两步的 --input POST」或「自证步的回读」。
-        if (CHECK_RUNS_ENDPOINT.test(line) && !checkRunSanctioned(name, line)) {
+        // 结论写面先判：命中端点字面量，或**任何带写意图的 http 调用**（不看端点拼写，
+        // 端点可以是变量），就必须是「那两步的 --input POST」或「自证步的回读」。
+        const writeIntent = commandWriteIntent(line);
+        if ((CHECK_RUNS_ENDPOINT.test(line) || writeIntent) && !checkRunSanctioned(name, line)) {
           violations.push({
             step: name,
             where,
             excerpt: line.trim(),
-            reason: "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
+            reason: checkRunReason(line, writeIntent),
           });
         }
         // 复制/替换写载体：写通道只能是产出那一行 —— 写者可以产出，但不能**替换**。
@@ -4632,7 +4759,7 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       run: "gh api repos/o/r/check-runs --method POST -f name=audit -f conclusion=success -f head_sha=deadbeef\n",
     };
     expect(auditDirReferenceViolations([direct], { root: dir }).map((v) => v.reason)).toEqual([
-      "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
+      CHECK_RUNS_REASON_WRITE,
     ]);
     // payload 先落到别的文件名再 --input 它：既碰未认领的 .audit 路径，也没绑 check-run.json。
     const aliased = {
@@ -4640,7 +4767,7 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
       run: "gh api repos/$GITHUB_REPOSITORY/check-runs --method POST --input .audit/second.json\n",
     };
     expect(auditDirReferenceViolations([aliased], { root: dir }).map((v) => v.reason)).toEqual([
-      "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
+      CHECK_RUNS_REASON_WRITE,
       "未认领的 .audit 引用",
     ]);
     // 只读查询没有放行条件：这个端点在真 workflow 里只有回写一种用途，读它等于拿到产出面。
@@ -4817,14 +4944,14 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     const dir = mkdtempSync(join(tmpdir(), "audit-graphql-"));
     const gql = `curl -sS -X POST https://api.github.com/graphql -d '{"query":"mutation{createCheckRun(input:{conclusion:SUCCESS})}"}'\n`;
     expect(auditDirReferenceViolations([{ name: "插一步", run: gql }], { root: dir }).map((v) => v.reason)).toEqual([
-      "check-runs 只能是那两步的 --input POST，或自证步的两次只读回读",
+      CHECK_RUNS_REASON_WRITE,
     ]);
     // gh api graphql 的等价写法同样命中：判据不认拼写，认面。
     expect(
       auditDirReferenceViolations([{ name: "插一步", run: "gh api graphql -f query='mutation{createCheckRun}'\n" }], {
         root: dir,
       }).map((v) => v.reason),
-    ).toEqual(["check-runs 只能是那两步的 --input POST，或自证步的两次只读回读"]);
+    ).toEqual([CHECK_RUNS_REASON_WRITE]);
     // 面收了，sanctioned 规则没变：那两步的 --input POST 仍然放行。
     const sanctioned = steps.find((step) => step.name === "回写 Check Run");
     expect(sanctioned).toBeTruthy();
@@ -5206,7 +5333,7 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     ].join(SH);
     expect(
       auditDirReferenceViolations([{ name: "结论自证：回读 Check Run", run: splitWrite }], { root: dir }).map((v) => v.reason),
-    ).toContain("check-runs 只能是那两步的 --input POST，或自证步的两次只读回读");
+    ).toContain(CHECK_RUNS_REASON_WRITE);
     // 对照组：同一条命令写成单行同样违规 —— 差异只能来自折行。
     expect(
       auditDirReferenceViolations(
@@ -5218,7 +5345,7 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
         ],
         { root: dir },
       ).map((v) => v.reason),
-    ).toContain("check-runs 只能是那两步的 --input POST，或自证步的两次只读回读");
+    ).toContain(CHECK_RUNS_REASON_WRITE);
     // 反面对照：拆行的只读回读在自证步名下不违规（折叠不是「见续行就红」）。
     const splitRead = [
       'gh api "repos/$GITHUB_REPOSITORY/commits/$AUDIT_SHA/check-runs?filter=all&per_page=100" \\',
@@ -5420,7 +5547,7 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
         ],
         { root: dir },
       ).map((v) => v.reason),
-    ).toEqual(["check-runs 只能是那两步的 --input POST，或自证步的两次只读回读"]);
+    ).toEqual([CHECK_RUNS_REASON_UNKNOWN]);
     // 去掉 filter=all：默认 filter=latest 是按 name 去重的视图，「恰好一条」不许建在去重上。
     expect(
       auditDirReferenceViolations(
@@ -5508,6 +5635,157 @@ describe("wiring: 扫描面放行过宽（豁免单位 / 载体缺位）", () =>
     expect(checkRunWriteSurface("gh api repos/o/r/check-runs/4242 --jq .conclusion")).toBeNull();
     expect(checkRunWriteSurface("gh api 'repos/o/r/commits/cafebabe/check-runs?filter=all' --paginate --slurp")).toBeNull();
     expect(workflowWriteSurfaceViolations()).toEqual([]);
+  });
+
+  it("轮十八-1：请求体按短标志簇与贴值判 —— -d@body / -d'{…}' / -sSd / -Fname= 一条都不许漏", () => {
+    // 旧判据要求 flag 后紧跟空白或 =：「flag 直接贴值」与「短标志簇写」两种拼法全漏（四项全绿，实测）。
+    // 现在按命令判：shellWords 切词后看短标志簇里的字母（curl 的体是 d/F/T、gh 的字段是 f/F），
+    // 这样 -d@body.json / -d'{...}' / -sSd '...' / -Fname=audit 是同一条判据的四个落点，不是四种词形。
+    for (const [label, line] of [
+      ["-d 贴文件", "curl -sS -d@body.json https://api.github.com/repos/o/r/check-runs"],
+      ["-d 贴体", 'curl -sS -d\'{"name":"audit","conclusion":"success"}\' https://api.github.com/repos/o/r/check-runs'],
+      ["-sSd 簇写", 'curl -sSd \'{"name":"audit","conclusion":"success"}\' https://api.github.com/repos/o/r/check-runs'],
+      ["-F 贴值", "curl -sS -Fname=audit https://api.github.com/repos/o/r/check-runs"],
+      ["-sS -F 分开", "curl -sS -F name=audit https://api.github.com/repos/o/r/check-runs"],
+      ["-T 上传", "curl -sS -Tbody.json https://api.github.com/repos/o/r/check-runs"],
+      ["gh -f 贴值", "gh api repos/o/r/check-runs --method POST -fname=audit"],
+    ]) {
+      expect(checkRunWriteSurface(line), label).toBe("check-runs");
+    }
+    // 反面对照：多一个空格的 -d @body.json 是旧判据已认的形态，必须仍然红（不是「一律红」的噪音）。
+    expect(checkRunWriteSurface("curl -sS -d @body.json https://api.github.com/repos/o/r/check-runs")).toBe("check-runs");
+    // 只读反例：curl 的小写 -f 是 --fail（不是请求体），-fsSL 不许被读成写。
+    for (const line of [
+      "curl -fsSL https://api.github.com/repos/o/r/check-runs/1",
+      "curl -sS https://api.github.com/repos/o/r/commits/cafebabe/check-runs?filter=all&per_page=100",
+      "wget -qO- https://api.github.com/repos/o/r/check-runs/1",
+      "gh api repos/o/r/check-runs/4242 --jq .conclusion",
+    ]) {
+      expect(checkRunWriteSurface(line), line).toBeNull();
+    }
+  });
+
+  it("轮十八-2：端点用变量时判据仍然命中 —— 写意图是命令级的，端点字面量只用于放行", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-var-endpoint-"));
+    // 实测全绿（两次独立复现）：旧判据要求「端点字面量 + 写形态」同现，端点只有变量时进入条件就不成立。
+    expect(
+      auditDirReferenceViolations(
+        [{ name: "插一步", run: 'gh api --method POST --input body.json "$ep"\n' }],
+        { root: dir },
+      ).map((v) => v.reason),
+    ).toEqual([CHECK_RUNS_REASON_WRITE_BLIND]);
+    // 端点定义在上一行也一样：判据看的是这条命令有没有写意图。
+    const twoLines = ['ep="repos/o/r/check-runs"', 'gh api --method POST --input body.json "$ep"', ""].join(SH);
+    expect(
+      auditDirReferenceViolations([{ name: "插一步", run: twoLines }], { root: dir }).map((v) => v.reason),
+    ).toContain(CHECK_RUNS_REASON_WRITE_BLIND);
+    // 面判据同理：任何 workflow 里的写意图都是违规，不看端点拼写。
+    expect(checkRunWriteSurface('gh api --method POST --input body.json "$ep"')).toBe("check-runs");
+    // 反面对照：同一个变量端点的**只读**调用不是写面（放行的读形态仍绑在自证步上）。
+    expect(checkRunWriteSurface('gh api --jq .id "$ep"')).toBeNull();
+  });
+
+  it("轮十八-3：显式只读方法不是写 —— -X GET 放行，-X PATCH 仍红，文案分得清两种原因", () => {
+    // 旧判据把「写了方法名」本身当写：给真自证步的回读加 -X GET 会 5 红，且文案指成 --input POST 的写面。
+    const selfRead =
+      'gh api -X GET "repos/$GITHUB_REPOSITORY/commits/$AUDIT_SHA/check-runs?filter=all&per_page=100" --paginate --slurp > "$runs_file"\n';
+    expect(auditDirReferenceViolations([{ name: "结论自证：回读 Check Run", run: selfRead }], { root: ROOT })).toEqual([]);
+    // 面判据：纯读带显式方法仍是读。
+    expect(checkRunWriteSurface("gh api -X GET repos/o/r/check-runs --jq '.[]'")).toBeNull();
+    expect(checkRunWriteSurface("gh api --method GET repos/o/r/check-runs --jq '.[]'")).toBeNull();
+    // -X PATCH 仍红。
+    expect(checkRunWriteSurface("gh api -X PATCH repos/o/r/check-runs/1 -f conclusion=success")).toBe("check-runs");
+    // 文案要能分辨「写形态」与「不可判形态」：纯读在自证步名下被拦时，原因不许说成 --input POST 的写面。
+    expect(
+      auditDirReferenceViolations(
+        [{ name: "结论自证：回读 Check Run", run: "gh api -X GET repos/o/r/check-runs --jq '.[]'\n" }],
+        { root: ROOT },
+      ).map((v) => v.reason),
+    ).toEqual([CHECK_RUNS_REASON_UNKNOWN]);
+  });
+
+  it("轮十八-4：自证回读的「id 最大」是数值序 —— 不同位数的 id 不许按字典序或位次", () => {
+    // 夹具默认 id 4242 与同页旧 id 都是等长 4 位且升序：数值序与字典序碰巧一致，
+    // sort() 与「取末位」两种错法都红不了。这里把最大的 1000 放最前：取末位得到 999（红）；
+    // 字典序 sort() 得到 999（红）；只有数值序才通过。
+    const out = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_POST_ID: "1000",
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 2,
+        check_runs: [
+          { id: 1000, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+          { id: 999, name: "audit", status: "completed", conclusion: "failure", app: { slug: "github-actions" } },
+        ],
+      }),
+    });
+    const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self.status, String(self.stdout) + String(self.stderr)).toBe(0);
+    expect(out.summary).toBe("");
+  });
+
+  it("轮十八-5：本次 id 不是数值最大时，点名数值更大的那条 —— 999 与 1000", () => {
+    const out = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_POST_ID: "999",
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 2,
+        check_runs: [
+          { id: 999, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+          { id: 1000, name: "audit", status: "completed", conclusion: "failure", app: { slug: "github-actions" } },
+        ],
+      }),
+    });
+    const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self.status).not.toBe(0);
+    // 断类别标题行，不是全文：尾段说明把五类名字都列了一遍，只查子串会互相满足。
+    expect(out.summary).toContain("## audit 自证失败：被更新的结论盖过");
+    expect(out.summary).toContain("merge-gate 会读到 id=1000");
+  });
+
+  it("轮十八-6：非十进制 id 更严不更松 —— 排不进去也不许放过，且点名「id 无法比较」", () => {
+    // 把 rank 的非十进制分支从 Infinity 改成 0（排不进去就放过）必须让这条红。
+    const out = runWorkflow({
+      AUDIT_FINDINGS_A: pass,
+      AUDIT_FINDINGS_B: pass,
+      FAKE_GH_CHECK_RUNS_JSON: JSON.stringify({
+        total_count: 2,
+        check_runs: [
+          { id: 4242, name: "audit", status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+          { id: "abc", name: "audit", status: "completed", conclusion: "failure", app: { slug: "github-actions" } },
+        ],
+      }),
+    });
+    const self = out.ran.find((step) => step.name === "结论自证：回读 Check Run");
+    expect(self.status).not.toBe(0);
+    // 专门分类，不混进「被更新的结论盖过」：处置相同（都红），诊断不同。
+    expect(out.summary).toContain("## audit 自证失败：id 无法比较");
+    expect(out.summary).toContain("abc");
+  });
+
+  it("轮十八-7：反面对照 —— 真 audit.yml 的四步与良性 peer.yml 必须仍被放行", () => {
+    // A–E 全是「更严」的方向：这一条钉住没把真 workflow 的合法形态误伤。
+    for (const name of ["口径层判定", "结论兜底", "回写 Check Run", "判不了：回写 INFRA", "结论自证：回读 Check Run"]) {
+      const step = steps.find((candidate) => candidate.name === name);
+      expect(step, name).toBeTruthy();
+      expect(
+        auditDirReferenceViolations([{ name, run: step.run }], { root: ROOT, jobPayloads: carrierPayloads }),
+        name,
+      ).toEqual([]);
+    }
+    const dir = mkdtempSync(join(tmpdir(), "audit-benign-peer-"));
+    mkdirSync(join(dir, WORKFLOW_DIR), { recursive: true });
+    writeFileSync(join(dir, WORKFLOW_DIR, "audit.yml"), readFileSync(join(ROOT, WORKFLOW_DIR, "audit.yml"), "utf8"));
+    writeFileSync(
+      join(dir, WORKFLOW_DIR, "peer.yml"),
+      ["name: peer", "jobs:", "  p:", "    steps:", "      - run: |", "          echo hi", "          gh api repos/o/r/check-runs/1", ""].join(SH),
+    );
+    expect(workflowWriteSurfaceViolations({ root: dir })).toEqual([]);
+    // 真仓库（audit.yml 自身也在里面）零违规。
+    expect(workflowWriteSurfaceViolations()).toEqual([]);
+    expect(auditDirReferenceViolations(steps, { root: ROOT, jobPayloads: carrierPayloads })).toEqual([]);
   });
 });
 

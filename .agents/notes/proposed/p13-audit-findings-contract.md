@@ -491,3 +491,70 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 **仍未解决的开放项**（同 §十四）：信任根——`workflow_dispatch` 用的是被 dispatch 那个 ref 的 YAML，
 被审对象可以整步删掉自证；根治要「从受信 ref（main）dispatch + 用受信 ref 的脚本，只把 PR 的 sha 当数据」，属 P-14 编排层。
+
+---
+
+## 十六、轮十八：写面判据自己又长回枚举——这次改判「命令级写意图」（`92d128c` → 下一提交）
+
+轮十七把写面判据改成默认拒绝之后，**新加的请求体判据自己又是词形枚举**（`REQUEST_BODY_FLAGS` 要求 flag 后紧跟空白或 `=`）。
+两家审查独立用 curl 短标志的簇写/贴值绕过，我在 `/tmp/vrf-r18` 逐条实测确认：
+
+| 绕过（peer.yml 加一行，都该红）                                | 实测        |
+| --------------------------------------------------------------- | ----------- |
+| `curl -sS -d@body.json https://api.github.com/repos/o/r/check-runs` | **147 全绿** |
+| `curl -sSd '{"name":"audit","conclusion":"success"}' …/check-runs`  | **147 全绿** |
+| `curl -sS -Fname=audit …/check-runs`                          | **147 全绿** |
+| 反面对照 `curl -sS -d @body.json`（多一个空格）               | 5 红        |
+| 反面对照 良性 peer.yml（echo + 只读 `gh api …/check-runs/1`） | 147 全绿    |
+
+同轮其余四条也是同一层的问题：
+
+- **端点用变量即失效**：`ep="repos/o/r/check-runs"` + `gh api --method POST --input body.json "$ep"` → 147 全绿。
+  根因是进入条件仍要「端点字面量 + 写形态同现」。
+- **「id 最大」这条语义没有承重用例**：`rank` 循环换成 `ids.slice().sort().at(-1)`（字典序）或 `ids[ids.length-1]` → 各 147 全绿。
+  夹具 id 全是等长 4 位且升序，数值序与字典序碰巧一致 —— 又一次「用例名字比覆盖强」。
+- **新加的 `Infinity` fail-closed 分支零用例**：`Infinity` → `0` 仍 147 全绿。
+- **只读被读成写**：`gh api -X GET repos/o/r/check-runs --jq '.[]'` → 5 红，且文案把纯读指成「--input POST 的写面」（方向指反）。
+
+**修法（`tests/audit-findings.test.mjs:2612-2738`、`:3154`；`audit.yml:335`、`:360-372`）**
+
+- 删掉 `REQUEST_BODY_FLAGS`，换 `HTTP_CLIENTS`(2612) + `BODY_SHORT_LETTERS` = `{gh:"fF", curl:"dFT"}` + `BODY_LONG_FLAGS` + `READ_METHODS`；
+  `commandWriteIntent`(2657) 用 `shellCommands` 切命令、按词扫客户端起点，`commandWriteIntentAt`(2673) 按**字母前缀**判短标志簇
+  （`-sSd` 命中 `d`、`-Fname=audit` 命中 `F`）；curl 的小写 `-f`（`--fail`）不计入体字母，`curl -fsSL` 保持放行。
+- 「写」判据改为**命令级默认拒绝**：`checkRunWriteSurface`(2764) 与步骤级(3155) 都以 `commandWriteIntent` 进入，
+  **端点是不是字面量不再参与进入判定**；端点字面量只用于白名单放行。
+- `-X`/`--method` 取值判读方法（`READ_METHODS`）→ 显式 `-X GET` 放行；文案分三档
+  `CHECK_RUNS_REASON_WRITE` / `_WRITE_BLIND`（端点不是字面量）/ `_UNKNOWN`（不可判形态），不再把纯读指成写。
+- 「id 最大」补不同位数的承重用例（`"999"` vs `"1000"`）；非十进制 id 单独一档 `fail("id 无法比较", …)`，
+  理由是它永远不可能是「被更新的盖过」，混进那条文案会把原因指反。
+
+**我的独立变异复核**（`/tmp/vrf-r19` 副本，基线 154 passed，每次先打印改后行、YAML 先 `yaml.parse`）：
+
+| 变异                                              | 红数 | 说明                         |
+| ------------------------------------------------- | ---- | ---------------------------- |
+| `a-cluster`：簇判改回「只认独立成词短标志」       | 1    | 轮十八-1                     |
+| `b-endpoint`：步骤级条件退回只认端点字面量        | 1    | 轮十八-2                     |
+| `c-sort`：`rank` 循环换成 `sort().at(-1)`        | 2    | 轮十八-4、轮十八-5           |
+| `d-infinity`：`Infinity` → `0`                   | 1    | 轮十八-6                     |
+| `e-xget`：`-X` 一律当写                          | 1    | 轮十八-3                     |
+| 还原                                              | 0    | 154 绿                       |
+
+**绕过探针复现 + 反面对照**（peer.yml 一行一变，跑完即删）：
+
+| 探针                                                       | 结果         |
+| ---------------------------------------------------------- | ------------ |
+| 良性 peer.yml（`echo hi` + 只读 `gh api …/check-runs/1`）  | 154 全绿     |
+| `curl -sSd '{"name":"audit","conclusion":"success"}'`       | **6 红**     |
+| 变量端点 + `gh api --method POST --input body.json "$ep"`   | **6 红**     |
+| 纯读 `gh api -X GET …/check-runs --jq '.[]'`                | 154 全绿     |
+
+**被推翻的既有断言（3 处，都点名改写）**：三处 `.toEqual(["check-runs 只能是那两步的 --input POST，或自证步的两次只读回读"])`
+改引用 `CHECK_RUNS_REASON_WRITE`；两处 `.toContain(同句)` 同步改（数组的 `.toContain` 是元素全等，不是子串匹配）；
+轮十六-1 里 `check-runs?head_sha=` 的无写意图形态期望改为 `CHECK_RUNS_REASON_UNKNOWN`。未删除任何既有用例。
+
+**这一轮的教训**：把判据从「枚举拼写」改成「默认拒绝」**不等于**不再枚举 —— 只要新加的那条判据还是「某个标志后面必须是什么」，
+它就又成了一张「还差哪几种」的清单。真正的方向是「这个命令**有没有**写意图」，词形只用来实现它。
+
+**仍未解决**：信任根（同 §十四/§十五）——`workflow_dispatch` 用被 dispatch 那个 ref 的 YAML 与被审对象自己的 `scripts/`，
+被审 PR 可以整步删掉自证。根治属 P-14 编排层：从受信 ref（main）dispatch + 用受信 ref 的脚本，只把 PR 的 sha 当数据。
+

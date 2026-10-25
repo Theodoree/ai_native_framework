@@ -332,7 +332,7 @@ jobs:
                   "（name/app.slug/status/conclusion）与本次 payload 一致。",
                   "同一 sha 上更旧的同名结论（id 更小）不影响判定：那是 dispatch / rerun 的正常留痕；",
                   "比本次更新的那条会盖掉本次结论，合并判据读到的就不是这一条。",
-                  "四类失败各自点名：本次结论不在本 sha 上 / 被更新的结论盖过 / 内容被改 / 内容无从比对。",
+                  "五类失败各自点名：本次结论不在本 sha 上 / 被更新的结论盖过 / id 无法比较 / 内容被改 / 内容无从比对。",
                   "静态判据只能列举已知形态，这几类写形态由这一条兜住。",
                   "",
                 ].join("\n"),
@@ -361,6 +361,15 @@ jobs:
             let latest = ids[0];
             for (const id of ids) if (rank(id) > rank(latest)) latest = id;
             if (latest !== expected) {
+              // 读不懂的 id 与「被更新的结论盖过」处置相同（都判红），但诊断不同：
+              // 排不进去就放过是松；把读不懂的 id 说成「被更新的盖过」是把原因指反。
+              if (!/^[0-9]+$/.test(latest) || !/^[0-9]+$/.test(expected)) {
+                fail(
+                  "id 无法比较",
+                  "本 sha 上 name=audit 回读到无法比较的 id（" + latest + "），本次 POST 出去的是 id=" + expected +
+                    "：拿不到数值序就判不了 merge-gate 的 G3 会读到哪一条；非十进制 id 一律按更严处理（fail-closed），不能因为排不进去就放过它。",
+                );
+              }
               fail(
                 "被更新的结论盖过",
                 "本 sha 上 id 最大的 name=audit 是 id=" + latest + "，本次 POST 出去的是 id=" + expected +
