@@ -31,9 +31,12 @@ name: audit
 # 上面三条（口径层判定 / 结论兜底 / 判不了：回写 INFRA）都是**静态判据**：它们列举的是
 # 已知的执行形态（哪一步、哪种命令行、哪个 YAML 键）。静态判据只能收口它认得出来的形态——
 # 换一个载体（github-script 的 with.script、兄弟 workflow、解包后改文件）就能在同一 sha 上
-# 再发一条同名结论，而本文件一字未改。所以「结论唯一」由运行时**自证**兜底：
-# 「结论自证：回读 Check Run」回读这个 sha 上所有 name=audit 的 Check Run，要求恰好一条、
-# 且 id 就是刚 POST 出去的那条。静态判据管已知形态，回读直接观测事实；两者不互相替代。
+# 再发一条同名结论，而本文件一字未改。所以「会被读到的是哪一条」由运行时**自证**兜底：
+# 「结论自证：回读 Check Run」回读这个 sha 上所有 name=audit 的 Check Run，要求刚 POST 出去的
+# 那条在其中、是本 sha 上 id 最大的那条、且内容与本次 payload 一致。判据不是「恰好一条」：
+# 同一个 commit 上的旧 dispatch / rerun 会留下 id 更小的同名结论，那是 GitHub 的正常操作，
+# 不是第二个写者，把它读成「判不了」就会让正确结论被旧记录掩盖。
+# 静态判据管已知形态，回读直接观测事实；两者不互相替代。
 #
 # 上面那句的前提是 payload 的 head_sha 非空：空 sha 会被 GitHub 拒收，于是**一条
 # Check Run 都没有**，「一定有一条」当场不成立。三条写 payload 的路径各自兜住这一点：
@@ -278,8 +281,13 @@ jobs:
       # 解包后改文件，都能在同一 sha 上再发一条同名结论，而本文件一字未改
       # （实测：peer.yml 用 actions/github-script@v7 发一条 name=audit / conclusion=success，
       # 静态判据全绿）。回读直接观测事实，不猜形态。
-      # 只读：不产生结论。数条数、比 id、再比这一条**写着什么** —— id 只证明「是谁」，
-      # PATCH 改写既有那条不换 id，只比 id 结构上看不见它（实测 checks.update 全绿）。
+      # 只读：不产生结论。判的是「平台上会被读到的那一条」，不是「只有一条」：
+      #   * 同一个 commit 上的旧 dispatch / rerun 会留下 id 更小的同名结论 —— GitHub 的正常操作，
+      #     不是第二个写者；把它读成「判不了」就等于用一条正常的历史留痕掩盖正确结论。
+      #   * 「会被读到」有唯一出处：scripts/merge-gate.mjs 的 G3 对同名 check 取 id 最大者。
+      #     所以本次这条必须是本 sha 上 id 最大的那条；被更新的结论盖过才算红。
+      # 再比这一条**写着什么**：id 只证明「是谁」，PATCH 改写既有那条不换 id，只比 id 结构上
+      # 看不见它（实测 checks.update 全绿）。
       - name: 结论自证：回读 Check Run
         if: always() && steps.ctx.outputs.ok == '1'
         env:
@@ -288,7 +296,7 @@ jobs:
           expected='${{ steps.post.outputs.check_run_id }}'
           # 端点只认 commits/<ref>/check-runs：/check-runs?head_sha= 这个形态不存在（实测 404）。
           # filter=all 必须显式写：默认 filter=latest 是按 name 去重后的视图，
-          # 「恰好一条」不许建在默认去重上。--slurp 与 --jq 互斥（gh 直接拒绝），
+          # 同名多条不许被默认视图藏起来。--slurp 与 --jq 互斥（gh 直接拒绝），
           # 所以整页落盘再交给 node 解；也不经 env 传：真仓 4 条 check run 就 14KB，多几条就撞上限。
           runs_file="$(mktemp)"
           gh api "repos/$GITHUB_REPOSITORY/commits/$AUDIT_SHA/check-runs?filter=all&per_page=100" --paginate --slurp > "$runs_file"
@@ -318,10 +326,14 @@ jobs:
                   "",
                   detail,
                   "",
-                  "恰好一条 name=audit、id 就是刚 POST 的那条，且这一条的内容（name/app.slug/status/conclusion）",
-                  "与本次 payload 一致，才叫「结论唯一且没被改写」。",
-                  "多出来的那条说明有第二个写者在同一 sha 上发结论；内容对不上说明既有那条被改写过：",
-                  "静态判据只能列举已知形态，这两类写形态由这一条兜住。",
+                  "判据不是「本 sha 上只有一条 name=audit」，而是「平台上会被读到的就是本次这条」：",
+                  "合并判据（scripts/merge-gate.mjs 的 G3）对同名 check 取 id 最大者。所以本次 POST 出去的",
+                  "这条必须同时成立：仍在本 sha 上、是本 sha 上 id 最大的那条 audit、且回读到的内容",
+                  "（name/app.slug/status/conclusion）与本次 payload 一致。",
+                  "同一 sha 上更旧的同名结论（id 更小）不影响判定：那是 dispatch / rerun 的正常留痕；",
+                  "比本次更新的那条会盖掉本次结论，合并判据读到的就不是这一条。",
+                  "四类失败各自点名：本次结论不在本 sha 上 / 被更新的结论盖过 / 内容被改 / 内容无从比对。",
+                  "静态判据只能列举已知形态，这几类写形态由这一条兜住。",
                   "",
                 ].join("\n"),
               );
@@ -335,22 +347,38 @@ jobs:
                 "回写步没跑、或没把 output 写出来：没有可比对的 id，自证无从谈起（fail-closed）。",
               );
             }
-            if (ids.length !== 1) {
+            // 本次这条必须真的落在平台上：回读里找不到它 = 这次没留痕。
+            if (!ids.includes(expected)) {
               fail(
-                "条数不对",
-                "本 sha 上出现了 " + ids.length + " 条 name=audit 的 Check Run（期望恰好 1 条）；回读到 id：" +
-                  (ids.length ? ids.join("、") : "（无）") + "；本步 POST 出去的 id：" + expected,
+                "本次结论不在本 sha 上",
+                "本 sha 上 name=audit 的 Check Run 回读到 id：" + (ids.length ? ids.join("、") : "（无）") +
+                  "；本步 POST 出去的是 id=" + expected + "：平台上读不到这一条，等于这次没留痕。",
               );
             }
-            if (ids[0] !== expected) {
+            // 「会被读到」有唯一出处：merge-gate 的 G3 对同名 check 取 id 最大者。
+            // 非十进制 id 按「无法比较」排到最大（fail-closed）：不能因为排不进去就放过它。
+            const rank = (id) => (/^[0-9]+$/.test(id) ? Number(id) : Infinity);
+            let latest = ids[0];
+            for (const id of ids) if (rank(id) > rank(latest)) latest = id;
+            if (latest !== expected) {
               fail(
-                "id 不对",
-                "本 sha 上那一条 name=audit 的 id=" + ids[0] + "，本步 POST 出去的是 id=" + expected + "：回读到的不是这一条。",
+                "被更新的结论盖过",
+                "本 sha 上 id 最大的 name=audit 是 id=" + latest + "，本次 POST 出去的是 id=" + expected +
+                  "：scripts/merge-gate.mjs 的 G3 对同名 check 取 id 最大者，merge-gate 会读到 id=" + latest +
+                  " 那条 —— 本次结论已被更新的那条盖掉，合并判据读到的不是这一条。",
               );
             }
             // 单条回读本身就失败了：没有内容可比，也是「证不了」。
             if (process.env.CONFIG_OK !== "1") {
               fail("内容无从比对", "按 id 回读单条（GET repos/{owner}/{repo}/check-runs/<id>）非 0：拿不到这一条的内容。");
+            }
+            // 回读成功但内容是空的：同样是「证不了」，而且是最危险的一种 ——
+            // 只要给空内容补一个默认值，「回读为空」就地变成「伪造通过」。
+            if (!process.env.CONFIG) {
+              fail(
+                "内容无从比对",
+                "按 id 回读单条成功，但回读内容是空的（拿不到 name/app.slug/status/conclusion）：没有内容可比就不叫自证（fail-closed）。",
+              );
             }
             // 内容从载体读（不经 env 传：env 有长度上限），读不到也进失败分支。
             let payload = null;
@@ -360,6 +388,8 @@ jobs:
               payload = null;
             }
             const wantConclusion = payload && typeof payload.conclusion === "string" ? payload.conclusion : "";
+            // 空串也是「读不到」：结论兜底只补「非字符串」的 payload，空串能一路穿到这里 ——
+            // 那时若拿实得内容与空期望比，「conclusion」两边都空就「相等」，用空内容冒充通过。
             if (!wantConclusion) {
               fail("内容无从比对", "本次 payload 里读不到 conclusion（载体 = 本步 POST 出去的那份）：不比内容就不叫自证（fail-closed）。");
             }
@@ -381,8 +411,9 @@ jobs:
               }
             }
             console.log(
-              "audit 自证通过：恰好一条 name=audit，id 相等（id=" + expected +
-                "），内容一致（name/app.slug/status/conclusion 与 payload 相同，conclusion=" + wantConclusion + "）。",
+              "audit 自证通过：本 sha 上 id 最大的 name=audit 就是本次 POST 的 id=" + expected +
+                "（未被更新的结论盖过），内容一致（name/app.slug/status/conclusion 与 payload 相同，conclusion=" +
+                wantConclusion + "）。",
             );
             process.exit(0);
           '

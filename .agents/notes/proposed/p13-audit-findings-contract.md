@@ -447,3 +447,47 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 
 - 信任根问题（review-a 提出，属 P-14 编排层）：`workflow_dispatch` 跑的是**被 dispatch 那个 ref 的 YAML**，`audit.yml` 与 `scripts/` 都来自被审对象——被审者能整步删掉自证，或改判据。根治方向是「从受信 ref（main）dispatch + 用受信 ref 的脚本，只把 PR 的 sha 当数据」。
 - Check Run 的条数与 id 由自证兜住，内容由四字段比对兜住；但「自证步自己是否真跑过」仍依赖 job 结论，属于上面同一条信任根。
+
+## 十五、轮十七：自证从「只有一条」改成「会被读到的那条」，写面判据转为默认拒绝
+
+**轮十七两家（review-a `9db0794c` / review-b `d638b12b`，审 `daee6e1`）都判 needs_revision，共六条**：
+
+| #   | 严重度  | 位置                | 问题                                                                                                                      | 我的独立复核                                       |
+| --- | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| F1  | medium  | `audit.yml` 自证步  | 自证非幂等：`ids.length !== 1` 把「同一 commit 的上一次 dispatch/rerun」当成第二个写者 → 正确结论被掩盖成「判不了」       | 成立，但这是**设计错误**不是测试缺口，见下「决策」 |
+| F2  | medium  | `tests` 四字段      | `["name","audit",got[0]]` / `["status","completed",got[2]]` 改成恒真时全绿——「看着在盯四列，其实只钉住两列」              | 我实测：两处恒真各 **138 全绿**                    |
+| F3  | low     | `audit.yml:363/367` | 两处 fail-closed 零用例：`CONFIG \|\| ""` 兜成默认串、`if (!wantConclusion)` 改 `if (false)` 都全绿                       | 我实测：两条各 **138 全绿**                        |
+| G1  | blocker | `tests:2490`        | 结论写面逐物理行判、不折叠反斜杠续行：一次 PATCH 拆三行后端点行与写形态行互不相遇                                         | 复核见下表（同形态 5 红）                          |
+| G2  | high    | `tests:2431`        | `CHECK_RUNS_WRITE_HINT` 拼写穷举且大小写敏感：`--method patch --raw-field` / `-Xpatch` 全绿（真 gh 实测这些都真发 PATCH） | 复核见下表                                         |
+| G3  | high    | `tests:2454`        | `checkRunWriteSurface` 漏 curl 的体标志：`curl -d '{"…conclusion":"success"}' …/check-runs`（隐含 POST）全绿              | 复核见下表                                         |
+
+**决策（F1，我定的）**：自证要保证的**不是**「本 sha 上只有一条 name=audit」，而是「平台上会被读到的就是本次这条」。
+依据是唯一出处：`scripts/merge-gate.mjs:219-221` 的 `newest(list)` 对同名 check 取 **id 最大者**。
+于是新判据 = `expected ∈ ids` ∧ `max(id) === expected`（非十进制 id 按 `Infinity` 排最大，fail-closed）∧ 四字段内容一致。
+好处：对重复 dispatch / rerun **幂等**（旧记录 id 更小，不影响判定）；仍咬得住「在我们之后有人发了更新的同名结论」（G3 会读到那条）。
+两个审查执行器都独立确认了这个前提（review-b 自己读了 `newest`），因此这不是「为了测试变绿而放宽判据」。
+
+**修法要点**：
+
+- `audit.yml`：失败分四类点名（本次结论不在本 sha 上 / 被更新的结论盖过 / 内容被改 / 内容无从比对）；回读成功但内容为空、payload 缺 conclusion 都进「内容无从比对」（空串也是「读不到」——否则两边都空就「相等」，用空内容冒充通过）；文件头与 summary 的「恰好一条」措辞全部改成「会被读到的那一条」。
+- `tests`：F1 倒逼两条语义被推翻的用例被**改写**（旧 id 更小 → 必须过；更新的 → 必须红），另补「expected 不在列表里」；F2 补 name / status 各自「回读值不是期望常量」的行为用例；F3 补「回读空 body」「payload 缺 conclusion」两条夹具。
+- `tests` 写面判据：`workflowWriteSurfaceViolations` / `auditDirReferenceViolations` 改为**先 `foldContinuations` 折成逻辑命令流再判**（复用文件里本就有的 `foldContinuations`）；写侧从枚举拼写改为**默认拒绝**——命中 check-runs / graphql 端点后只放行白名单只读形态，方法大小写、`=` 形式、`--raw-field`、curl 的 `-d/--data*` 体标志一律算写。
+
+**我的十组变异 + 一组反面对照（`/tmp/vrf-r18` 副本，基线 147 passed）**：
+
+| 变异                                   | 红  | 变异                                   | 红  |
+| -------------------------------------- | --- | -------------------------------------- | --- |
+| `["status",got[2],got[2]]`（恒真）     | 2   | 回读 name 恒真                         | 2   |
+| 空 CONFIG 守卫改 `if (false)`          | 1   | `if (!wantConclusion)` 改 `if (false)` | 1   |
+| `max(id) === expected` 守卫拆掉        | 1   | peer.yml：PATCH 拆三行续行             | 5   |
+| peer.yml：`--method patch --raw-field` | 5   | peer.yml：`-Xpatch --raw-field`        | 5   |
+| peer.yml：`curl -d` 体标志             | 5   | peer.yml：`curl --data-binary`         | 5   |
+
+**反面对照（关键）**：写一个**良性** peer.yml（`echo hi` + 只读 `gh api repos/o/r/check-runs/1`）→ **147 全绿**。
+没有这条，上面那些「5 红」可能只是「多了个 workflow 文件就红」的噪音；有了它，红是判据在认写形态。
+
+**流程事实**：本轮修复执行器 `915698f5` 在收尾前失败、没留报告（六条它实际都做完了）。我没有等它重说，
+而是按「报告是证据不是判决」自己跑完上面 11 组变异 + 全仓 `npm run check`（313 tests）才接受这批改动。
+
+**仍未解决的开放项**（同 §十四）：信任根——`workflow_dispatch` 用的是被 dispatch 那个 ref 的 YAML，
+被审对象可以整步删掉自证；根治要「从受信 ref（main）dispatch + 用受信 ref 的脚本，只把 PR 的 sha 当数据」，属 P-14 编排层。
