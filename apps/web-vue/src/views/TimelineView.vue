@@ -34,36 +34,59 @@ function refresh(): void {
 </script>
 
 <template>
-  <div class="stack-layout">
-    <section class="panel">
-      <header class="panel-head">
-        <h2>事件时间线</h2>
-        <span class="muted">共 {{ state.events.length }} 条 · 倒序 · 显示 {{ visible.length }} 条</span>
-        <input v-model="filter" class="input filter" type="search" placeholder="按 id 过滤，如 REQ-1" />
-        <button type="button" class="btn" :disabled="state.eventsLoading" @click="refresh">
-          {{ state.eventsLoading ? "加载中…" : "刷新" }}
-        </button>
-      </header>
-      <FailureBanner :failure="state.eventsFailure" title="事件加载失败" />
-      <p v-if="visible.length === 0" class="muted empty">没有匹配的事件。</p>
-      <ol v-else class="timeline">
-        <li
-          v-for="(event, index) in visible"
-          :key="(event.id ?? 'evt') + '-' + index"
-          class="timeline-item"
+  <v-container fluid class="pa-3">
+    <v-card variant="flat">
+      <v-card-title class="d-flex align-center text-body-2 py-2">
+        <span class="font-weight-bold">事件时间线</span>
+        <span class="text-caption text-medium-emphasis ms-2">
+          共 {{ state.events.length }} 条 · 倒序 · 显示 {{ visible.length }} 条
+        </span>
+        <v-spacer />
+        <v-text-field
+          v-model="filter"
+          class="filter"
+          type="search"
+          label="按 id 过滤，如 REQ-1"
+          @keydown.enter.prevent
+        />
+        <v-btn
+          size="small"
+          variant="tonal"
+          class="ms-2"
+          :loading="state.eventsLoading"
+          @click="refresh"
         >
-          <div class="timeline-head">
-            <span class="item-id">{{ event.id ?? "(无 id)" }}</span>
-            <span class="flow">{{ flowText(event) }}</span>
-            <span class="chip">{{ event.by ?? "(无 by)" }}</span>
-            <span v-if="event.flow !== null" class="chip chip-muted">flow={{ event.flow }}</span>
-            <time class="muted">{{ event.at ?? "(无时间)" }}</time>
-          </div>
-          <p class="comment">
-            {{ event.comment === null || event.comment === "" ? "(无 comment)" : event.comment }}
-          </p>
-        </li>
-      </ol>
-    </section>
-  </div>
+          刷新
+        </v-btn>
+      </v-card-title>
+      <v-card-text class="pa-3 pt-0">
+        <FailureBanner :failure="state.eventsFailure" title="事件加载失败" />
+        <p v-if="visible.length === 0" class="text-caption text-medium-emphasis">
+          没有匹配的事件。
+        </p>
+        <ol v-else class="timeline">
+          <li
+            v-for="(event, index) in visible"
+            :key="(event.id ?? 'evt') + '-' + index"
+            class="timeline-item"
+          >
+            <div class="timeline-head">
+              <span class="text-caption font-weight-medium">{{ event.id ?? "(无 id)" }}</span>
+              <span class="flow">{{ flowText(event) }}</span>
+              <v-chip size="x-small" variant="tonal" color="secondary">
+                {{ event.by ?? "(无 by)" }}
+              </v-chip>
+              <v-chip v-if="event.flow !== null" size="x-small" variant="outlined">
+                flow={{ event.flow }}
+              </v-chip>
+              <time class="text-caption text-medium-emphasis">{{ event.at ?? "(无时间)" }}</time>
+            </div>
+            <p class="comment">
+              {{ event.comment === null || event.comment === "" ? "(无 comment)" : event.comment }}
+            </p>
+          </li>
+        </ol>
+      </v-card-text>
+    </v-card>
+  </v-container>
 </template>

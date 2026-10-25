@@ -54,8 +54,11 @@ function nodeClass(id: string): string {
 </script>
 
 <template>
+  <!-- 几何全部来自 lib/graph.ts；这里只画，不动坐标。配色/圆角/字号由 main.css 对齐主题变量。 -->
   <div class="graph-wrap">
-    <p v-if="layout.nodes.length === 0" class="muted">config 里没有 states，画不出图。</p>
+    <p v-if="layout.nodes.length === 0" class="text-caption text-medium-emphasis">
+      config 里没有 states，画不出图。
+    </p>
     <template v-else>
       <svg
         class="graph"
@@ -137,7 +140,7 @@ function nodeClass(id: string): string {
           </text>
         </g>
       </svg>
-      <p class="muted legend">
+      <p class="legend text-caption text-medium-emphasis">
         <span class="legend-item"><i class="swatch swatch-terminal"></i>终态</span>
         <span class="legend-item"><i class="swatch swatch-pseudo"></i>none / * 伪节点</span>
         <span v-if="activeLabel !== null">当前高亮：{{ activeLabel }}（再点一次取消）</span>

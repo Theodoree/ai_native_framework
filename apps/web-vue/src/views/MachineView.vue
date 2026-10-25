@@ -7,18 +7,21 @@ const { state } = usePlatform();
 </script>
 
 <template>
-  <div class="stack-layout">
-    <section class="panel">
-      <header class="panel-head">
-        <h2>状态机图</h2>
-        <span class="muted">
-          由 config.states + config.transitions 生成（手写 SVG）；defaultFlow =
-          {{ state.config.defaultFlow ?? "(未声明)" }} · labelPrefix =
-          {{ state.config.labelPrefix === "" ? "(空)" : state.config.labelPrefix }}
-        </span>
-      </header>
-      <StateMachineGraph :states="state.config.states" :transitions="state.config.transitions" />
-    </section>
+  <v-container fluid class="pa-3">
+    <v-card variant="flat" class="mb-3">
+      <v-card-title class="text-body-2 py-2 font-weight-bold">状态机图</v-card-title>
+      <v-card-subtitle class="text-caption">
+        由 config.states + config.transitions 生成（手写 SVG）；defaultFlow =
+        {{ state.config.defaultFlow ?? "(未声明)" }} · labelPrefix =
+        {{ state.config.labelPrefix === "" ? "(空)" : state.config.labelPrefix }}
+      </v-card-subtitle>
+      <v-card-text class="pa-3">
+        <StateMachineGraph
+          :states="state.config.states"
+          :transitions="state.config.transitions"
+        />
+      </v-card-text>
+    </v-card>
     <ConfigEditor />
-  </div>
+  </v-container>
 </template>

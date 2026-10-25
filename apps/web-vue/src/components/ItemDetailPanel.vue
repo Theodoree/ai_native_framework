@@ -34,24 +34,37 @@ function close(): void {
 </script>
 
 <template>
-  <section class="panel detail">
-    <header class="panel-head">
-      <h2>详情</h2>
-      <button v-if="selectedItem" type="button" class="btn btn-ghost" @click="close">关闭</button>
-    </header>
-    <p v-if="selectedItem === null" class="muted">点左侧卡片查看详情。</p>
-    <template v-else>
-      <dl class="fields">
-        <template v-for="field in fields" :key="field.key">
-          <dt>{{ field.key }}</dt>
-          <dd>{{ field.value }}</dd>
-        </template>
-      </dl>
-      <details class="raw">
-        <summary>完整 JSON（折叠结果原样）</summary>
-        <pre>{{ rawJson }}</pre>
-      </details>
-      <TransitionForm :item="selectedItem" />
-    </template>
-  </section>
+  <v-card variant="flat" class="mb-3">
+    <v-card-title class="d-flex align-center text-body-2 py-2">
+      <span class="font-weight-bold">详情</span>
+      <v-spacer />
+      <v-btn v-if="selectedItem" size="small" variant="text" @click="close">关闭</v-btn>
+    </v-card-title>
+    <v-card-text class="pa-3 pt-0">
+      <p v-if="selectedItem === null" class="text-caption text-medium-emphasis">
+        点左侧卡片查看详情。
+      </p>
+      <template v-else>
+        <v-table density="compact" class="detail-fields">
+          <tbody>
+            <tr v-for="field in fields" :key="field.key">
+              <th class="text-left text-caption text-medium-emphasis">{{ field.key }}</th>
+              <td class="text-caption text-left">{{ field.value }}</td>
+            </tr>
+          </tbody>
+        </v-table>
+        <v-expansion-panels variant="accordion" class="mt-2">
+          <v-expansion-panel>
+            <v-expansion-panel-title class="text-caption">
+              完整 JSON（折叠结果原样）
+            </v-expansion-panel-title>
+            <v-expansion-panel-text>
+              <pre class="json-block">{{ rawJson }}</pre>
+            </v-expansion-panel-text>
+          </v-expansion-panel>
+        </v-expansion-panels>
+        <TransitionForm :item="selectedItem" class="mt-3" />
+      </template>
+    </v-card-text>
+  </v-card>
 </template>
