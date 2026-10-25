@@ -725,3 +725,21 @@ wiring：job 名 audit、checks: write、真调 check-runs、YAML 内无真模�
 **登记两条新的假红（不计分，仍是取舍）**：① `$GH_CLI api <非 check-runs 端点>` 因动态命令头落 overflow 被一刀切判写面；② 兄弟 workflow 里裸端点挂 env（没有调用）不判红。前者是默认拒绝方向上的误报，会在真实仓库里误伤「把 gh 别名成变量」这类写法，记下来以便将来真被误伤时有据可查。
 
 **取舍说明（修复者提出、我认可）**：被跟随脚本里的 `child_process` 不能一律判红 —— `scripts/merge-gate.mjs`、`scripts/writer-record.mjs` 都在 child_process 里调 gh，一律判红会把真仓库的 `workflowWriteSurfaceViolations() === []` 打死。所以窄口径：**同一行同时点名 `check-runs`/`graphql`** 才算跟不下去。`scriptTree().missing` 里混着 `verdict.json`/`intent.json` 这类数据文件名，只对 `SCRIPT_EXT` 命中的缺失文件记 `script-missing`。
+
+## 二十二、轮二十三 / 轮二十四：放行条件必须证明方法；跟不下去一律记 gap
+
+**轮二十三 R24-B-1（high，review-b 先发现，我独立复现）**：盲端点放行档 `READ_ONLY_REQUEST` 把 `--jq / -q / --template / --paginate / --slurp` 与 `-X GET` 并列当「只读证明」。前四个只是输出整形，不约束方法 —— 而 `audit.yml` 自己的回写步就写成 `--jq '.id'`，抄它最自然。复现：peer.yml `on: push` + `permissions: {checks: write}` + `env: EP/M/B` + `gh api $EP $M $B --jq .id` → 181 全绿；删掉 ` --jq .id` → 9 红；换 ` --paginate` → 181 全绿。**红绿只差一个「不约束方法」的旗标。** 修法：只认方法证明（`-X GET`/`-XGET`/`--method GET`/`--method=GET`/curl `-G`、`--get`），并显式拒绝「gh api 没写 --method 所以是 GET」这条推理（盲端点里变量正藏着方法）。
+
+**处置规则（本轮新增，适用后续所有轮次）**：一条断言如果**编码了缺陷**（例：`expect(checkRunWriteSurface('gh api --jq .id "$ep"')).toBeNull()` 断言「仅凭 --jq 的盲端点不是写面」），任何正确修法都会让它变红。允许改写它，但必须 ① 原处改成正确形态（补 `-X GET` 保住「变量端点的只读调用不是写面」这个反面对照）；② 另加一条钉住缺陷的红向断言。**改写一条编码缺陷的断言不算削弱覆盖**——反之，为了保住它而让缺陷继续成立才是。
+
+**轮二十四 R24-A-1～A-4（review-a 复审 f4b768f）同一根因**：`stepTexts` 的执行面在「跟不下去」时没有一律记 gap —— `空面 ≠ 已跟完`。四条形态：`runs.using` 非 composite 的本地 action 返回空 steps 且不落 gap（`:1984`）；不带引号的 `$(` 把调用截成 `words=['$']` 而单 `$` 不算不可解（`:3473`，同一步交给另一入口却是 1 条 → 两个入口相反）；远端 `uses` 在 `stepTexts` 里静默 return（`:2447`）；`node $(echo scripts/x.mjs)` 的脚本引用整条消失且不记 gap（`:1732`）。
+
+**修法（`tests/audit-findings.test.mjs`）**：`:1967` `ALLOWED_USES` 加 `actions/upload-artifact`（`kb-sync.yml:78,86` 真在用，否则真仓库自身变红）；`:1982-1985` `NODE_ACTION_USING=/^node/i`、`ACTION_ENTRY_KEYS=["main","pre","post"]`、`localActionSteps` 返回 `{file,using,entries,steps}`；`:2442-2450` `TRUNCATED_DOLLAR_WORD=/^\$(?:\{[^}]*)?$/`、`SUBSTITUTION_SCRIPT_NAME`、`substitutionScriptGaps`；`:2469` `stepTexts` 重写（`follow(rel, where)` + 每载荷 `substitutionScriptGaps`），`:2507` `uses-remote`、`:2528/:2538` `action-using`；`:3220` 截断 `$` 词落 `httpCalls.overflow{kind:"truncated-dollar"}`；`:3662` `GAP_REASONS` 增 `action-using` / `uses-remote`，两个入口都把每条 gap 判违规。
+
+**我的独立复核（`/tmp/vrf-r26`，基线 186 passed）**：A-2 裸 `$(printf %s …/check-runs) -X PATCH` → **10 红**；A-3 远端 `uses: evil/check-writer@v1` → **10 红**；A-4 `node $(echo scripts/peer-evil.mjs)` → **10 红**；A-1 `using: node20` + `main: dist/index.js`（内藏 PATCH）→ **10 红**；良性对照（同形状 main 只 `console.log`；`checkout` + `upload-artifact` + `echo`）→ 186 全绿；清理后 186 全绿。
+**变异（`/tmp/vrf-r27`）**：node 入口不 follow → 1 红；`truncated-dollar` 不落 overflow → 1 红；远端 uses 不记 gap → 3 红；命令替换脚本 gap 关掉 → 1 红；composite 递归关闭 → 2 红；还原 186 全绿。
+
+**被改写的既有断言 2 处**（轮十五-6b `:6168`、轮十六-2 `:6590`）：fixture 用的是未白名单的 `actions/github-script@v7`，修后必然多一条 `uses-remote`，而原断言用 `map(v => v.step)` 与 `violations[0]` 取首条 —— 它把「只有一条」写进了缺陷态。已改成 `filter` / `find` 取写面那条，并在原处补断言钉住「写面违规仍在、gap 没吞违规」。
+
+整仓 `npm run check` = 13 files / **352 tests**、oxlint 0/0。
+
