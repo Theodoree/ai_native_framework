@@ -111,3 +111,4 @@
 | P-13 | findings 契约执行层 | M4 |
 | P-14 | audit 上 required check | M4 |
 | P-11 | 平台形态：单进程 JavaScript，不做前后端分离 | M0.5 · **已完成** |
+**P-14 的两条前置（轮二十三登记）**：① 自证是快照，回读之后写入的同名结论会盖掉真结论 → `scripts/merge-gate.mjs` 需加时序判据（读到的 audit / audit-runner 晚于本次 merge-gate 开始、或 id 大于 merge-gate 自身 check，按「未判过」阻断）；② 或把本次 nonce 写进 Check Run 的 `external_id` 随 artifact 发布、由 merge-gate 比对。二者任选其一，都要在「audit 挂 required + 打开 pull_request 触发」之前落地；在此之前，信任根未解决时它们也只是抬高门槛。

@@ -31,12 +31,24 @@ name: audit
 # 上面三条（口径层判定 / 结论兜底 / 判不了：回写 INFRA）都是**静态判据**：它们列举的是
 # 已知的执行形态（哪一步、哪种命令行、哪个 YAML 键）。静态判据只能收口它认得出来的形态——
 # 换一个载体（github-script 的 with.script、兄弟 workflow、解包后改文件）就能在同一 sha 上
-# 再发一条同名结论，而本文件一字未改。所以「会被读到的是哪一条」由运行时**自证**兜底：
-# 「结论自证：回读 Check Run」回读这个 sha 上所有 name=audit 的 Check Run，要求刚 POST 出去的
-# 那条在其中、是本 sha 上 id 最大的那条、且内容与本次 payload 一致。判据不是「恰好一条」：
+# 再发一条同名结论，而本文件一字未改。所以「会被读到的是哪一条」由运行时**自证**兜底——
+# 但它只是一次快照，兜住的是「回读那一刻已经存在的同名结论」：「结论自证：回读 Check Run」
+# 回读这个 sha 上所有 name=audit 的 Check Run，要求刚 POST 出去的那条在其中、是本 sha 上
+# id 最大的那条、且内容与本次 payload 一致。判据不是「恰好一条」：
 # 同一个 commit 上的旧 dispatch / rerun 会留下 id 更小的同名结论，那是 GitHub 的正常操作，
 # 不是第二个写者，把它读成「判不了」就会让正确结论被旧记录掩盖。
 # 静态判据管已知形态，回读直接观测事实；两者不互相替代。
+#
+# 自证管不到的那一半（**已经写明，不要读成已解决**）：回读之后再写入的同名结论 ——
+# 「自证通过 → merge-gate 读取」这段时间里，另一个带 checks:write 的写者补发一条 id 更大的
+# name=audit（以及补一条 audit-runner），本次真结论会被 G3 的「同名取 id 最大」盖掉。
+# 这不是判据写漏，是一次快照在时间轴上的固有边界。闭合它有两条路，都落在 P-14 编排层
+# （audit 挂 required + 打开 pull_request 触发时一起做）：① merge-gate 加时序判据（读到的
+# audit/audit-runner 晚于本次 merge-gate 开始、或 id 大于 merge-gate 自身 check → 按「未判过」
+# 阻断）；② 本次 nonce 写进 Check Run 的 external_id 并随 artifact 发布，由 merge-gate 比对。
+# 在信任根未解决（audit 用的是被 dispatch 那个 ref 的 YAML 与被审对象自己的 scripts/）之前，
+# 这两条都只是抬高门槛，不改变「被审对象能改判据」这个前提。登记出处：
+# .agents/notes/proposed/p13-audit-findings-contract.md §二十、platform-rollout-plan 的 P-14 待办。
 #
 # 上面那句的前提是 payload 的 head_sha 非空：空 sha 会被 GitHub 拒收，于是**一条
 # Check Run 都没有**，「一定有一条」当场不成立。三条写 payload 的路径各自兜住这一点：
