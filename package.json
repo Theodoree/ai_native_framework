@@ -5,9 +5,10 @@
   "type": "module",
   "description": "AI 原生研发交付引擎：issue 即状态，PR 即交付，证据可复算",
   "scripts": {
-    "check": "npm run check:state && npm run lint && npm test && npm run check:go && npm run check:web",
+    "check": "npm run check:state && npm run lint && npm test && npm run check:go && npm run check:engine && npm run check:web",
     "check:state": "node scripts/state-validate.mjs --check-config",
     "check:go": "cd apps/api-go && test -z \"$(gofmt -l *.go)\" && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
+    "check:engine": "cd apps/engine && test -z \"$(gofmt -l .)\" && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
     "check:web": "npm --prefix apps/web-vue run build && node scripts/copy-dist.mjs",
     "cli": "node scripts/cli.mjs",
     "format": "prettier --write .",

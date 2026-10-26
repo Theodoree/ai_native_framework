@@ -7,7 +7,7 @@
 本仓库用三种语言，各自有明确的归属：
 
 - **JavaScript（ESM，Node ≥ 20）**：判定、账本、门与审计的执行层；唯一的运行时依赖是 `yaml`（解析状态机声明）。
-- **Go（≥ 1.22，标准库）**：本机平台实例的 HTTP 面（`apps/api-go`），零第三方依赖。
+- **Go（≥ 1.22）**：本机平台实例的 HTTP 面（`apps/api-go`）与判定/账本引擎（`apps/engine`，库 + 单二进制 CLI）。第三方依赖只有两个：`gopkg.in/yaml.v3`（解析状态机声明）、`modernc.org/sqlite`（纯 Go，无需 cgo）。
 - **TypeScript + Vue 3（Vite）**：本机平台实例的页面（`apps/web-vue`）。
 
 ## 安装
@@ -23,6 +23,7 @@ npm --prefix apps/web-vue install  # 前端自带依赖树
 npm test              # vitest
 npm run check:state   # 只跑状态机配置自检
 npm run check:go      # gofmt + go vet + go test（apps/api-go）
+npm run check:engine  # gofmt + go vet + go test（apps/engine）
 npm run check:web     # vue-tsc + vite build（apps/web-vue）
 ```
 

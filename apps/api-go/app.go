@@ -15,12 +15,8 @@ import (
 // 超过 1MB 的请求体不解析：与原型同一条边界。
 const maxBodyBytes = 1 << 20
 
-// 两个 Node 入口是判定与账本的唯一实现，Go 只经它们说话。
-const (
-	validatorCLI = "state-validate.mjs"
-	ledgerCLI    = "ledger-cli.mjs"
-	configRel    = ".agents/platform/state-machine.yml"
-)
+// 声明路径：判定器与账本都以它为真源，只由引擎解释。
+const configRel = ".agents/platform/state-machine.yml"
 
 type app struct {
 	root string

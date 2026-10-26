@@ -37,8 +37,8 @@ func main() {
 	}
 }
 
-// resolveRoot: 二进制可能从 apps/api-go 里起，而两个 Node 入口与账本都以仓库根为基准，
-// 所以向上找到带 scripts/state-validate.mjs 的目录。PLATFORM_ROOT 用于测试与显式覆盖。
+// resolveRoot: 二进制可能从 apps/api-go 里起，而状态机声明与账本都以仓库根为基准，
+// 所以向上找到带 .agents/platform/state-machine.yml 的目录。PLATFORM_ROOT 用于测试与显式覆盖。
 func resolveRoot() (string, error) {
 	if override := os.Getenv("PLATFORM_ROOT"); override != "" {
 		return filepath.Abs(override)
@@ -48,7 +48,7 @@ func resolveRoot() (string, error) {
 		return "", err
 	}
 	for {
-		if _, statErr := os.Stat(filepath.Join(dir, "scripts", "state-validate.mjs")); statErr == nil {
+		if _, statErr := os.Stat(filepath.Join(dir, ".agents", "platform", "state-machine.yml")); statErr == nil {
 			return dir, nil
 		}
 		parent := filepath.Dir(dir)
