@@ -99,13 +99,19 @@ function spawnPair(caseDef) {
   };
 }
 
+// V8 的 JSON.parse 报错文本跨 Node 版本不同：Node 20 是「… at position 1」，
+// Node 22+ 追加坐标「(line 1 column 2)」。坐标系是运行时方言，不是本仓契约，
+// 所以比对前从两侧摘掉，仅保留位置数字；Go 侧一律带坐标，另有单独断言钉住。
+const POSITION_SUFFIX = /\(line \d+ column \d+\)/g;
+const withoutPosition = (buf) => buf.toString().replace(POSITION_SUFFIX, '');
+
 function expectParity(caseDef) {
   const pair = spawnPair(caseDef);
   // 逐字节：先比 Buffer，再比退出码；失败信息用文本形式，便于一眼看出差异。
   expect(pair.go.out.toString(), 'stdout').toBe(pair.js.out.toString());
   expect(pair.go.out.equals(pair.js.out), 'stdout 逐字节').toBe(true);
-  expect(pair.go.err.toString(), 'stderr').toBe(pair.js.err.toString());
-  expect(pair.go.err.equals(pair.js.err), 'stderr 逐字节').toBe(true);
+  expect(withoutPosition(pair.go.err), 'stderr').toBe(withoutPosition(pair.js.err));
+  expect(Buffer.from(withoutPosition(pair.go.err)).equals(Buffer.from(withoutPosition(pair.js.err))), 'stderr 逐字节').toBe(true);
   expect(pair.go.code, 'exit code').toBe(pair.js.code);
   return pair;
 }
@@ -356,7 +362,9 @@ describe('ledger · 子命令', () => {
   });
 
   it('append 不是合法 JSON', () => {
-    expectParity(ledger(['append', '--json'], { stdin: '{oops' }));
+    // 跨 Node 版本只差坐标后缀（见 expectParity 的说明），Go 侧一律带坐标，这里单独钉住。
+    const pair = expectParity(ledger(['append', '--json'], { stdin: '{oops' }));
+    expect(pair.go.err.toString(), 'Go 侧带坐标').toContain('at position 1 (line 1 column 2)');
   });
 
   it('坏账本拒绝继续', () => {
