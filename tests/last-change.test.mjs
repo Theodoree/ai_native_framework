@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { changedFiles } from "../scripts/last-change.mjs";
+import { engineInto } from "./helpers/engine.mjs";
 
 // 门牌的判据是幂等：同一份输入重算两次必须逐字相同，否则它不是派生物。
 // 下面每条都用真 git 区间 + 真 PR 事件跑脚本，只有 workflow 那条把 YAML 里的
@@ -467,6 +468,9 @@ function runWorkflow({ dir, event, body, base, head }) {
   if (!existsSync(join(dir, "node_modules")))
     symlinkSync(join(ROOT, "node_modules"), join(dir, "node_modules"));
   mkdirSync(join(dir, "bin"), { recursive: true });
+  // 门牌的调用点是 Go 引擎：二进制跟着进沙箱，YAML 里那条 cwd 相对的
+  // ./.cache/bin/engine 才能原样执行。
+  engineInto(dir);
   const log = join(dir, "gh.log");
   writeFileSync(log, "");
   const gh = join(dir, "bin", "gh");

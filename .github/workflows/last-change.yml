@@ -27,6 +27,15 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
+      # 判据与门的调用点是 Go 引擎（apps/engine），Node 版脚本留作 parity 对照（tests 两侧同口径）。
+      # 构建入口只有一个：npm run build:engine → .cache/bin/engine（.cache/ 已忽略，产物不进仓库）。
+      # 这一步刻意不写 name：测试沙箱只跑「有 name 的步骤」，构建不该在沙箱里重跑。
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - run: npm run build:engine
+
       # 输入只有宿主事件 + git 区间：提议人/审核人/合并人全取事件字段，不读任何自述身份；
       # 合并日期取事件的 merged_at，脚本里没有时钟。
       # 区间用 ...（merge-base → head），算出来的是这个 PR 自己的改动；
@@ -43,7 +52,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.merged && github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha }}
         run: |
           gh pr view "$NUMBER" --json body --jq .body > body.in.md
-          node scripts/last-change.mjs --in body.in.md --out body.out.md
+          ./.cache/bin/engine last-change --in body.in.md --out body.out.md
 
       # 只在真的不同时写回：同一次输入的第二次运行不改 PR（幂等的可见后果）。
       # render 失败时它没有发布 changed，这一步被跳过 —— 已有字段原样还在。

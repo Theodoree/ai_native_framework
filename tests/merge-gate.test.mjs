@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { renderSection } from "../scripts/last-change.mjs";
+import { engineInto } from "./helpers/engine.mjs";
 
 // 四守卫的判据是「每条能独立失败」：每个用例只坏一条，另外三条必须仍是 PASS。
 // 输入全是文件（脚本里没有网络调用），所以 G3 那种最容易被「看起来绿」骗过的
@@ -44,6 +45,9 @@ function repo(files = { "src/a.mjs": "a\n", "docs/b.md": "b\n" }) {
   // 沙箱里放一份指向真 scripts/ 的链接：YAML 的 run 块写的是仓库相对路径，
   // 原样执行才需要它落在这里。链接在提交之后建，不进门牌证据。
   symlinkSync(SCRIPT_DIR, join(dir, "scripts"), "dir");
+  // 门的调用点是 Go 引擎：.cache/bin/engine 跟着进沙箱，YAML 里那条 cwd 相对的
+  // ./.cache/bin/engine 才能原样执行（换成绝对路径就测不到这条接线了）。
+  engineInto(dir);
   return { dir, head };
 }
 
@@ -640,11 +644,12 @@ test("(d) workflow 真的调用脚本：job 名＝required check 名，取数步
     "infra.json",
   ])
     expect(collect.run).toContain(".gate/" + name);
+  // 判据只在 Go 引擎里：这里钉的是那条 cwd 相对的命令，换回 node 脚本立刻红。
   expect(collect.run).toContain(
-    "node scripts/merge-gate.mjs --event .gate/event.json --pr .gate/pr.json --print-issue",
+    "./.cache/bin/engine merge-gate --event .gate/event.json --pr .gate/pr.json --print-issue",
   );
   expect(stepNamed("gate").run).toBe(
-    "node scripts/merge-gate.mjs --event .gate/event.json --pr .gate/pr.json --issue .gate/issue.json --checks .gate/checks.json --infra .gate/infra.json",
+    "./.cache/bin/engine merge-gate --event .gate/event.json --pr .gate/pr.json --issue .gate/issue.json --checks .gate/checks.json --infra .gate/infra.json",
   );
   // 取数要的权限与 PR head 检出：门牌文件靠 git cat-file 取证，check runs 靠 checks: read。
   expect(wf.permissions).toMatchObject({
