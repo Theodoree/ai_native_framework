@@ -32,33 +32,58 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
-      # 上一次的产物：清单用来按 path + sha256 去重，INFRA 记录用来重试失败路径。
-      # 取不到（首次汇入 / gh 不可用）不算错——脚本把缺失的文件当空集。
+      # 上一次的产物：清单用来按 path + sha256 去重（并继承进本次产物累积），INFRA 记录用来重试失败路径。
+      # 基准只能来自「别的 run」：本 run 自己（attempt 2 的 rerun）已经写过同名 artifact，
+      # 从它取等于从未来取——拿不到就被当成首次汇入，同一个合并于是被汇入两次。
+      # 「取不到」也不许静默：清单没下来就把 base 记成 unknown，脚本据此记 INFRA、不产出可能重复的清单。
       - name: restore previous artifacts
         id: restore
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SELF_RUN: ${{ github.run_id }}
         run: |
-          set -e
-          RUN_ID="$(gh run list --workflow kb-sync.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
-          gh run download "$RUN_ID" --name kb-manifest --dir .kb-out/prev
-          gh run download "$RUN_ID" --name kb-infra --dir .kb-out/prev
+          set -u
+          mkdir -p .kb-out/prev
+          BASE=none
+          RUN_ID="$(gh run list --workflow kb-sync.yml --status success --limit 50 \
+            --json databaseId \
+            --jq "[.[] | select(.databaseId != ${SELF_RUN:-0})][0].databaseId" 2>/dev/null || true)"
+          if [ -n "${RUN_ID:-}" ] && [ "$RUN_ID" != "null" ]; then
+            BASE="$RUN_ID"
+            if ! gh run download "$RUN_ID" --name kb-manifest --dir .kb-out/prev; then
+              echo "::warning title=kb-sync 去重基准取不到::run $RUN_ID 的 kb-manifest 没下载下来，本次按 INFRA 留痕，不产出可能重复的清单"
+              BASE=unknown
+            fi
+            gh run download "$RUN_ID" --name kb-infra --dir .kb-out/prev || true
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### kb-sync 去重基准"
+            echo "- 基准 run：$BASE（none = 首次汇入，unknown = 应该有但没取到）"
+            ls -1 .kb-out/prev 2>/dev/null | sed 's/^/- 取回：/' || true
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: export manifest
         id: export
         continue-on-error: true
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
+          BASE: ${{ steps.restore.outputs.base }}
         run: |
           mkdir -p .kb-out
           set +e
+          # 基准本该存在（base 是 run id 或 unknown）就必须读到：读不到按 INFRA 留痕，
+          # 而不是按空清单去重、把同一份内容再汇入一遍。
+          REQUIRE=""
+          if [ "${BASE:-none}" != "none" ]; then REQUIRE="--require-existing"; fi
           node scripts/kb-export.mjs \
             --repo "$GITHUB_REPOSITORY" \
             --ref "${{ github.ref_name }}" \
             --from "${{ github.event.before }}" \
             --to "${{ github.event.after }}" \
             --existing .kb-out/prev/kb-manifest.yml \
+            $REQUIRE \
             --retry .kb-out/prev/kb-infra.yml \
             --out .kb-out/kb-manifest.yml \
             --infra-out .kb-out/kb-infra.yml
