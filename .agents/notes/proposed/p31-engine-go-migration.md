@@ -161,3 +161,21 @@ PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progres
 - workflow 里仍有内联 `node -e/-p`（取 check runs、拼 JSON），所以运行时依赖 Node 只是变少，没有消失；要归零得把这些也搬到引擎，属 D2。
 - `tests/helpers/engine.mjs` 用 mtime 判新鲜：Go 源比二进制新就重建。时钟异常或跨机器搬运二进制会误判，代价是多一次 `go build`。
 - `cache:false`（与 `check.yml` 现状一致）每次下载 Go 工具链，换来的是不受缓存键漂移影响。
+
+## 十一·补、阶段 D1 的 CI 红：文本扫描器把编译产物当源码读
+
+切到 Go 引擎后 PR #89 的 `check` 红了九条断言，全部一个根：`tests/audit-findings.test.mjs` 的 workflow 扫描器把 `./.cache/bin/engine` 当成被引用的脚本，用 utf8 把 4 MB 二进制读进了判据面。CI 上因此报出 669 条「写结论」violation，`excerpt` 全是乱码；本地同一份代码全绿——本地构建的二进制里没有能命中的字节，于是「同一份判据 + 同一个文件」在两个环境给出相反结论。
+
+判断：文本扫描器读二进制，两个方向都不成立——随机字节可能被当成命中（假红），真写面也可能藏进读不出来的字节里（假绿）。所以正确的修法不是「让本地也红」，而是**这类文件根本不该进文本判据面**。
+
+修法（只改 `tests/audit-findings.test.mjs`）：
+
+- `isBinarySource()`（读前 8 KB，含 NUL 即判二进制）把二进制挡在扫描面外，改记 `binary-source` gap；
+- 该 gap 不计入 violation，也不计入「命中写面的文件」；
+- 新增 `workflowBinarySourceGaps()`，在真仓库用例里断言被跳过的恰好是 `.cache/bin/engine`（只有构建过引擎才做精确断言，未构建不失败）——**跳过不等于没看见**。
+
+学到的三条：
+
+1. 判据的输入面必须先回答「这是不是文本」，否则同一份判据会在不同机器上给出不同答案。CI 红、本地绿这种分歧，多半是环境把判据的某个假设改掉了，而不是环境有 bug。
+2. 变异能证明「断言在承重」，证不了「它读的东西在两个环境里是同一类东西」。
+3. 三组变异留存：`isBinarySource` 恒 false → 1 红；gap 允许计入 violation → 10 红；`stepTexts` 不跳过 → 1 红；还原后 199 绿，整仓 665 绿。
