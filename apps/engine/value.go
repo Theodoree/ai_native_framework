@@ -208,6 +208,71 @@ func (v *Value) Encode() []byte {
 
 func (v *Value) EncodeString() string { return string(v.Encode()) }
 
+// EncodeIndent 生成与 JSON.stringify(value, null, indent) 一致的缩进 JSON：
+// 空数组/空对象仍是 []/{}，每层缩进 indent 个空格，键值之间是 ": "。
+func (v *Value) EncodeIndent(indent int) []byte {
+	var buffer bytes.Buffer
+	writeIndented(&buffer, v, indent, 0)
+	return buffer.Bytes()
+}
+
+func writeIndented(buffer *bytes.Buffer, v *Value, indent, depth int) {
+	switch v.Kind() {
+	case KindArray:
+		if len(v.arr) == 0 {
+			buffer.WriteString("[]")
+			return
+		}
+		buffer.WriteString("[\n")
+		for index, item := range v.arr {
+			if index > 0 {
+				buffer.WriteString(",\n")
+			}
+			writeIndent(buffer, indent, depth+1)
+			writeIndented(buffer, item, indent, depth+1)
+		}
+		buffer.WriteString("\n")
+		writeIndent(buffer, indent, depth)
+		buffer.WriteByte(']')
+	case KindObject:
+		defined := 0
+		for _, value := range v.vals {
+			if value.Kind() != KindUndefined {
+				defined++
+			}
+		}
+		if defined == 0 {
+			buffer.WriteString("{}")
+			return
+		}
+		buffer.WriteString("{\n")
+		wrote := false
+		for index, key := range v.keys {
+			value := v.vals[index]
+			if value.Kind() == KindUndefined {
+				continue
+			}
+			if wrote {
+				buffer.WriteString(",\n")
+			}
+			wrote = true
+			writeIndent(buffer, indent, depth+1)
+			writeString(buffer, key)
+			buffer.WriteString(": ")
+			writeIndented(buffer, value, indent, depth+1)
+		}
+		buffer.WriteString("\n")
+		writeIndent(buffer, indent, depth)
+		buffer.WriteByte('}')
+	default:
+		writeValue(buffer, v)
+	}
+}
+
+func writeIndent(buffer *bytes.Buffer, indent, depth int) {
+	buffer.WriteString(strings.Repeat(" ", indent*depth))
+}
+
 func writeValue(buffer *bytes.Buffer, v *Value) {
 	switch v.Kind() {
 	case KindNull, KindUndefined:
