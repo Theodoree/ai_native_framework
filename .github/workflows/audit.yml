@@ -113,6 +113,11 @@ jobs:
         with:
           node-version: 20
 
+      # routing.mjs 要读 YAML（yaml 是 devDependency）。本机有 node_modules 时
+      # 这条依赖不会显形；CI 里没装，自动审查第一步就崩在 ERR_MODULE_NOT_FOUND。
+      - name: 安装依赖
+        run: npm ci || npm install
+
       # 这一步永不失败：解不出 PR 上下文本身就是一种结论（判不了），
       # 而失败的 step 会让后面所有 step 被跳过、连 Check Run 都写不出去——
       # 于是同一个 sha 上上一轮的 success 原样留着，「这次判不了」退化成「上次判过了」。

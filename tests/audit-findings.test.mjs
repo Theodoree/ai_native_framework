@@ -675,6 +675,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 不是扫描面之外的包装器；真仓库上它同样必须零读者。
   const carrierPayloads = jobPayloads(job, doc);
 
+  // 装依赖要联网，沙箱里没有 lockfile、跑了只有噪声，所以按 name 跳过；
+  // 「跳过」不等于「可以不装」—— 它必须存在这件事由下面的形状断言钉住
+  // （真事件 run 40284427925：audit.yml 从不装依赖，routing.mjs 导入 yaml 直接崩）。
+  const NETWORK_STEPS = new Set(["安装依赖"]);
+
   function sandbox() {
     const dir = mkdtempSync(join(tmpdir(), "audit-wf-"));
     cpSync(join(ROOT, "scripts"), join(dir, "scripts"), { recursive: true });
@@ -1087,6 +1092,7 @@ try {
     for (const step of steps) {
       if (!step.run) continue;
       if (skip.has(step.name)) continue;
+      if (NETWORK_STEPS.has(step.name)) continue;
       if (step.if && !ifMatches(step.if, outputs)) continue;
       writeFileSync(env.GITHUB_OUTPUT, "");
       const stepEnv = { ...env };
@@ -1144,6 +1150,21 @@ try {
 
   const pass = JSON.stringify(result());
   const infra = JSON.stringify(result({ verdict: "INFRA" }));
+
+  // 真事件 run 40284427925 的教训：自动审查第一件事是读 routing.yml（要 YAML），
+  // 而 audit.yml 当时从头到尾没装依赖 —— 本机有 node_modules，所以 198 条用例全绿，
+  // CI 里第一次真跑就崩在 ERR_MODULE_NOT_FOUND: Cannot find package 'yaml'。
+  // 沙箱跳过这条联网步（NETWORK_STEPS），所以它必须被形状断言钉住，否则「跳过」会变成「可以不装」。
+  it("先装依赖：routing.mjs 要读 YAML，不装依赖自动审查第一步就崩", () => {
+    const names = steps.map((s) => s.name);
+    const at = names.indexOf("安装依赖");
+    expect(at, "audit.yml 没有「安装依赖」这一步").toBeGreaterThan(-1);
+    expect(at).toBeGreaterThan(names.indexOf("node"));
+    const install = steps.find((s) => s.name === "安装依赖");
+    expect(install.run).toContain("npm ci");
+    // 装依赖不能带 continue-on-error：装不上就该红，而不是让后面以「判不了」收场。
+    expect(install["continue-on-error"]).toBeUndefined();
+  });
 
   it("全 pass：POST check-runs，conclusion=success，判定步骤退出 0", () => {
     const out = runWorkflow({ AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass });
