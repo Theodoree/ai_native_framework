@@ -113,15 +113,57 @@ test("labeled：非 state 标签不参与「还有别的状态」判断", () => 
   ).toBeNull();
 });
 
-test("labeled：拿不到宿主标签（null）时不当无操作，交给判定器判 INFRA", () => {
+// 真实 issues.labeled 事件里 payload 自带标签、注入文件那一步是 skipped：
+// 两个来源只看得到 payload。这条钉住"事实来源不是注入文件"。
+test("labeled：payload 自带唯一 state 标签、注入缺失 → 仍是无操作", () => {
+  expect(
+    buildIntent({
+      eventName: "issues",
+      action: "labeled",
+      payload: issue(["state:done"], { label: { name: "state:done" } }),
+      actorRole: "ci",
+      issueLabelsFromHost: null,
+    }),
+  ).toBeNull();
+});
+
+test("labeled：payload 没有标签且注入也缺失 → 不当无操作，交给判定器判 INFRA", () => {
   const out = buildIntent({
     eventName: "issues",
     action: "labeled",
-    payload: issue(["state:done"], { label: { name: "state:done" } }),
+    payload: {
+      issue: { number: 7, author_association: "OWNER" },
+      label: { name: "state:done" },
+      sender: { login: "ted" },
+    },
     actorRole: "ci",
     issueLabelsFromHost: null,
   });
   expect(out.to).toBe("done");
+});
+
+// 建单时就带 state 标签：状态已经是它了，打开事件不该再改一次状态
+// （否则真实事件上一次建单会留下「没有从 in-progress 到 accepted 的转换」）。
+test("opened：payload 已带 state 标签 → 不产出意图", () => {
+  expect(
+    buildIntent({
+      eventName: "issues",
+      action: "opened",
+      payload: issue(["state:in-progress"]),
+      defaultFlow: "auto",
+    }),
+  ).toBeNull();
+});
+
+test("opened：没有 state 标签时照旧受理（auto）", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "opened",
+    payload: issue(),
+    defaultFlow: "auto",
+  });
+  expect(out.to).toBe("accepted");
+  expect(out.actor_role).toBe("platform");
 });
 
 test("pull_request.opened → in-progress，归属它引用的 issue", () => {

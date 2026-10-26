@@ -141,24 +141,34 @@ export function buildIntent({
     ...extra,
   });
 
+  // issues.* 事件的 payload 自带被改动 issue 的完整标签集，它就是宿主事实；
+  // 注入文件（ISSUE_STATE_FILE）只在 PR 事件上取得到 —— 实测 issues.labeled 上
+  // 那一步是 skipped，拿文件当唯一依据等于永远拿不到（事件照旧判一次、照旧留痕）。
+  // 两个来源都没有（payload 没这个字段且注入缺失）时不做无操作判断：事实缺失
+  // 交给判定器判 INFRA，不当成「什么都不用做」。
+  const hostLabels = Array.isArray(issue.labels)
+    ? eventLabels
+    : issueLabelsFromHost;
+  const stateLabels = Array.isArray(hostLabels)
+    ? hostLabels.filter((name) => String(name).startsWith("state:"))
+    : null;
+
   // default_flow=auto：新需求直接受理，actor 是平台自己；缺省仍是入库分发。
-  if (eventName === "issues" && action === "opened")
+  // 但建单时就带 state 标签的（状态已经是它了），打开事件不该再改一次状态。
+  if (eventName === "issues" && action === "opened") {
+    if (stateLabels && stateLabels.length > 0) return null;
     return defaultFlow === "auto"
       ? make(issue.number ?? null, "accepted", "platform")
       : make(issue.number ?? null, "triage", "ci");
+  }
   if (eventName === "issues" && action === "labeled") {
     const label = payload.label?.name ?? "";
     if (!label.startsWith("state:")) return null;
-    // 状态就是标签本身：宿主上除这次加上的这个标签以外再没有别的 state 标签，
+    // 状态就是标签本身：除这次加上的这个标签以外再没有别的 state 标签，
     // 说明状态已经是它了 —— 这不是一次转换。写者自己打标签会引发一串标签事件，
     // 不在这里拦住，每个事件都会去判定一次并留下一条「没有从 X 到 X 的转换」。
-    // 拿不到宿主标签（null）时保持原样：事实缺失交给判定器判 INFRA，不当成无操作。
-    if (Array.isArray(issueLabelsFromHost)) {
-      const others = issueLabelsFromHost.filter(
-        (name) => name !== label && name.startsWith("state:"),
-      );
-      if (others.length === 0) return null;
-    }
+    if (stateLabels && stateLabels.length === 1 && stateLabels[0] === label)
+      return null;
     return make(issue.number ?? null, label.slice("state:".length), actorRole);
   }
 
