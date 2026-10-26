@@ -1,6 +1,6 @@
 # P-31 判据与门搬进 Go（进行中）
 
-状态：proposed（人已定方向，分四阶段落地；阶段 A、B 已完成并合入，C / D 未做）
+状态：proposed（人已定方向，分四阶段落地；阶段 A、B、C 已完成并合入，D 未做（只剩删 .mjs、改 package.json 与 workflow、parity 转 golden））
 
 ## 一、为什么做
 
@@ -75,3 +75,49 @@
 
 **阶段 C 的耦合点（先说清，免得改错）**：`merge-gate.mjs` 是 **import 这三个 .mjs 的导出函数**（`buildIntent`/`resolveIssueRefs`/`renderSection`/`recordBody`），不是调 CLI —— Go 侧已有同名导出，阶段 C 是把 merge-gate 改成调库，入口契约不经过命令行。另：last-change 的 git 命令别换 plumbing（`-z` 等），`core.quotePath=true` 会把非 ASCII 路径转八进制转义，两侧逐字节一致正是靠它；writer-record 的退出码是「判定结论 × 评论成功」的合成，infra 评论成功仍退 1，不是可重试信号；`GITHUB_OUTPUT` 是追加写。
 **运行时方言第二次咬人（与阶段 A 同一类，这次的载体是 stderr 文案）**：last-change 的「EVENT 非法 JSON」用例本地（Node 24）全绿、CI（Node 20）红——JSON.parse 的坐标后缀 (line 1 column 2) 只在 Node 22+ 出现。修法与阶段 A 同口径：比对前把坐标后缀从两侧摘掉（位置数字仍比），并**单独断言 Go 侧一律带坐标**，避免「两边都摘」退化成什么都没比。判断：凡是把 JSON.parse 的消息写进输出面的入口，都按这条办。
+
+## 九、同步到 main 时暴露的一个状态机缺口（未修，登记）
+
+阶段 B 的 PR #83 基分支误设为 `develop`：GitHub 只在**指向默认分支**时自动关单，main 也就没快进。补的同步 PR #84（`develop → main`）又踩到第二层：门 G1 需要一个**还能被合并带到 done 的 issue**，而 #82 已被写者带到 `state:done`，门如实报 `E_TERMINAL_STATE 终态 done 不能再转换`。于是单独开 #85 作为同步单。
+
+PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progress`。原因查清：写者的意图表**只认 `issues.opened` 与 `issues.labeled`**（`scripts/build-intent.mjs:158`、`:164`，Go 侧同源），`issues.closed` 不产生意图；而 PR 关闭事件（`pull_request.closed && merged` → done）与 GitHub 的自动关单几乎同时发生，谁先谁后不确定。结果是「关单是平台外的动作，状态标签是平台内的记录」这两件事在时间上脱钩。
+
+不在这里手工改标签：状态只有一个写者，绕过写者改标签等于把契约当建议。这条缺口留给后续（要么给 `issues.closed` 建意图，要么把自动关单从平台外挪进写者）。当前状态如实写在 PR/issue 里，读的人能看到。
+
+## 十、阶段 C 落地记录（merge-gate）
+
+**派了两次**：第一次的执行器中途失败、零改动、无收尾消息（`git status` 空）；按 R6 重派一次并加约束「每完成一步就记一行」，第二次正常交付。这类「静默失败」只能靠工作树有没有变来发现，靠回合数等不出来。
+
+**交付物**：`apps/engine/mergegate.go`（新增 800 行：四守卫 G1 issue-state / G2 refs-and-files / G3 checks / G4 last-change，加 collect/report/fail 与 `RunMergeGate`）；`apps/engine/cli.go`（+3 行：`merge-gate` 子命令）；`apps/engine/README.md`；`tests/engine-parity-c.test.mjs`（439 行，46 用例，假 git/假 gh 双替身）。`scripts/*.mjs`、`package.json`、`.github/**`、`apps/api-go/**`、`apps/web-vue/**` 一个字节都没动。
+
+**耦合点全部进程内**：`LoadConfig` + `ConsultTransition` / `RenderLastChange` / `ResolveIssueRefs` + `issueRefsValue`，整条路径不起 node 子进程，外部工具只剩 `git` 的两条 `cat-file -e`。这正是阶段 A 之后 api-go 已经达到的形态，阶段 C 把门也拉到同一形态。
+
+**唯一不做逐字节对照的地方**：JS 未捕获异常的多行栈（G1 的 labels 不是数组时 Node 打 `TypeError: ... is not a function` 加栈帧）。Go 只打首行。一致的契约降到「stdout 一个字节都没有 + 退出码 1」，这条写进了 parity 用例名与 README。
+
+**我的独立变异（五组，就地改 + /tmp 备份 + 先打印改后行 + 恢复）**：
+
+| # | 变异 | 红数 |
+| --- | --- | --- |
+| A | `mergegate.go:276` `mergeGateNewest` 的 `>=` → `>`（平手取先出现的那条） | **0 红（漏了）** |
+| B | `mergegate.go:449` `!strictEqual(sha, ctx.head)` → `!strictEqual(sha, sha)`（stale 永不成立） | 1 红 |
+| C | `mergegate.go:318` `len(refs) != 1` → `len(refs) < 1`（放过多个引用） | 1 红 |
+| D | `mergegate.go:353` 咨询 `to:"done"` → `to:"in-progress"`（G1 目标状态错） | 30 红 |
+| E | `mergegate.go:727` 汇总行「未就绪=」→「未完成=」 | 28 红 |
+
+**A 是这一轮唯一抓到的缺口，根因是夹具 id 全不等**：`newest` 在 JS 里是 `(a,b) => Number(b?.id ?? 0) >= Number(a?.id ?? 0) ? b : a`，平手取**后**出现的那条；交付方的 45 个夹具里没有一条让两条同名 check 的 id 相等，于是 `>=` 与 `>` 在测试面上不可区分。补的夹具是「两条 `render`，id 都是 2，前一条 completed/success、后一条 in_progress」——JS 取后者 → `E_LAST_CHANGE_PENDING`/exit 3；改成 `>` 取前者 → 直接放行。补完后 A 变 1 红，恢复 47 全绿（46 + 新增 1）。
+
+**教训**：同名取最新这类判据，夹具必须同时覆盖「id 不等」和「id 相等」两种形状——只盖不等的话，比较符号写反、写成 `>`、写成字典序都测不出来。这跟阶段 B 的「单守卫夹具盖不到多守卫拼接」是同一类：**夹具形状的单一性，等于判据半个身子没被测**。
+
+**顺手清掉一条 lint**：`tests/engine-parity-c.test.mjs:145` 的 `...(spec.env ?? {})` → `...spec.env`（oxlint 的 no-useless-fallback-in-spread）。`npx oxlint scripts tests` 回到 3 warnings，全部是 `tests/audit-findings.test.mjs` 的既有正则转义噪声。
+
+**交付方照实登记、我复核认可的 JS 侧可疑之处（未改 scripts/，因为对照物必须保持原样）**：
+
+1. **G3 不排除生产者 `render`**：G2/G4 把 render 当「门牌还没就绪」（infra/3），G3 却把它当「别人家的 check」判真失败（1）。于是 render 自己失败时整笔是 exit 1 且同时出现 INFRA 与 FAIL 两种结论，语义上「无法判定」被降级成「真失败」。
+2. **G2 先查生产者再查 issue 引用**：于是「PR 正文既不引用 issue、门牌也没写完」报的是 `E_ISSUE_REFS`（真失败）而不是 `E_LAST_CHANGE_MISSING`（未就绪）。
+3. **`--head` 恒优先于 `--pr` 的 head**：事件快照旧、现况文件新时，G3 的 stale 判断会拿旧 head 去比。
+4. **`readJson` 用 `!path` 判「没提供」**：`--issue ""` 被当成没给，报「没有提供」而不是「读不到」。
+5. **`resolvePrIssue` 只在 body 解析为空时才看 title**：body 有一个引用、title 另一个时不报「多个引用」。
+6. **同名「最新」按 id 数值比**，不是时间戳；id 若来自不同来源不保证单调；平手取后出现的那条。
+
+**运行时方言第三次咬人（这次是 stdout 里的 JSON.parse 文案）**：本地 Node 24 的 JSON.parse 报错带 (line L column C)，CI 的 Node 20 不带，于是 E_EVENT_UNPARSABLE 与 E_INPUT_UNPARSABLE 两个夹具在 CI 红、本地绿。修法与阶段 A/B 同口径：比对前把坐标后缀从两侧摘掉（position N 的数字仍比），并**单独断言「Go 侧只要报了 at position 就必须带坐标」**——否则两侧都摘成空等于什么都没比。代价是 line/column 的数值不再参与比较（实测：把 column 改 +1 仍绿，把 column 写成 col 则 2 红），position 的数值仍比。
+这些都在 parity 夹具里以「照原样复刻」的形式钉住了——**先复刻再议**，改语义是另一件事（阶段 D 之后再单独决定）。
