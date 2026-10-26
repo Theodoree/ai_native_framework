@@ -11,6 +11,9 @@
 // pull_request.* 事件的 payload 里没有被引用 issue 的标签（那里只有 PR 自己的），
 // issue 的当前状态必须由宿主取数后注入（ISSUE_STATE_FILE）。本脚本不联网：
 // 它只消费注入的事实，注入缺失就如实报「状态未知」，绝不把缺席读成 none。
+//
+// 守卫证据同理（GUARD_EVIDENCE_FILE）：merge-gate 的结论只存在于宿主的 check run 上，
+// 意图产地没有资格替它作证，所以这里只做透传 —— 不判断证据真假，也不认识任何具体守卫名。
 
 import { appendFileSync, readFileSync } from "node:fs";
 import YAML from "yaml";
@@ -66,6 +69,34 @@ export function readIssueLabels(path) {
     .filter((name) => typeof name === "string" && name.length > 0);
 }
 
+// 宿主的守卫证据：`{"merge-gate":"check run 890 merge-gate success on <sha>（PR #42 已合并）"}`。
+// 返回 null 表示「没有可用证据」：文件不存在 / 空 / 不是 JSON 对象 / 值不是非空字符串。
+// 为什么整份丢弃而不是只删坏的那个键：判定器要求每个声明的守卫都有证据，半份证据在它
+// 眼里与没有证据等价；而按某个具体守卫名裁剪，等于在脚本里又抄了一份声明。
+// 合法对象原样透传：内容真假归判定器，归陈述的那一方，不归归一化这一步。
+export function readGuardEvidence(path) {
+  if (!path) return null;
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  if (!String(raw).trim()) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    return null;
+  const entries = Object.entries(parsed);
+  if (entries.length === 0) return null;
+  if (entries.some(([, v]) => typeof v !== "string" || !v.trim())) return null;
+  return parsed;
+}
+
 // body 优先；body 一个都没写才看 title（title 兜底），不把两处结果相加。
 function resolvePrIssue(pr) {
   const inBody = resolveIssueRefs(pr.body);
@@ -89,6 +120,7 @@ export function buildIntent({
   actorRole,
   defaultFlow,
   issueLabelsFromHost = null,
+  guardEvidence = null,
 }) {
   const issue = payload.issue ?? {};
   const pr = payload.pull_request ?? {};
@@ -129,9 +161,15 @@ export function buildIntent({
           : null;
     if (!to) return null; // 关而未合并：不动状态（取消由 owner 裁决）
     const resolved = resolvePrIssue(pr);
+    // 守卫证据只属于 PR 事件：它描述的是「这条 PR 的合并被守卫放行」，
+    // 一个 issues.* 事件既没有对应的事实，形状也必须与改动前一致（不带 guards 键）。
+    const guard = guardEvidence ? { guards: guardEvidence } : {};
     // 解不出 issue：原样交出去，由判定器判 INFRA。
     if (resolved.issue === null)
-      return make(null, to, "ci", { unresolved: resolved.unresolved });
+      return make(null, to, "ci", {
+        unresolved: resolved.unresolved,
+        ...guard,
+      });
     // 解出了 issue 但宿主没交来它的当前状态：这不是 shape 错误，是「事实缺失」。
     // 交出去判 INFRA，绝不退回 payload 里的 PR 标签或 none。
     if (issueLabelsFromHost === null)
@@ -144,10 +182,11 @@ export function buildIntent({
             reason: "issue-state-unavailable",
             candidates: [resolved.issue],
           },
+          ...guard,
         },
         [],
       );
-    return make(resolved.issue, to, "ci", {}, issueLabelsFromHost);
+    return make(resolved.issue, to, "ci", guard, issueLabelsFromHost);
   }
   return null;
 }
@@ -199,6 +238,7 @@ function main() {
     actorRole: roleFromAssociation(association),
     defaultFlow: process.env.DEFAULT_FLOW ?? defaultFlowFromDeclaration(),
     issueLabelsFromHost: readIssueLabels(process.env.ISSUE_STATE_FILE),
+    guardEvidence: readGuardEvidence(process.env.GUARD_EVIDENCE_FILE),
   });
   if (!intent) {
     publishHasIntent(false);

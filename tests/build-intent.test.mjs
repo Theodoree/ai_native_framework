@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildIntent,
+  readGuardEvidence,
   readIssueLabels,
   resolveIssueRefs,
   roleFromAssociation,
@@ -360,7 +361,9 @@ test("issues.* 事件不用注入：payload 自带标签（回归）", () => {
   const out = buildIntent({
     eventName: "issues",
     action: "labeled",
-    payload: issue(["state:accepted"], { label: { name: "state:in-progress" } }),
+    payload: issue(["state:accepted"], {
+      label: { name: "state:in-progress" },
+    }),
     actorRole: "owner",
     issueLabelsFromHost: null,
   });
@@ -398,9 +401,13 @@ const stateFile = (body) => {
 };
 
 test("CLI：(a) 注入 accepted → 判定 allowed（exit 0），from 来自注入而不是 payload", () => {
-  const r = runCli("pull_request", { ...realPr(), action: "opened" }, {
-    ISSUE_STATE_FILE: stateFile('{"labels":["state:accepted"]}'),
-  });
+  const r = runCli(
+    "pull_request",
+    { ...realPr(), action: "opened" },
+    {
+      ISSUE_STATE_FILE: stateFile('{"labels":["state:accepted"]}'),
+    },
+  );
   expect(r.status).toBe(0);
   const intent = JSON.parse(r.stdout);
   expect(intent).toMatchObject({
@@ -418,9 +425,13 @@ test("CLI：(a) 注入 accepted → 判定 allowed（exit 0），from 来自注�
 });
 
 test("CLI：(b) 注入终态 done → rejected E_TERMINAL_STATE（exit 1），issue 仍是 1", () => {
-  const r = runCli("pull_request", { ...realPr(), action: "opened" }, {
-    ISSUE_STATE_FILE: stateFile('{"labels":["state:done"]}'),
-  });
+  const r = runCli(
+    "pull_request",
+    { ...realPr(), action: "opened" },
+    {
+      ISSUE_STATE_FILE: stateFile('{"labels":["state:done"]}'),
+    },
+  );
   const intent = JSON.parse(r.stdout);
   expect(intent.issue).toBe(1);
   const v = validateStdin(r.stdout);
@@ -500,4 +511,166 @@ test("wiring：validate/apply/record 都以 has_intent 为闸门", () => {
     "steps.intent.outputs.has_intent == '1' && steps.validate.outputs.exit != '0'",
   );
   expect(yml).not.toContain("no state change");
+});
+
+// ---- 守卫证据（P-21 回归）：证据只由宿主注入，脚本只透传，不判断真假 ----
+
+const guardFile = (body) => {
+  const path = join(
+    mkdtempSync(join(tmpdir(), "guard-evidence-")),
+    "guard-evidence.json",
+  );
+  writeFileSync(path, body);
+  return path;
+};
+
+const GUARD = {
+  "merge-gate":
+    "check run 890 merge-gate success on abc123def（PR #42 已合并）",
+};
+
+// 真 PR #42 的形状：closed 且 merged，引用 issue #1，issue 当前是 in-progress，
+// 于是「in-progress → done」这条唯一声明了 merge-gate 的转换被命中。
+const mergedPr = () =>
+  prWith({
+    number: 42,
+    merged: true,
+    body: "Fixes #1",
+    title: "fix: 状态机真回归",
+    head: { sha: "abc123def" },
+  });
+
+const doneIntentCli = (extraEnv = {}) =>
+  runCli(
+    "pull_request",
+    { ...mergedPr(), action: "closed" },
+    {
+      ISSUE_STATE_FILE: stateFile('{"labels":["state:in-progress"]}'),
+      ...extraEnv,
+    },
+  );
+
+test("readGuardEvidence：不是合法对象就当没证据，合法对象原样返回", () => {
+  const dir = mkdtempSync(join(tmpdir(), "guard-read-"));
+  expect(readGuardEvidence(undefined)).toBeNull();
+  expect(readGuardEvidence(join(dir, "missing.json"))).toBeNull();
+  expect(readGuardEvidence(guardFile(""))).toBeNull();
+  expect(readGuardEvidence(guardFile("   \n"))).toBeNull();
+  expect(readGuardEvidence(guardFile("not json"))).toBeNull();
+  expect(readGuardEvidence(guardFile("null"))).toBeNull();
+  expect(readGuardEvidence(guardFile("[]"))).toBeNull();
+  expect(readGuardEvidence(guardFile("{}"))).toBeNull();
+  // 值是空字符串 / 空白串 / 非字符串：整份丢弃，不做逐条裁剪
+  expect(readGuardEvidence(guardFile('{"merge-gate":""}'))).toBeNull();
+  expect(readGuardEvidence(guardFile('{"merge-gate":"   "}'))).toBeNull();
+  expect(readGuardEvidence(guardFile('{"merge-gate":true}'))).toBeNull();
+  expect(
+    readGuardEvidence(guardFile('{"merge-gate":"ok","other":3}')),
+  ).toBeNull();
+  // 合法的原样透传：不认识的守卫名也照收，内容真假不归这里判
+  expect(
+    readGuardEvidence(guardFile(JSON.stringify({ "some-gate": "证据一" }))),
+  ).toEqual({ "some-gate": "证据一" });
+  expect(readGuardEvidence(guardFile(JSON.stringify(GUARD)))).toEqual(GUARD);
+});
+
+test("(a) 有合法证据：intent.guards 原样出现，真实判定器 allowed 且回传同一份证据", () => {
+  const r = doneIntentCli({
+    GUARD_EVIDENCE_FILE: guardFile(JSON.stringify(GUARD)),
+  });
+  expect(r.status).toBe(0);
+  const intent = JSON.parse(r.stdout);
+  expect(intent).toMatchObject({ issue: 1, to: "done", actor_role: "ci" });
+  expect(intent.guards).toEqual(GUARD);
+
+  // 不 mock 判定器：真实 validateIntent + 真实 state-machine.yml
+  const verdict = validateIntent(loadConfig(CONFIG), intent);
+  expect(verdict).toMatchObject({ from: "in-progress", to: "done", by: "ci" });
+  expect(verdict.guards).toEqual(GUARD);
+});
+
+test("(b) 没有可用证据：intent 里连 guards 键都没有，真实判定器 reject E_GUARD_MISSING", () => {
+  const variants = {
+    文件不存在: join(mkdtempSync(join(tmpdir(), "guard-none-")), "none.json"),
+    空文件: guardFile(""),
+    "坏 JSON": guardFile("{oops"),
+    值非字符串: guardFile('{"merge-gate":["x"]}'),
+    值是空白串: guardFile('{"merge-gate":"  "}'),
+  };
+  for (const [name, path] of Object.entries(variants)) {
+    const out = buildIntent({
+      eventName: "pull_request",
+      action: "closed",
+      payload: mergedPr(),
+      issueLabelsFromHost: ["state:in-progress"],
+      guardEvidence: readGuardEvidence(path),
+    });
+    expect(out.to, name).toBe("done");
+    // 形状与改动前一致：不是 "guards 为空"，而是根本没有这个键
+    expect("guards" in out, name).toBe(false);
+    let error;
+    try {
+      validateIntent(loadConfig(CONFIG), out);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error?.kind, name).toBe("rejected");
+    expect(error?.code, name).toBe("E_GUARD_MISSING");
+  }
+
+  // 同一事实走 CLI（真 PR #42 的形状）：没有注入就没有 guards，判定结果就是真跑出来的那条
+  const r = doneIntentCli();
+  expect(r.status).toBe(0);
+  const intent = JSON.parse(r.stdout);
+  expect("guards" in intent).toBe(false);
+  const v = validateStdin(r.stdout);
+  expect(v.status).toBe(1);
+  expect(JSON.parse(v.stdout)).toMatchObject({
+    verdict: "rejected",
+    code: "E_GUARD_MISSING",
+    from: "in-progress",
+    to: "done",
+  });
+});
+
+test("issues.* 事件与 --resolve-issue 一律不带 guards（即使宿主塞了证据）", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "labeled",
+    payload: issue(["state:analyzing"], { label: { name: "state:accepted" } }),
+    actorRole: "owner",
+    guardEvidence: GUARD,
+  });
+  expect(out.to).toBe("accepted");
+  expect("guards" in out).toBe(false);
+
+  const r = runCli(
+    "issues",
+    {
+      action: "labeled",
+      issue: {
+        number: 7,
+        labels: [{ name: "state:analyzing" }],
+        author_association: "OWNER",
+      },
+      label: { name: "state:accepted" },
+      sender: { login: "ted" },
+    },
+    { GUARD_EVIDENCE_FILE: guardFile(JSON.stringify(GUARD)) },
+  );
+  expect("guards" in JSON.parse(r.stdout)).toBe(false);
+
+  const resolved = spawnSync(
+    process.execPath,
+    ["scripts/build-intent.mjs", "--resolve-issue"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        EVENT: JSON.stringify(mergedPr()),
+        GUARD_EVIDENCE_FILE: guardFile(JSON.stringify(GUARD)),
+      },
+    },
+  );
+  expect(resolved.stdout).toBe("1\n");
 });
