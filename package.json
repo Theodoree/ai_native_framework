@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "AI 原生研发交付引擎：issue 即状态，PR 即交付，证据可复算",
   "scripts": {
     "check": "npm run check:state && npm run lint && npm test && npm run check:go && npm run check:web",
     "check:state": "node scripts/state-validate.mjs --check-config",
@@ -17,12 +18,10 @@
     "web:build": "npm --prefix apps/web-vue run build",
     "web:dist": "node scripts/copy-dist.mjs"
   },
-  "dependencies": {
-    "yaml": "^2.5.0"
-  },
   "devDependencies": {
     "oxlint": "^0.16.0",
     "prettier": "^3.3.0",
-    "vitest": "^2.1.0"
+    "vitest": "^2.1.0",
+    "yaml": "^2.5.0"
   }
 }
