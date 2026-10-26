@@ -350,6 +350,122 @@ describe("verdict：--to 原样转发，--role 缺省 owner", () => {
   });
 });
 
+describe("verdict --guard：守卫证据原样进 body.guards", () => {
+  const doneRoute = () => ({
+    "/api/verdict": () => ({
+      status: 200,
+      json: { id: "REQ-40", from: "in-progress", to: "done", by: "ci" },
+    }),
+  });
+
+  test("--guard merge-gate=… 出现在 body.guards，证据里的 = 不被截断", async () => {
+    const backend = await startBackend(doneRoute());
+    const evidence = "merge-gate PASS 4/4 PR #40 (k=v)";
+    const r = await runCli([
+      "verdict",
+      "--id",
+      "REQ-40",
+      "--to",
+      "done",
+      "--role",
+      "ci",
+      "--guard",
+      `merge-gate=${evidence}`,
+      "--api",
+      backend.url,
+    ]);
+
+    expect(r.code).toBe(0);
+    expect(backend.requests[0].body).toEqual({
+      id: "REQ-40",
+      to: "done",
+      actor_role: "ci",
+      comment: "",
+      guards: { "merge-gate": evidence },
+    });
+  });
+
+  test("--guard 可重复：两个 --guard 合并成一个对象", async () => {
+    const backend = await startBackend(doneRoute());
+    const r = await runCli([
+      "verdict",
+      "--id",
+      "REQ-40",
+      "--to",
+      "done",
+      "--role",
+      "ci",
+      "--guard",
+      "merge-gate=PASS",
+      "--guard",
+      "audit-contract=24/24",
+      "--api",
+      backend.url,
+    ]);
+
+    expect(r.code).toBe(0);
+    expect(backend.requests[0].body.guards).toEqual({
+      "merge-gate": "PASS",
+      "audit-contract": "24/24",
+    });
+  });
+
+  test("--guard 缺 = → 退出 2，零请求", async () => {
+    const backend = await startBackend(doneRoute());
+    const r = await runCli([
+      "verdict",
+      "--id",
+      "REQ-40",
+      "--to",
+      "done",
+      "--guard",
+      "merge-gate",
+      "--api",
+      backend.url,
+    ]);
+
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("name=evidence");
+    expect(backend.requests).toHaveLength(0);
+  });
+
+  test("--guard 的 name 为空 → 退出 2，零请求", async () => {
+    const backend = await startBackend(doneRoute());
+    const r = await runCli([
+      "verdict",
+      "--id",
+      "REQ-40",
+      "--to",
+      "done",
+      "--guard",
+      "=PASS",
+      "--api",
+      backend.url,
+    ]);
+
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("name 不能为空");
+    expect(backend.requests).toHaveLength(0);
+  });
+
+  test("一次 --guard 都没给 → body 里没有 guards 字段", async () => {
+    const backend = await startBackend(doneRoute());
+    const r = await runCli([
+      "verdict",
+      "--id",
+      "REQ-40",
+      "--to",
+      "done",
+      "--api",
+      backend.url,
+    ]);
+
+    expect(r.code).toBe(0);
+    expect(Object.hasOwn(backend.requests[0].body, "guards")).toBe(false);
+    expect(r.stdout).not.toContain("guards");
+  });
+});
+
 describe("verify：exitCode 与输出尾部", () => {
   test("--json 给全部输出，人读最多 20 行尾部", async () => {
     const output = Array.from(

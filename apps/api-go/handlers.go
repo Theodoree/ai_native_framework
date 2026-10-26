@@ -241,6 +241,11 @@ func (a *app) handleVerdict(w http.ResponseWriter, r *http.Request) {
 		actorRole = "owner"
 	}
 	comment := stringField(body, "comment")
+	guards, err := guardsField(body)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -285,6 +290,7 @@ func (a *app) handleVerdict(w http.ResponseWriter, r *http.Request) {
 		To:        to,
 		ActorRole: actorRole,
 		Comment:   comment,
+		Guards:    guards,
 	})
 	if err != nil {
 		a.fail(w, err)
@@ -298,6 +304,8 @@ func (a *app) handleVerdict(w http.ResponseWriter, r *http.Request) {
 		By:      verdict.By,
 		Flow:    verdict.Flow,
 		Comment: comment,
+		// 落账的守卫证据来自判定结果，不是请求体：只有判定器采纳过的证据才进账本。
+		Guards: verdict.Guards,
 	})
 	if err != nil {
 		a.fail(w, err)

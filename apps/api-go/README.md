@@ -214,11 +214,15 @@ cd ../.. && npm run check   # 链尾的 check:go = gofmt 干净 + go vet + go te
 
 标题（trim 后）为空 → 409 §E_TITLE_REQUIRED§。落到哪个状态、由谁触发，取自声明：§ledger-cli entry§ 给出 §{to,by}§，再交给判定器确认；Go 不做 flow 分支。
 
-### §POST /api/verdict§ · body §{"id","to","actor_role","comment"}§ → 200 <新事件对象>
+### §POST /api/verdict§ · body §{"id","to","actor_role","comment","guards"}§ → 200 <新事件对象>
+
+§guards§ 可选：守卫名 → 证据字符串，原样交给判定器（§{"merge-gate":"merge-gate PASS 4/4"}§）。
 
 - 账本里没有该 §id§ → 409 §E_ITEM_MISSING§
-- 判定器拒绝 → 409，§code/message/extra§ 原样透传（例如 §E_NO_TRANSITION§、§E_COMMENT_REQUIRED§、§E_TERMINAL_STATE§）
+- 判定器拒绝 → 409，§code/message/extra§ 原样透传（例如 §E_NO_TRANSITION§、§E_COMMENT_REQUIRED§、§E_TERMINAL_STATE§、§E_GUARD_MISSING§）
 - 判定器判 infra（例如未知状态、未知角色）→ 500，同样原样透传
+- §guards§ 形状不是「对象 + 每值字符串」（数组、数字、嵌套对象、某个值是 §null§）→ 500 §E_GUARD_SHAPE§，§extra§ 为 §{}§；不静默忽略、不强转、不落账本。整个 §guards§ 字段显式给 §null§ 与「没给」等价（与判定器的 §?? null§ 语义一致），不是形状错
+- 判定被拒时账本一行不加；allowed 时事件带上判定器采纳的 §guards§（§omitempty§：没有证据的事件不多出这个字段）
 
 ### §POST /api/verify§ → 200 §{"exitCode": <int|null>, "output": <末尾 8000 字符>}§
 
@@ -254,9 +258,10 @@ node scripts/state-validate.mjs --json --intent -      # 意图 JSON 从 stdin �
 node scripts/state-validate.mjs --json --check-config --config <path>
 ```
 
-- stdin：一个意图对象 §{"labels": [], "to": "<状态>", "actor_role": "<角色>", "comment": "<可选>"}§
+- stdin：一个意图对象 §{"labels": [], "to": "<状态>", "actor_role": "<角色>", "comment": "<可选>", "guards": {"<守卫名>": "<证据>"}}§
 - stdout：一行 §{"verdict":"allowed|rejected|infra","code","message", ...extra}§
-  - §allowed§ 的 extra 含 §from/to/by/flow/event§
+  - §allowed§ 的 extra 含 §from/to/by/flow/event§，转换声明了 §guards§ 时还含 §guards§（采纳的证据）；未声明时不出现该键
+  - 转换声明了 §guards§ 而证据缺失 → §rejected§ §E_GUARD_MISSING§；§guards§ 形状错 → §infra§ §E_GUARD_SHAPE§
   - §rejected/infra§ 的 extra 含判定器给出的细节
 - 退出码：§0§ allowed · §1§ rejected · §3§ infra
 

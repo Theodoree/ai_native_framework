@@ -366,11 +366,30 @@ async function createItem(title: string, body: string): Promise<boolean> {
   return true;
 }
 
+// 守卫证据只做「收与传」：值 trim 后为空的键丢掉，一个都不剩就当没填。
+// 「缺证据」必须由后端判（E_GUARD_MISSING），前端不替它决定、也不伪造占位值。
+function guardEvidence(
+  guards: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (guards === undefined) return undefined;
+  const kept: Record<string, string> = {};
+  let count = 0;
+  for (const [name, value] of Object.entries(guards)) {
+    const key = name.trim();
+    const evidence = value.trim();
+    if (key === "" || evidence === "") continue;
+    kept[key] = evidence;
+    count += 1;
+  }
+  return count > 0 ? kept : undefined;
+}
+
 async function submitVerdict(input: {
   id: string;
   to: string;
   actorRole: string;
   comment: string;
+  guards?: Record<string, string>;
 }): Promise<boolean> {
   state.verdict.pending = true;
   state.verdict.failure = null;
@@ -380,6 +399,7 @@ async function submitVerdict(input: {
     to: input.to,
     actor_role: input.actorRole,
     comment: input.comment,
+    guards: guardEvidence(input.guards),
   });
   state.verdict.pending = false;
   if (!result.ok) {

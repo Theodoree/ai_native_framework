@@ -104,17 +104,17 @@ npm run dev -- --port 5399
 
 ## 后端契约（前端只按这个说话）
 
-| 方法 | 路径           | 请求                              | 响应                                                                   |
-| ---- | -------------- | --------------------------------- | ---------------------------------------------------------------------- |
-| GET  | `/api/board`   | —                                 | `{ items, config: { defaultFlow, labelPrefix, states, transitions } }` |
-| GET  | `/api/events`  | —                                 | `{ events }`                                                           |
-| GET  | `/api/config`  | —                                 | `{ text }`                                                             |
-| PUT  | `/api/config`  | `{ text }`                        | `{ ok: true }`                                                         |
-| POST | `/api/item`    | `{ title, body }`                 | 事件对象                                                               |
-| POST | `/api/verdict` | `{ id, to, actor_role, comment }` | 事件对象                                                               |
-| POST | `/api/verify`  | `{}`                              | `{ exitCode, output }`                                                 |
-| GET  | `/api/kb`      | —                                 | `{ items, count, builtAt }`                                            |
-| GET  | `/api/kb/item` | `?path=<仓库相对路径>`            | `{ path, sha256, bytes, text }`                                        |
+| 方法 | 路径           | 请求                                       | 响应                                                                   |
+| ---- | -------------- | ------------------------------------------ | ---------------------------------------------------------------------- |
+| GET  | `/api/board`   | —                                          | `{ items, config: { defaultFlow, labelPrefix, states, transitions } }` |
+| GET  | `/api/events`  | —                                          | `{ events }`                                                           |
+| GET  | `/api/config`  | —                                          | `{ text }`                                                             |
+| PUT  | `/api/config`  | `{ text }`                                 | `{ ok: true }`                                                         |
+| POST | `/api/item`    | `{ title, body }`                          | 事件对象                                                               |
+| POST | `/api/verdict` | `{ id, to, actor_role, comment, guards? }` | 事件对象                                                               |
+| POST | `/api/verify`  | `{}`                                       | `{ exitCode, output }`                                                 |
+| GET  | `/api/kb`      | —                                          | `{ items, count, builtAt }`                                            |
+| GET  | `/api/kb/item` | `?path=<仓库相对路径>`                     | `{ path, sha256, bytes, text }`                                        |
 
 错误统一 `{ kind: "rejected" | "infra", code, message, extra }`：rejected → HTTP 409，infra → 500。
 知识库的路径拒绝是例外码：`/api/kb/item` 越界或条目不存在时是 `kind=rejected`、`code=E_KB_PATH`，HTTP 400 或 404。
@@ -129,6 +129,9 @@ item 的状态字段 `state` 与 `to` 两种都认。
 2. **流转**：目标状态只从 `config.transitions`（含通配 `*`）里取候选（选目标后把该条声明的
    `by` 填进 `actor_role` 作为建议，但输入框可手填任意角色——合法角色集合是后端知识）；
    声明要求 comment 只用文字提示、不拦提交；409 原样留在详情面板里（`kind`/`code`/`message`/`extra`）。
+   转换声明里的 `guards`（如 `merge-gate`）照原样读进 `BoardTransition.guards`，选中目标后按 guard 名渲染证据输入框；
+   证据表 `{ "<guard 名>": "<字符串>" }` 只在至少一个键的值 trim 后非空时才随请求发出，否则请求体里**没有** `guards` 这个键——
+   「缺证据」由后端判（`E_GUARD_MISSING`），前端既不补占位值、也不在本地拦提交。
 3. **声明保存**：前端不解析 YAML、不校验；服务器拒绝时把 `code`/`message` 原样贴出。
 
 ## 已知取舍
@@ -139,6 +142,8 @@ item 的状态字段 `state` 与 `to` 两种都认。
 - 看板是 `v-row`/`v-col` + `v-card` 的分列，**没有**为 `v-data-table` 把九种字段塞成表格——
   看板要的是「一列一个状态」的空间结构，表格会把这层语义抹掉。
 - 看板不做拖拽换列——换状态只能走「流转」，避免前端伪造状态。
+- 守卫证据不做前端校验：内容真假、够不够，平台一律不认，前端只负责收集与呈递；证据输入框按 guard 名存值，
+  换目标不清空，返回时还在。
 - 状态机图是只读视图：不放编辑手柄，改结构走「声明编辑」后刷新。
 - 时间线只读（事件是 append-only 账本），不做删除/重放。
 - 时间线读 `GET /api/events`。后端没起或路由缺失时，界面会原样显示
