@@ -318,14 +318,29 @@ export function assess({ a, b } = {}) {
   // 槽内已经校验「自报的执行器 == 所在槽」，但槽间没有人管：两个槽都自报同一个执行器时，
   // 双执行器独立比对的前提就没了 —— 一份意见会被记成两票，比对永远是 agreed。
   // 这条不变式原先只写在 audit-slot.mjs 的注释里，注释拦不住一次配置改动，所以这里也判一次。
+  //
+  // 身份是「执行器 + 模型」，不是执行器：两位审查者都跑在 GitHub Actions 里，执行器必然都是
+  // github —— 只认执行器就等于宣布「自动产出 findings」永远判 INFRA。用两个不同模型跑出两份
+  // 独立意见时独立性成立；同执行器同模型才是同一份意见被记成两票。
   const claimants = executors
-    .map((e) => (e.evidence && typeof e.evidence.executor === "string" ? e.evidence.executor : null))
+    .map((e) => {
+      const evidence = e.evidence ?? {};
+      const executor = typeof evidence.executor === "string" ? evidence.executor : null;
+      const model = typeof evidence.model === "string" ? evidence.model : null;
+      return executor && model ? executor + "\u0000" + model : null;
+    })
     .filter((x) => x !== null);
   const duplicated = claimants.find((x, i) => claimants.indexOf(x) !== i) ?? null;
   if (duplicated) {
+    const [executor, model] = duplicated.split("\u0000");
     for (const e of executors) {
       e.effective = "INFRA";
-      e.reason = "两个槽自报同一个执行器 " + duplicated + "：双执行器独立比对的前提消失";
+      e.reason =
+        "两个槽自报同一个执行器 " +
+        executor +
+        " 与同一个模型 " +
+        model +
+        "：双执行器独立比对的前提消失";
     }
   }
   const verdict = normalizeVerdict(executors.map((e) => e.effective));

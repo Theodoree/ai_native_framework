@@ -384,14 +384,30 @@ describe("崩溃兜底", () => {
 });
 
 describe("跨槽不变式", () => {
-  it("两个槽自报同一个执行器 -> INFRA（一份意见不许记成两票）", () => {
+  it("两个槽自报同一个执行器与同一个模型 -> INFRA（一份意见不许记成两票）", () => {
     const same = result({
       evidence: { ...result().evidence, executor: "github", agent: "review-b" },
     });
     const out = assess({ a: same, b: same });
     expect(out.verdict).toBe("INFRA");
     expect(out.conclusion).toBe("action_required");
-    expect(out.executors.map((e) => e.reason).join("\n")).toContain("同一个执行器");
+    const reasons = out.executors.map((e) => e.reason).join("\n");
+    expect(reasons).toContain("同一个执行器");
+    expect(reasons).toContain("与同一个模型 vendor/model-1");
+  });
+
+  it("同为 github 执行器但模型不同 -> 独立性成立，不判 INFRA", () => {
+    // 两位审查者都跑在 GitHub Actions 里，执行器必然都是 github；
+    // 若只按执行器认重，自动产出 findings 这条路永远拿不到结论。
+    const a = result({
+      evidence: { executor: "github", agent: "review-a", model: "deepseek-chat", request_id: "req_a" },
+    });
+    const b = result({
+      evidence: { executor: "github", agent: "review-b", model: "deepseek-reasoner", request_id: "req_b" },
+    });
+    const out = assess({ a, b });
+    expect(out.verdict).toBe("pass");
+    expect(out.executors.map((e) => e.effective)).toEqual(["pass", "pass"]);
   });
 
   it("两个槽不同执行器时不受影响", () => {

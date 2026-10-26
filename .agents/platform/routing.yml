@@ -13,18 +13,19 @@
 #   model     上游真实模型名（非空字符串）
 #   purpose   一句话：这条路由为什么存在（说不清用途的路由不该存在）
 #
-# model 当前是占位值（pending-*），只是把结构声明清楚；绑定真实模型是 owner 的动作，
-# 占位值不参与任何真伪校验，但已经足以让「workflow 硬编码模型名」这条判定生效。
+# review-a / review-b 已绑定真实模型（GitHub 侧执行器 scripts/audit-review.mjs 按这张表调用）；
+# impl 仍是占位值（pending-impl）—— 绑定真实模型是 owner 的动作，占位值不参与真伪校验，
+# 但已经足以让「workflow 硬编码模型名」这条判定生效。
 # 校验器不看值像不像真模型名（那要发明平台事实），只看结构自洽。
 version: 1
 routes:
   - name: review-a
-    provider: anthropic
-    model: pending-review-a
+    provider: deepseek
+    model: deepseek-chat
     purpose: 交叉验证的 A 侧审计，负责契约判据类 finding
   - name: review-b
-    provider: openai
-    model: pending-review-b
+    provider: deepseek
+    model: deepseek-reasoner
     purpose: 交叉验证的 B 侧审计，与 review-a 的结论逐条比对
   - name: impl
     provider: deepseek
