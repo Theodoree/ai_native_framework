@@ -377,6 +377,47 @@ describe("verify：exitCode 与输出尾部", () => {
     expect(human.stdout).not.toContain("line-10\n");
     expect(human.stdout.trimEnd().split("\n").length).toBe(2 + 20);
   });
+
+  test("校验判红时退出 4，且仍把输出交出去", async () => {
+    const backend = await startBackend({
+      "/api/verify": () => ({
+        status: 200,
+        json: { exitCode: 1, output: "FAIL tests/x.test.mjs" },
+      }),
+    });
+
+    const machine = await runCli(["verify", "--json", "--api", backend.url]);
+    // 4 是「真的判了、真的没过」：既不是 1（后端拒绝流转），也不是 3（拿不到结论）。
+    expect(machine.code).toBe(4);
+    expect(JSON.parse(machine.stdout)).toEqual({
+      exitCode: 1,
+      output: "FAIL tests/x.test.mjs",
+    });
+
+    const human = await runCli(["verify", "--api", backend.url]);
+    expect(human.code).toBe(4);
+    expect(human.stdout).toContain("exitCode: 1");
+    expect(human.stdout).toContain("FAIL tests/x.test.mjs");
+  });
+
+  test("拿不到可信结论时退出 3，而不是 4", async () => {
+    const nulled = await startBackend({
+      "/api/verify": () => ({
+        status: 200,
+        json: { exitCode: null, output: "" },
+      }),
+    });
+    const timedOut = await runCli(["verify", "--api", nulled.url]);
+    // 超时/被杀 = 不知道过没过；算成 4 会让「没过」与「没跑完」混成一档。
+    expect(timedOut.code).toBe(3);
+    expect(timedOut.stdout).toContain("不可信");
+
+    const missing = await startBackend({
+      "/api/verify": () => ({ status: 200, json: { output: "oops" } }),
+    });
+    const noField = await runCli(["verify", "--api", missing.url]);
+    expect(noField.code).toBe(3);
+  });
 });
 
 describe("outbox：在途台账原样呈现", () => {

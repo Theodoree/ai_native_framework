@@ -15,6 +15,9 @@ const EXIT_OK = 0;
 const EXIT_REJECTED = 1;
 const EXIT_USAGE = 2;
 const EXIT_INFRA = 3;
+// 4 只用于 verify：校验真的跑了、也真的判红了。它既不是「后端拒绝」（1），
+// 也不是「拿不到可信结果」（3）——自动化必须能把「代码没过闸」和「命令/后端坏了」分开。
+const EXIT_VERIFY_FAILED = 4;
 
 const USAGE = `用法: cli <命令> [选项] [--api <url>] [--json]
 
@@ -23,7 +26,7 @@ const USAGE = `用法: cli <命令> [选项] [--api <url>] [--json]
   new <title> [--body <text>] [--json]             新建需求，打印新 id 与落到的状态
   verdict --id <id> --to <state> [--role <role>] [--comment <text>] [--json]
                                                    发起一次状态变更（--role 缺省 owner）
-  verify [--json]                                  真跑校验，打印 exitCode 与输出尾部
+  verify [--json]                                  真跑校验，打印 exitCode 与输出尾部（判红则退出 4）
   outbox [--json]                                  列出在途条目（status/attempts/nextCheckAt）
 
 全局:
@@ -349,9 +352,19 @@ const verdict = async (context) => {
   return `${cell(created.id)}: ${cell(created.from)} -> ${cell(created.to)}（by ${cell(created.by)}）\n`;
 };
 
+// 校验结果到退出码：0 绿 / 4 真红 / 3 拿不到可信结果（超时、被杀、字段缺失）。
+// 3 不并进 4：一个是「没过」，一个是「不知道过没过」，报警与重跑的方向完全不同。
+const verifyCode = (exitCode) => {
+  if (typeof exitCode !== "number" || !Number.isInteger(exitCode)) {
+    return EXIT_INFRA;
+  }
+  return exitCode === 0 ? EXIT_OK : EXIT_VERIFY_FAILED;
+};
+
 const verify = async (context) => {
   const result = await request(context.api, "/api/verify", { method: "POST" });
-  if (context.json) return renderJson(result);
+  const code = verifyCode(result.exitCode);
+  if (context.json) return { code, stdout: renderJson(result) };
   const exitCode =
     result.exitCode === null || result.exitCode === undefined
       ? "null（超时或被杀，不可信）"
@@ -360,8 +373,11 @@ const verify = async (context) => {
   const lines = output === "" ? [] : output.split("\n");
   const tail = lines.slice(-20);
   const header = `exitCode: ${exitCode}`;
-  if (tail.length === 0) return header + "\n（输出为空）\n";
-  return `${header}\n--- 输出尾部（最多 20 行，--json 看全文）---\n${tail.join("\n")}\n`;
+  const text =
+    tail.length === 0
+      ? header + "\n（输出为空）\n"
+      : `${header}\n--- 输出尾部（最多 20 行，--json 看全文）---\n${tail.join("\n")}\n`;
+  return { code, stdout: text };
 };
 
 const outbox = async (context) => {
@@ -395,13 +411,14 @@ const execute = async (argv) => {
   const parsed = parseArgv(argv);
   if (parsed.help) return { code: EXIT_OK, stdout: USAGE };
   const api = resolveApi(parsed.api);
-  const stdout = await HANDLERS[parsed.command]({
+  const out = await HANDLERS[parsed.command]({
     api,
     json: parsed.json,
     flags: parsed.flags,
     positionals: parsed.positionals,
   });
-  return { code: EXIT_OK, stdout };
+  // 处理器默认只产文本（成功）；需要独立退出码的（verify）自己回 { code, stdout }。
+  return typeof out === "string" ? { code: EXIT_OK, stdout: out } : out;
 };
 
 const main = async (argv) => {
