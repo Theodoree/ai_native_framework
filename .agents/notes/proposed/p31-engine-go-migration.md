@@ -48,6 +48,8 @@
 
 **判据口径**：parity 只钉「两侧输出一致」，不重写任何一条判据——45 条 fixture 逐字节相同。唯一例外是「非法 YAML」：js-yaml 与 yaml.v3 的解析器消息无法逐字复刻，只钉前缀 + code + 退出码，这一条例外写在测试里而不是让判据松掉。
 
+**运行时方言**：`JSON.parse` 的报错文本跨 Node 版本不同——Node 20 是 `… at position 1`，Node 22+ 追加 `(line 1 column 2)`。本机 Node 24 与实现同代，所以本地全绿、CI（Node 20）红。修法：比对前把坐标后缀从两侧摘掉（位置数字仍比），并单独断言 Go 侧一律带坐标；理由写在 `tests/engine-parity.test.mjs` 的 `POSITION_SUFFIX` 旁。教训：parity 的对手是「另一份实现 + 另一个运行时」，本地绿只证明第一半。
+
 **变异验证**（改坏 Go 实现看 parity / 单测变红）：`validate.go` 消息里的「的转换」→「的迁移」5 红；`fail.go` 的 ExitCode 默认值 3→0 共 14 红；`ledger.go` 的 `"REQ-"`→`"REQ"` 1 红；`cli.go` 的 `asJSON` 恒 false 26 红；`engine_test.go:166` 断言 `REQ-4`→`REQ-3` → `check:engine` 退出码 1（`--- FAIL: TestFoldAndNextID`）。
 
 **两处要记住的教训**
