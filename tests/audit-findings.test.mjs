@@ -2,11 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
+  readSync,
   readFileSync,
   rmSync,
   statSync,
@@ -3164,6 +3167,15 @@ try {
         }
         for (const file of tree.files) {
           const abs = scriptPath(root, file);
+          if (abs && existsSync(abs) && isBinarySource(abs)) {
+            noteGap({
+              step: label,
+              where,
+              kind: BINARY_SOURCE_KIND,
+              detail: file,
+            });
+            continue;
+          }
           if (abs && existsSync(abs))
             texts.push({
               where: file,
@@ -4716,6 +4728,22 @@ try {
     return null;
   }
 
+  // 判据是**文本**扫描器：把编译产物当 utf8 读只会得到乱码，拿乱码判「有没有写结论」
+  // 两个方向都不成立 —— 随机字节可能被当成命中（假红），真写面也可能藏进读不出来的字节里
+  // （假绿）。所以二进制不进扫描面，改成记 binary-source gap，并在真仓库用例里断言
+  // 「跳过的那几个恰好是引擎构建产物」—— 新增一处二进制引用仍然看得见。
+  const BINARY_SOURCE_KIND = "binary-source";
+  function isBinarySource(abs) {
+    const fd = openSync(abs, "r");
+    try {
+      const buffer = Buffer.alloc(8192);
+      const read = readSync(fd, buffer, 0, buffer.length, 0);
+      return buffer.subarray(0, read).includes(0);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
   function workflowFiles(options = {}) {
     const root = options.root ?? ROOT;
     const dir = join(root, WORKFLOW_DIR);
@@ -4831,9 +4859,23 @@ try {
               surfaceAssignments(text, entry.envMap ?? assignments),
             ) !== null
           );
-        }) || gaps.length > 0
+        }) ||
+        gaps.some((gap) => gap.kind !== BINARY_SOURCE_KIND)
       );
     });
+  }
+
+  // 被跳过的二进制引用：它们是构建产物，不进文本扫描面，但不许静默消失。
+  function workflowBinarySourceGaps(options = {}) {
+    const root = options.root ?? ROOT;
+    const found = new Set();
+    for (const file of workflowFiles({ root })) {
+      const gaps = [];
+      workflowSurfaceTexts(file, root, gaps);
+      for (const gap of gaps)
+        if (gap.kind === BINARY_SOURCE_KIND) found.add(gap.detail);
+    }
+    return [...found].sort();
   }
 
   // 除 audit.yml 外任何 workflow 写结论都是违规：scripts/merge-gate.mjs 按 name 取 id 最新，
@@ -4854,6 +4896,7 @@ try {
       const entries = workflowSurfaceTexts(file, root, gaps);
       // 跟不下去就响：脚本缺文件 / 本地 action 读不到 / 嵌套超限，都不许当成「没有执行面」。
       for (const gap of gaps) {
+        if (gap.kind === BINARY_SOURCE_KIND) continue;
         const gapKey =
           file + "\u0000gap\u0000" + gap.kind + "\u0000" + gap.detail;
         if (seen.has(gapKey)) continue;
@@ -8323,6 +8366,12 @@ try {
       // 正向断言：写面文件清单精确等于 [audit.yml]。
       expect(workflowWriteSurfaceFiles()).toEqual(["audit.yml"]);
       expect(workflowWriteSurfaceViolations()).toEqual([]);
+      // 二进制不进文本扫描面，但不许静默消失：真仓库里被跳过的恰好是引擎构建产物引用。
+      const binaryGaps = workflowBinarySourceGaps();
+      expect(binaryGaps.every((one) => one === ".cache/bin/engine")).toBe(true);
+      // 构建过引擎时（npm run check 一定先建）必须精确等于那一条：跳过不等于没看见。
+      if (existsSync(join(ROOT, ".cache/bin/engine")))
+        expect(binaryGaps).toEqual([".cache/bin/engine"]);
       // merge-gate.yml 只是**读** checks 列表（就绪轮询）：读不产生结论，不是写面。
       const gate = readFileSync(
         join(ROOT, WORKFLOW_DIR, "merge-gate.yml"),
