@@ -55,8 +55,54 @@ jobs:
             --jq '{labels: [.labels[].name]}' > issue-state.json
           cat issue-state.json
 
+      # 守卫证据只能来自宿主事实：合并之后 merge-gate 到底绿没绿，只有那个提交上的
+      # check run 知道，写者没有资格替它作证。所以这里去宿主取，取到的只是「事实摘要」。
+      # 取不到（没有这条 check / 结论不是 success / 接口报错）就**不写文件**，也绝不
+      # 因此让 job 失败：没证据 → 判定器 reject E_GUARD_MISSING → 状态不改，这是设计好的
+      # 正常路径；把它做成红 job 反而会把「守卫拦住了」伪装成「流水线坏了」。
+      - name: fetch guard evidence
+        id: guard_evidence
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # 选择规则本身必须被测过：jq 表达式在假 gh 里替换不掉，测不到就只能靠人看。
+          # 所以这里只取原始 JSON，筛谁、算不算成功都交给下面的 node 脚本。
+          RAW="$(mktemp)"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?filter=latest&per_page=100" > "$RAW" 2>/dev/null; then
+            echo "merge-gate：取 ${HEAD_SHA} 的 check run 失败 → 不写守卫证据（判定将 reject E_GUARD_MISSING）" >> "$SUMMARY"
+            exit 0
+          fi
+          node -e '
+            const fs = require("node:fs");
+            const [rawPath, sha, pr, summaryPath] = process.argv.slice(1);
+            const note = (line) => fs.appendFileSync(summaryPath, line + "\n");
+            const giveUp = (reason) => {
+              note("merge-gate：" + reason + " → 不写守卫证据（判定将 reject E_GUARD_MISSING）");
+              process.exit(0);
+            };
+            let runs = [];
+            try {
+              const parsed = JSON.parse(fs.readFileSync(rawPath, "utf8"));
+              runs = Array.isArray(parsed && parsed.check_runs) ? parsed.check_runs : [];
+            } catch (error) {
+              giveUp(sha + " 的 check run 列表读不出来（" + error.message + "）");
+            }
+            const matched = runs.filter((run) => run && run.name === "merge-gate");
+            if (matched.length === 0) giveUp(sha + " 上没有名为 merge-gate 的 check run");
+            if (matched.length > 1) giveUp(sha + " 上有 " + matched.length + " 条同名 merge-gate，无法确定以哪条为准");
+            const run = matched[0];
+            if (run.conclusion !== "success") giveUp("check run " + run.id + " 的结论是 " + (run.conclusion || "<空>") + "，不是 success");
+            fs.writeFileSync("guard-evidence.json", JSON.stringify({ "merge-gate": "check run " + run.id + " merge-gate success on " + sha + "（PR #" + pr + " 已合并）" }));
+            note("merge-gate：check run " + run.id + " success on " + sha + " → 已写 guard-evidence.json");
+          ' "$RAW" "${HEAD_SHA}" "${PR_NUMBER}" "$SUMMARY"
+
       # 事件 → 意图。身份只从宿主字段推，不读调用方自述。
-      # 脚本不联网：issue 的当前状态从 ISSUE_STATE_FILE 注入（上一取的产物）。
+      # 脚本不联网：issue 的当前状态从 ISSUE_STATE_FILE 注入（上一取的产物），
+      # 守卫证据从 GUARD_EVIDENCE_FILE 注入（上一步的产物，取不到时该文件不存在）。
       # NUMBER 是事件自身的号（issue 或 PR），只用来取上下文与留痕的兜底位置，不当 issue 号用。
       # 有没有意图由 build-intent 自己写进 has_intent（它是意图的产地），
       # YAML 不猜、也不在这里做任何判定：没有意图 = 后续三步全部不跑，job 保持绿。
@@ -68,6 +114,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
           ISSUE_STATE_FILE: issue-state.json
+          GUARD_EVIDENCE_FILE: guard-evidence.json
         run: |
           LAST_COMMENT="$(gh api "repos/${{ github.repository }}/issues/${NUMBER}/comments" --jq '.[-1].body // ""' 2>/dev/null || echo "")"
           export LAST_COMMENT

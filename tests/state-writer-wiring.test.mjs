@@ -25,19 +25,30 @@ const WORKFLOW = ".github/workflows/state-writer.yml";
 const steps = () =>
   YAML.parse(readFileSync(join(ROOT, WORKFLOW), "utf8")).jobs.write.steps;
 
-// 只实现本 workflow 用到的 if 子集：steps.<id>.outputs.<key> 与 '值' 比 == / !=，用 && 连接。
-// 被跳过的步骤没有输出，按 Actions 语义取空字符串。
-function evalIf(expr, outputs) {
+// 只实现本 workflow 用到的 if 子集：
+// - steps.<id>.outputs.<key> 与 '值' 比 == / !=（被跳过的步骤没有输出，按 Actions 取空串）
+// - github.<路径> 与 '值' / true / false 比 == / !=（事件上下文事实）
+// 用 && 连接。认不出的写法直接报错，不静默放过。
+function evalIf(expr, outputs, ctx = {}) {
   return expr
     .split("&&")
     .map((atom) => atom.trim())
     .every((atom) => {
-      const m =
+      const stepAtom =
         /^steps\.([\w-]+)\.outputs\.([\w-]+)\s*(==|!=)\s*'([^']*)'$/.exec(atom);
-      if (!m) throw new Error("if 超出本测试支持范围: " + atom);
-      const got = outputs[m[1]] && outputs[m[1]][m[2]];
-      const actual = got ? got : "";
-      return m[3] === "==" ? actual === m[4] : actual !== m[4];
+      if (stepAtom) {
+        const got = outputs[stepAtom[1]] && outputs[stepAtom[1]][stepAtom[2]];
+        const actual = got ? got : "";
+        return stepAtom[3] === "=="
+          ? actual === stepAtom[4]
+          : actual !== stepAtom[4];
+      }
+      const ctxAtom =
+        /^github\.([\w.]+)\s*(==|!=)\s*(?:'([^']*)'|(true|false))$/.exec(atom);
+      if (!ctxAtom) throw new Error("if 超出本测试支持范围: " + atom);
+      const actual = String(ctx["github." + ctxAtom[1]] ?? "");
+      const expected = ctxAtom[3] !== undefined ? ctxAtom[3] : ctxAtom[4];
+      return ctxAtom[2] === "==" ? actual === expected : actual !== expected;
     });
 }
 
@@ -65,8 +76,9 @@ function sandbox() {
   mkdirSync(join(dir, "bin"));
   const log = join(dir, "calls.log");
   const gh = join(dir, "bin", "gh");
-  // 假 gh：调用记进 calls.log。两类 api 取数必须分开返回 ——
-  // 上一条评论（/comments）与 issue 的当前状态（/issues/<n>）是两次不同的取数。
+  // 假 gh：调用记进 calls.log。三类 api 取数必须分开返回 ——
+  // 上一条评论（/comments）、issue 的当前状态（/issues/<n>）、
+  // 合并提交上的 check run（/commits/<sha>/check-runs）是三次不同的取数。
   writeFileSync(
     gh,
     [
@@ -74,9 +86,10 @@ function sandbox() {
       `printf '%s\\n' "$*" >> "${log}"`,
       'if [ "$1" = "api" ]; then',
       '  case "$2" in',
-      '    */comments) printf \'%s\\n\' "$GH_LAST_COMMENT" ;;',
-      '    */issues/*) printf \'%s\\n\' "$GH_ISSUE_STATE" ;;',
-      '    *) : ;;',
+      "    */comments) printf '%s\\n' \"$GH_LAST_COMMENT\" ;;",
+      "    */issues/*) printf '%s\\n' \"$GH_ISSUE_STATE\" ;;",
+      "    */check-runs*) printf '%s\\n' \"$GH_CHECK_RUNS\" ;;",
+      "    *) : ;;",
       "  esac",
       "fi",
       "exit 0",
@@ -84,7 +97,9 @@ function sandbox() {
     ].join("\n"),
   );
   chmodSync(gh, 0o755);
-  return { dir, log };
+  const summary = join(dir, "step_summary");
+  writeFileSync(summary, "");
+  return { dir, log, summary };
 }
 
 function runWorkflow({
@@ -93,8 +108,9 @@ function runWorkflow({
   number,
   lastComment = "",
   issueState = "",
+  checkRuns = "",
 }) {
-  const { dir, log } = sandbox();
+  const { dir, log, summary } = sandbox();
   const ghOutput = join(dir, "gh_output");
   writeFileSync(ghOutput, "");
   const env = {
@@ -103,14 +119,24 @@ function runWorkflow({
     GH_LOG: log,
     GH_LAST_COMMENT: lastComment,
     GH_ISSUE_STATE: issueState,
+    GH_CHECK_RUNS: checkRuns,
     GH_TOKEN: "stub-token",
     GITHUB_OUTPUT: ghOutput,
+    GITHUB_STEP_SUMMARY: summary,
+    GITHUB_REPOSITORY: "owner/repo",
   };
   const ctx = {
     "toJSON(github.event)": JSON.stringify(event),
     "github.event_name": eventName,
     "github.event.issue.number || github.event.pull_request.number":
       String(number),
+    "github.event.pull_request.head.sha": event.pull_request?.head?.sha ?? "",
+    "github.event.pull_request.number": String(
+      event.pull_request?.number ?? "",
+    ),
+    "github.event.pull_request.merged": String(
+      event.pull_request?.merged === true,
+    ),
     "github.repository": "owner/repo",
     "secrets.GITHUB_TOKEN": "stub-token",
   };
@@ -122,7 +148,7 @@ function runWorkflow({
     // 而且 npm install 会替换掉沙箱里的 node_modules。
     if (!step.run || !step.name) continue;
     const key = step.id || String(step.name);
-    if (step.if && !evalIf(interpolate(step.if, ctx), outputs)) {
+    if (step.if && !evalIf(interpolate(step.if, ctx), outputs, ctx)) {
       ran.push({ key, skipped: true });
       continue;
     }
@@ -165,6 +191,11 @@ function runWorkflow({
     // job 红 = 任何一步非 0 退出（被跳过的步骤不参与）。
     failed: ran.filter((s) => s.skipped !== true && s.status !== 0),
     intentBytes: existsSync(intentPath) ? statSync(intentPath).size : null,
+    intent: existsSync(intentPath)
+      ? JSON.parse(readFileSync(intentPath, "utf8") || "null")
+      : null,
+    guardEvidenceExists: existsSync(join(dir, "guard-evidence.json")),
+    summary: readFileSync(summary, "utf8"),
     verdictExists: existsSync(join(dir, "verdict.json")),
   };
 }
@@ -183,14 +214,20 @@ const issueEvent = (
   sender: { login: "ted" },
 });
 
-const prEvent = (action, { number = 9, body = "", title = "" } = {}) => ({
+const MERGED_SHA = "abc123def456";
+
+const prEvent = (
+  action,
+  { number = 9, body = "", title = "", merged = false, sha = MERGED_SHA } = {},
+) => ({
   action,
   pull_request: {
     number,
-    merged: false,
+    merged,
     labels: [],
     body,
     title,
+    head: { sha },
     author_association: "CONTRIBUTOR",
   },
   sender: { login: "agent" },
@@ -398,4 +435,208 @@ test("(d) YAML：顺序是「解析 issue → 取标签 → 建意图」，且�
   expect(script).not.toMatch(/\bfetch\(/);
   expect(script).not.toMatch(/node:https?/);
   expect(script).not.toMatch(/child_process/);
+});
+
+// ---- P-21 回归的真缺口：声明了 merge-gate 的转换必须拿到宿主取来的守卫证据 ----
+// 证据不是人写的：它来自合并提交上 name=merge-gate 的 check run 结论。
+
+const mergedPr = (number = 42) =>
+  prEvent("closed", { number, merged: true, body: "Fixes #1" });
+
+// 假的 gh 只回放原始响应体：过滤、判定都由 workflow 里的脚本自己做，
+// 所以夹具给的是 GitHub 的真实形状，不是已经算好的结论。
+const checkRun = (id, conclusion) => ({ id, name: "merge-gate", conclusion });
+const checkRunsJson = (...runs) =>
+  JSON.stringify({ total_count: runs.length, check_runs: runs });
+
+test("(d) fetch guard evidence 的位置、if 条件与端点都钉在 YAML 里", () => {
+  const doc = steps();
+  const named = doc.filter((s) => s.name && s.run);
+  const at = (name) => named.findIndex((s) => s.name === name);
+
+  expect(at("fetch guard evidence")).toBeGreaterThan(at("fetch issue state"));
+  expect(at("fetch guard evidence")).toBeLessThan(at("build intent"));
+
+  const guard = named[at("fetch guard evidence")];
+  expect(guard.id).toBe("guard_evidence");
+  // 只对「已合并的 pull_request」成立：未合并的 PR 与 issues.* 事件都不该去取证据
+  expect(guard.if).toBe(
+    "github.event_name == 'pull_request' && github.event.pull_request.merged == true",
+  );
+  expect(
+    evalIf(
+      guard.if,
+      {},
+      {
+        "github.event_name": "pull_request",
+        "github.event.pull_request.merged": "true",
+      },
+    ),
+  ).toBe(true);
+  expect(
+    evalIf(
+      guard.if,
+      {},
+      {
+        "github.event_name": "pull_request",
+        "github.event.pull_request.merged": "false",
+      },
+    ),
+  ).toBe(false);
+  expect(
+    evalIf(
+      guard.if,
+      {},
+      {
+        "github.event_name": "issues",
+        "github.event.pull_request.merged": "",
+      },
+    ),
+  ).toBe(false);
+
+  // 端点：该 PR head sha 上的最新 check run 列表（filter=latest 由服务端按 name 去重后的视图）
+  expect(guard.run).toContain(
+    "commits/${HEAD_SHA}/check-runs?filter=latest&per_page=100",
+  );
+  // 选择规则落在 node 脚本里而不是 --jq：jq 表达式在测试替身里实现不出来，
+  // 测不到的选择逻辑等于没有（曾经的 sort_by(.started_at)|last 就是这样漏掉的）。
+  expect(guard.run).not.toContain("--jq");
+  expect(guard.run).toContain('run.name === "merge-gate"');
+  expect(guard.env.HEAD_SHA).toBe("${{ github.event.pull_request.head.sha }}");
+  // 只有 conclusion === success 才写文件；同名多条与读不出来都只留痕，不猜也不红
+  expect(guard.run).toContain("matched.length > 1");
+  expect(guard.run).toContain('run.conclusion !== "success"');
+  expect(guard.run).not.toMatch(/exit 1/);
+
+  // 证据文件通过环境变量注入 build intent 步骤（脚本不自己去找、也不自己联网）
+  const intent = named[at("build intent")];
+  expect(intent.env.GUARD_EVIDENCE_FILE).toBe("guard-evidence.json");
+  const script = readFileSync(join(ROOT, "scripts/build-intent.mjs"), "utf8");
+  expect(script).not.toMatch(/\bgh\b/);
+  expect(script).not.toMatch(/node:https?/);
+  expect(script).not.toMatch(/child_process/);
+});
+
+test("(d) 真跑：merge-gate success → 写入证据 → 判定 allowed → in-progress 改 done", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: mergedPr(42),
+    number: 42,
+    issueState: '{"labels":["state:in-progress"]}',
+    checkRuns: checkRunsJson(checkRun(890, "success")),
+  });
+  expect(r.ok("guard_evidence").skipped).toBeUndefined();
+  expect(r.ok("guard_evidence").status).toBe(0);
+  expect(r.guardEvidenceExists).toBe(true);
+  expect(r.intent.guards).toEqual({
+    "merge-gate":
+      "check run 890 merge-gate success on abc123def456（PR #42 已合并）",
+  });
+  expect(r.outputs.validate.exit).toBe("0");
+  expect(r.edits).toEqual([
+    "issue edit 1 --remove-label state:in-progress",
+    "issue edit 1 --add-label state:done",
+  ]);
+  expect(r.failed).toEqual([]);
+  // 取的是该 PR head sha 上的 check run
+  expect(
+    r.calls.some((c) =>
+      c.includes("commits/abc123def456/check-runs?filter=latest&per_page=100"),
+    ),
+  ).toBe(true);
+});
+
+test("(d) 真跑：没有 merge-gate 这条 check → 不写文件，判定 reject E_GUARD_MISSING，job 仍绿", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: mergedPr(42),
+    number: 42,
+    issueState: '{"labels":["state:in-progress"]}',
+    checkRuns: checkRunsJson(),
+  });
+  // 取不到不是故障：步骤成功退出，只是没有产物
+  expect(r.ok("guard_evidence").status).toBe(0);
+  expect(r.guardEvidenceExists).toBe(false);
+  expect("guards" in r.intent).toBe(false);
+  expect(r.outputs.validate.exit).toBe("1");
+  expect(r.ok("apply").skipped).toBe(true);
+  expect(r.comments).toHaveLength(1);
+  expect(r.comments[0]).toContain("REJECTED E_GUARD_MISSING");
+  expect(r.edits).toEqual([]);
+  expect(r.failed).toEqual([]);
+  // 摘要要说清是「没有这条 check」
+  expect(r.summary).toContain("没有名为 merge-gate 的 check run");
+});
+
+test("(d) 真跑：merge-gate 结论不是 success → 不写文件，判定 reject，摘要点明结论", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: mergedPr(42),
+    number: 42,
+    issueState: '{"labels":["state:in-progress"]}',
+    checkRuns: checkRunsJson(checkRun(890, "failure")),
+  });
+  expect(r.ok("guard_evidence").status).toBe(0);
+  expect(r.guardEvidenceExists).toBe(false);
+  expect("guards" in r.intent).toBe(false);
+  expect(r.outputs.validate.exit).toBe("1");
+  expect(r.comments[0]).toContain("E_GUARD_MISSING");
+  expect(r.failed).toEqual([]);
+  expect(r.summary).toContain("结论是 failure");
+  expect(r.summary).toContain("不是 success");
+});
+
+test("(d) 真跑：同名 merge-gate 不止一条 → 不猜以哪条为准，不写文件", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: mergedPr(42),
+    number: 42,
+    issueState: '{"labels":["state:in-progress"]}',
+    // filter=latest 正常只回一条；回了多条说明「最新」这个前提不成立，
+    // 随便挑一条就是把守卫交给运气。
+    checkRuns: checkRunsJson(
+      checkRun(890, "success"),
+      checkRun(991, "failure"),
+    ),
+  });
+  expect(r.ok("guard_evidence").status).toBe(0);
+  expect(r.guardEvidenceExists).toBe(false);
+  expect("guards" in r.intent).toBe(false);
+  expect(r.outputs.validate.exit).toBe("1");
+  expect(r.comments[0]).toContain("E_GUARD_MISSING");
+  expect(r.failed).toEqual([]);
+  expect(r.summary).toContain("2 条同名 merge-gate");
+});
+
+test("(d) 真跑：check run 列表读不出来 → 不写文件，摘要点明读不出来", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: mergedPr(42),
+    number: 42,
+    issueState: '{"labels":["state:in-progress"]}',
+    // gh 退出 0 但回的不是 JSON（网关错误页等）：解析失败只能当「没证据」，
+    // 不能当「没有结论的 check run」，更不能崩掉这一步。
+    checkRuns: "<html>503 Service Unavailable</html>",
+  });
+  expect(r.ok("guard_evidence").status).toBe(0);
+  expect(r.guardEvidenceExists).toBe(false);
+  expect("guards" in r.intent).toBe(false);
+  expect(r.outputs.validate.exit).toBe("1");
+  expect(r.comments[0]).toContain("E_GUARD_MISSING");
+  expect(r.failed).toEqual([]);
+  expect(r.summary).toContain("读不出来");
+});
+
+test("(d) 真跑：未合并的 PR 不去取证据（步骤被跳过），也不会凭空带上 guards", () => {
+  const r = runWorkflow({
+    eventName: "pull_request",
+    event: prEvent("closed", { number: 43, merged: false, body: "Fixes #1" }),
+    number: 43,
+    issueState: '{"labels":["state:in-progress"]}',
+    checkRuns: checkRunsJson(checkRun(890, "success")),
+  });
+  expect(r.ok("guard_evidence").skipped).toBe(true);
+  expect(r.calls.filter((c) => c.includes("check-runs"))).toEqual([]);
+  // 关而未合并没有意图，后续步骤全跳过
+  expect(r.outputs.intent.has_intent).toBe("0");
 });
