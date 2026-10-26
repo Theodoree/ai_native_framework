@@ -14,7 +14,6 @@
     "lint": "oxlint scripts tests",
     "test": "vitest run",
     "api": "cd apps/api-go && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go run .",
-    "platform": "npm run api",
     "web:dev": "npm --prefix apps/web-vue run dev",
     "web:build": "npm --prefix apps/web-vue run build",
     "web:dist": "node scripts/copy-dist.mjs"
