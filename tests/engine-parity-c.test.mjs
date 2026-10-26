@@ -20,6 +20,12 @@ const goEnv = {
   GOFLAGS: "-mod=mod",
 };
 
+// Node 22+ 的 JSON.parse 报错带 (line L column C) 坐标，Node 20 不带；
+// 比对前把坐标后缀从两侧摘掉（位置数字仍比），再单独断言 Go 侧一律带坐标。
+const POSITION_SUFFIX = / ?\(line \d+ column \d+\)/g;
+const POSITION_SUFFIX_SINGLE = /\(line \d+ column \d+\)/;
+const withoutPosition = (text) => text.replace(POSITION_SUFFIX, "");
+
 const GOOD = "a".repeat(40);
 const OTHER = "b".repeat(40);
 const BT = String.fromCharCode(96);
@@ -433,7 +439,9 @@ describe("engine merge-gate 与 scripts/merge-gate.mjs 逐字一致", () => {
       if (spec.code) expect(js.stdout).toContain(spec.code);
       for (const extra of spec.alsoCodes ?? []) expect(js.stdout).toContain(extra);
       expect(go.status).toBe(js.status);
-      expect(go.stdout).toBe(js.stdout);
+      expect(withoutPosition(go.stdout)).toBe(withoutPosition(js.stdout));
+      // 反向守卫：两侧都摘成空等于什么都没比，所以 Go 侧必须自己带坐标。
+      if (/JSON at position/.test(go.stdout)) expect(go.stdout).toMatch(POSITION_SUFFIX_SINGLE);
       if (spec.crash) {
         expect(js.stdout).toBe("");
         expect(go.stdout).toBe("");

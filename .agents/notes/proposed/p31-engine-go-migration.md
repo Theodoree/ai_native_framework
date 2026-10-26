@@ -119,4 +119,5 @@ PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progres
 5. **`resolvePrIssue` 只在 body 解析为空时才看 title**：body 有一个引用、title 另一个时不报「多个引用」。
 6. **同名「最新」按 id 数值比**，不是时间戳；id 若来自不同来源不保证单调；平手取后出现的那条。
 
+**运行时方言第三次咬人（这次是 stdout 里的 JSON.parse 文案）**：本地 Node 24 的 JSON.parse 报错带 (line L column C)，CI 的 Node 20 不带，于是 E_EVENT_UNPARSABLE 与 E_INPUT_UNPARSABLE 两个夹具在 CI 红、本地绿。修法与阶段 A/B 同口径：比对前把坐标后缀从两侧摘掉（position N 的数字仍比），并**单独断言「Go 侧只要报了 at position 就必须带坐标」**——否则两侧都摘成空等于什么都没比。代价是 line/column 的数值不再参与比较（实测：把 column 改 +1 仍绿，把 column 写成 col 则 2 红），position 的数值仍比。
 这些都在 parity 夹具里以「照原样复刻」的形式钉住了——**先复刻再议**，改语义是另一件事（阶段 D 之后再单独决定）。
