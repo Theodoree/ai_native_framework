@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
+import { engineInto } from "./helpers/engine.mjs";
 
 // 专测 wiring：把 state-writer.yml 里的 run 块与 if 条件原样搬到沙箱里执行，
 // 让「有没有意图 → 跑哪几步 → 评不评论 / 改不改标签 / 红不红 job」由 YAML 与脚本自己决定，
@@ -73,6 +74,9 @@ function sandbox() {
   cpSync(join(ROOT, "scripts"), join(dir, "scripts"), { recursive: true });
   cpSync(join(ROOT, ".agents"), join(dir, ".agents"), { recursive: true });
   symlinkSync(join(ROOT, "node_modules"), join(dir, "node_modules"));
+  // 判据/留痕的调用点是 Go 引擎：二进制跟着进沙箱，YAML 里那条 cwd 相对的
+  // ./.cache/bin/engine 才能原样执行。
+  engineInto(dir);
   mkdirSync(join(dir, "bin"));
   const log = join(dir, "calls.log");
   const gh = join(dir, "bin", "gh");
@@ -412,7 +416,9 @@ test("(d) YAML：顺序是「解析 issue → 取标签 → 建意图」，且�
 
   const resolve = named[at("resolve issue")];
   expect(resolve.id).toBe("resolve");
-  expect(resolve.run).toContain("build-intent.mjs --resolve-issue");
+  expect(resolve.run).toContain(
+    "./.cache/bin/engine build-intent --resolve-issue",
+  );
 
   const fetch = named[at("fetch issue state")];
   expect(fetch.if).toBe("steps.resolve.outputs.issue != ''");

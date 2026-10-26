@@ -2,6 +2,10 @@
 
 ## 做什么
 
+判据与留痕的**生产调用点指向 Go 引擎**（§apps/engine§ → `.cache/bin/engine`）：`state-validate` / `build-intent` / `writer-record` / `merge-gate` 由那个单二进制执行，CI workflow 与 `npm run check:state` 调的都是它。下表里这四个同名 `.mjs` 是**同口径对照物**：只被 parity 测试与 `import` 它们的脚本/测试调用，不是任何 workflow 或 npm 脚本的入口。
+
+仍被 workflow 或 npm 脚本直接执行的：`audit-review` / `audit-slot` / `audit-findings`（`audit.yml`）、`kb-export`（`kb-sync.yml`）、`copy-dist`（`check:web` / `web:dist`）、`cli`（`npm run cli`）；`ledger` / `ledger-cli` / `routing` 作为模块被脚本与测试 `import`。
+
 | 文件                 | 唯一职责                                                                                                                                                            | 不做什么                                                         |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | `state-validate.mjs` | 读声明、判定一次状态转换（0 allowed / 1 rejected / 3 INFRA），意图没有归属 issue 也判 INFRA；声明了 guards 的转换必须带非空证据（写入口 fail-closed），给「门」另有只读咨询入口 | 不写任何状态，不知道宿主是谁；不校验证据内容真假                |

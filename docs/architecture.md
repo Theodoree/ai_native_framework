@@ -32,7 +32,7 @@ AI 原生研发交付引擎：需求以 issue 入库，以 PR 交付，交付物
 | 事实                                | 家                                                                                                                     |
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | issue 状态、允许的转换、谁能触发    | `.agents/platform/state-machine.yml`                                                                                   |
-| 转换合法性的机械判定                | `apps/engine`（Go 库，平台与门在进程内调用）；`scripts/state-validate.mjs` 是同口径的 Node CLI 入口，供 CI 与 parity 对照 |
+| 转换合法性的机械判定                | `apps/engine`（Go 库 + `cmd/engine` 单二进制：平台与门在进程内调用，CI 与 npm 脚本调 `.cache/bin/engine`）；`scripts/state-validate.mjs` 是同口径的 Node **对照物**，只供 parity 测试 |
 | 权限项与交付节点的对应              | `docs/permissions.md`                                                                                                  |
 | 审计的输入、输出、判据与 INFRA 口径 | `docs/audit-contract.md`                                                                                               |
 | PR 必填字段                         | `.github/PULL_REQUEST_TEMPLATE/proposed.md`、`.github/PULL_REQUEST_TEMPLATE/bugfix.md`                                 |

@@ -1,6 +1,6 @@
 # P-31 判据与门搬进 Go（进行中）
 
-状态：proposed（人已定方向，分四阶段落地；阶段 A、B、C 已完成并合入，D 未做（只剩删 .mjs、改 package.json 与 workflow、parity 转 golden））
+状态：阶段 A、B、C、D1 已完成并合入，D2（删 .mjs、parity 转 golden、去掉剩余 Node 依赖）未做。
 
 ## 一、为什么做
 
@@ -126,3 +126,38 @@ PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progres
 顺带看清了它的**后果不只是显示难看**：门 G1 拿标签去咨询转换表，标签停在 `state:in-progress` 的已关单看起来「还能被合并带到 done」，于是 G1 会对一个已经关掉的 issue 判 PASS。也就是说，缺口的真实风险是**门可能把已关单当成在途单放行**，而不只是标签不准。
 
 修法仍是那两条（给 `issues.closed` 建意图，或把自动关单挪进写者），本轮不动：状态只有一个写者这条约束优先。
+## 十一、阶段 D1 落地记录（CI 与 npm 脚本切到 Go 引擎）
+
+阶段 A/B/C 让 Go 有了全部判据，但调用点还在 Node——冗余没真正消掉。D1 把 8 个生产调用点指向 `./.cache/bin/engine`：
+
+| 调用点 | 命令 |
+| ------ | ---- |
+| `merge-gate.yml` collect | `./.cache/bin/engine merge-gate --event … --pr … --print-issue` |
+| `merge-gate.yml` gate | `./.cache/bin/engine merge-gate --event … --pr … --issue … --checks … --infra …` |
+| `state-writer.yml` resolve | `ISSUE="$(./.cache/bin/engine build-intent --resolve-issue)"` |
+| `state-writer.yml` intent | `./.cache/bin/engine build-intent > intent.json` |
+| `state-writer.yml` validate | `./.cache/bin/engine validate --intent intent.json --json` |
+| `state-writer.yml` record | `./.cache/bin/engine writer-record --verdict verdict.json --issue "$TARGET"` |
+| `last-change.yml` render | `./.cache/bin/engine last-change --in body.in.md --out body.out.md` |
+| `package.json` `check:state` | `npm run --silent build:engine && ./.cache/bin/engine check-config` |
+
+构建入口只有一个：`build:engine`（`cd apps/engine` + `go build -o ../../.cache/bin/engine ./cmd/engine`，GOPATH/GOCACHE 指仓库 `.cache`；`.cache/` 早已在 .gitignore，产物不进仓库）。三个 workflow 各在 `npm ci` 之后加 `actions/setup-go@v5`(1.22) + `npm run build:engine`；`check` 链未变，故一次 check 只构建一次。仍用 Node 的只剩审计六件套、kb-sync、copy-dist、cli 与内联 `node -e/-p`，所以 `setup-node` 全部保留——**零 Node 属 D2，不是本阶段**。
+
+### 等价性（25 组，同 cwd/env/fixture，比 stdout+stderr+退出码+写出文件）
+
+22 组逐字节相同（含 10 条失败路径，0/1/3 三种退出码全覆盖）；3 组差异全部落在**已登记**的例外界内：`build-intent` 的 `EVENT` 非 JSON ×2（Node 语法栈）、`check-config` 坏 YAML（js-yaml 与 yaml.v3 文案不同，verdict/code/前缀/退出码相同，`tests/engine-parity.test.mjs` 已钉服务契约，`apps/engine/README.md` 例外清单补登）。
+
+### 我补的第四条门：`tests/engine-wiring.test.mjs`（9 例）
+
+执行器交付时自报两条「接线无覆盖」，我复现后确认实际是**四种静默形态**，全在改动后仍 105 例全绿：① `check:state` 退回 `node scripts/state-validate.mjs`；② 构建步挪到 `setup-go` 之前；③ 删掉构建步；④ 构建步换成 `echo skipped`。②③④ 在运行时会表现成 127（会红，但红在 CI 不在测试），① 是真静默——全绿而 Node 又回来了。
+
+新用例只盯这一条链，且每条都能被单个改动打红：`build:engine` 是唯一入口且产物落 `.cache/bin`；`check:state` 走引擎不走 node（`check` 链仍含 `check:state`/`check:engine`）；扫描面非空且恰好是三家调用引擎的 workflow（扫描落空也要红）；每个调用引擎的 job 里 setup-go < 唯一构建步 < 首次引擎调用；没有谁把调用点换回 `node scripts/*.mjs`；构建步不许 `continue-on-error`；`go-version` 钉 `1.22`。
+
+七组变异全部见红：check:state 退回 node（1）、构建步前移（1）、删构建步（1）、改 echo（1）、加 `continue-on-error`（1）、`go-version` 改 1.21（1）、三家调用点全换回 node（2）。还原 9 绿，整仓 `npm run check` exit=0（21 文件 / 665 用例）。
+
+### 仍然存在的边界
+
+- 构建真失败时表现为运行时 127（CI 红、测试不红）：静态判据只能证明「该建的地方有建」，证不了「建得出来」。
+- workflow 里仍有内联 `node -e/-p`（取 check runs、拼 JSON），所以运行时依赖 Node 只是变少，没有消失；要归零得把这些也搬到引擎，属 D2。
+- `tests/helpers/engine.mjs` 用 mtime 判新鲜：Go 源比二进制新就重建。时钟异常或跨机器搬运二进制会误判，代价是多一次 `go build`。
+- `cache:false`（与 `check.yml` 现状一致）每次下载 Go 工具链，换来的是不受缓存键漂移影响。

@@ -30,6 +30,15 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
+      # 判据与门的调用点是 Go 引擎（apps/engine），Node 版脚本留作 parity 对照（tests 两侧同口径）。
+      # 构建入口只有一个：npm run build:engine → .cache/bin/engine（.cache/ 已忽略，产物不进仓库）。
+      # 这一步刻意不写 name：测试沙箱只跑「有 name 的步骤」，构建不该在沙箱里重跑。
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - run: npm run build:engine
+
       # PR 号不是 issue 号，且 PR 事件的 payload 里没有被引用 issue 的标签。
       # 所以「先解析 issue、再取它的当前状态、再建意图」是三个有先后依赖的步骤，
       # 顺序用步骤图表达（Actions 按序执行），不塞进一行 shell 拼接里：
@@ -39,7 +48,7 @@ jobs:
         env:
           EVENT: ${{ toJSON(github.event) }}
         run: |
-          ISSUE="$(node scripts/build-intent.mjs --resolve-issue)"
+          ISSUE="$(./.cache/bin/engine build-intent --resolve-issue)"
           echo "issue=${ISSUE}" >> "$GITHUB_OUTPUT"
           echo "referenced issue: ${ISSUE:-<none>}"
 
@@ -118,14 +127,14 @@ jobs:
         run: |
           LAST_COMMENT="$(gh api "repos/${{ github.repository }}/issues/${NUMBER}/comments" --jq '.[-1].body // ""' 2>/dev/null || echo "")"
           export LAST_COMMENT
-          node scripts/build-intent.mjs > intent.json
+          ./.cache/bin/engine build-intent > intent.json
 
       - name: validate
         id: validate
         if: steps.intent.outputs.has_intent == '1'
         run: |
           set +e
-          node scripts/state-validate.mjs --intent intent.json --json > verdict.json
+          ./.cache/bin/engine validate --intent intent.json --json > verdict.json
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           cat verdict.json
 
@@ -156,4 +165,4 @@ jobs:
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
         run: |
           TARGET="$(node -p "const i = require('./intent.json').issue; Number.isInteger(i) ? i : process.env.NUMBER")"
-          node scripts/writer-record.mjs --verdict verdict.json --issue "$TARGET"
+          ./.cache/bin/engine writer-record --verdict verdict.json --issue "$TARGET"

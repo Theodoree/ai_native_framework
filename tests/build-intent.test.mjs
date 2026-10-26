@@ -583,8 +583,9 @@ test("CLI --resolve-issue：只解析 issue 号，解不出什么都不打印", 
 test("wiring：apply 用意图解析出的 issue，record 只调用 writer-record", () => {
   const yml = readFileSync(".github/workflows/state-writer.yml", "utf8");
   expect(yml).toContain("require('./intent.json').issue");
+  // 留痕的调用点是 Go 引擎：这条命令的字面就是接线，换回 node 脚本立刻红。
   expect(yml).toContain(
-    "node scripts/writer-record.mjs --verdict verdict.json",
+    "./.cache/bin/engine writer-record --verdict verdict.json",
   );
   expect(yml).not.toContain("状态未被修改");
 });

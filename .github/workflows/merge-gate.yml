@@ -50,6 +50,15 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
+      # 判据与门的调用点是 Go 引擎（apps/engine），Node 版脚本留作 parity 对照（tests 两侧同口径）。
+      # 构建入口只有一个：npm run build:engine → .cache/bin/engine（.cache/ 已忽略，产物不进仓库）。
+      # 这一步刻意不写 name：测试沙箱只跑「有 name 的步骤」，构建不该在沙箱里重跑。
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - run: npm run build:engine
+
       # 门牌的生产者名（render）只有一个家：scripts/merge-gate.mjs 的 PRODUCER，
       # 由 tests/merge-gate.test.mjs 钉住它与 last-change.yml 的 job 键一致。
       # 等的是「别人的结论」，所以自己（SELF=merge-gate）要排除 —— 自己此刻必然
@@ -95,12 +104,12 @@ jobs:
           printf '%s' "$EVENT" > .gate/event.json
           # 正文取现况：事件里的正文是快照，门牌写回不会回填它。
           gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER" > .gate/pr.json
-          # issue 号也由脚本解析（引用只有一个家），不在这里再写一遍正则。
-          node scripts/merge-gate.mjs --event .gate/event.json --pr .gate/pr.json --print-issue > .gate/issue.number
+          # issue 号也由引擎解析（引用只有一个家），不在这里再写一遍正则。
+          ./.cache/bin/engine merge-gate --event .gate/event.json --pr .gate/pr.json --print-issue > .gate/issue.number
           gh api "repos/$GITHUB_REPOSITORY/issues/$(cat .gate/issue.number)" > .gate/issue.json
           # 等完之后才取：取的是别人的最终结论，不是起跑时的半截。
           gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD/check-runs" > .gate/checks.json
           gh issue list --label infra --state open --json number,title,url --limit 100 > .gate/infra.json
 
       - name: gate
-        run: node scripts/merge-gate.mjs --event .gate/event.json --pr .gate/pr.json --issue .gate/issue.json --checks .gate/checks.json --infra .gate/infra.json
+        run: ./.cache/bin/engine merge-gate --event .gate/event.json --pr .gate/pr.json --issue .gate/issue.json --checks .gate/checks.json --infra .gate/infra.json
