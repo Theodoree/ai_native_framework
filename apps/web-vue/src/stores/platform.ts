@@ -6,6 +6,8 @@ import {
   getBoard,
   getConfig,
   getEvents,
+  getKnowledgeItem,
+  getKnowledgeList,
   getOutbox,
   getRemote,
   postIndexRebuild,
@@ -22,6 +24,8 @@ import {
   parseEvent,
   parseEvents,
   parseIndexRebuild,
+  parseKnowledgeDocument,
+  parseKnowledgeIndex,
   parseOutbox,
   parseRemote,
   parseSyncReport,
@@ -36,6 +40,8 @@ import {
   type BoardItem,
   type BoardTransition,
   type IndexRebuildReport,
+  type KnowledgeDocument,
+  type KnowledgeEntry,
   type OutboxSnapshot,
   type PlatformEvent,
   type RemoteSnapshot,
@@ -83,6 +89,19 @@ interface RetryPanelState {
   ok: string | null;
 }
 
+// 知识库只有读：目录一次、正文按选中项各一次；选中态也放这里，刷新不会把选中丢掉。
+interface KnowledgeState {
+  entries: KnowledgeEntry[];
+  count: number | null;
+  builtAt: string | null;
+  loading: boolean;
+  failure: ApiFailure | null;
+  selectedPath: string | null;
+  doc: KnowledgeDocument | null;
+  docLoading: boolean;
+  docFailure: ApiFailure | null;
+}
+
 interface PlatformState {
   items: BoardItem[];
   config: BoardConfig;
@@ -112,6 +131,7 @@ interface PlatformState {
   sync: SyncPanelState;
   indexRebuild: IndexPanelState;
   retry: RetryPanelState;
+  knowledge: KnowledgeState;
 }
 
 const state = reactive<PlatformState>({
@@ -149,6 +169,17 @@ const state = reactive<PlatformState>({
   sync: { running: false, failure: null, report: null },
   indexRebuild: { running: false, failure: null, report: null },
   retry: { attemptId: null, pending: false, failure: null, ok: null },
+  knowledge: {
+    entries: [],
+    count: null,
+    builtAt: null,
+    loading: false,
+    failure: null,
+    selectedPath: null,
+    doc: null,
+    docLoading: false,
+    docFailure: null,
+  },
 });
 
 const selectedItem = computed<BoardItem | null>(() => {
@@ -264,6 +295,37 @@ async function reloadOutbox(): Promise<void> {
   state.outboxLoading = false;
 }
 
+async function reloadKnowledge(): Promise<void> {
+  state.knowledge.loading = true;
+  const result = await getKnowledgeList();
+  state.knowledge.loading = false;
+  if (!result.ok) {
+    state.knowledge.failure = result.failure;
+    return;
+  }
+  const index = parseKnowledgeIndex(result.data);
+  state.knowledge.entries = index.entries;
+  state.knowledge.count = index.count;
+  state.knowledge.builtAt = index.builtAt;
+  state.knowledge.failure = null;
+}
+
+// 选中即请求正文。连点两条时只认最后一次选择：晚到的旧响应不许覆盖新选中项。
+async function selectKnowledgeItem(path: string): Promise<void> {
+  state.knowledge.selectedPath = path;
+  state.knowledge.doc = null;
+  state.knowledge.docFailure = null;
+  state.knowledge.docLoading = true;
+  const result = await getKnowledgeItem(path);
+  if (state.knowledge.selectedPath !== path) return;
+  state.knowledge.docLoading = false;
+  if (!result.ok) {
+    state.knowledge.docFailure = result.failure;
+    return;
+  }
+  state.knowledge.doc = parseKnowledgeDocument(result.data);
+}
+
 async function reloadAll(): Promise<void> {
   await Promise.all([
     reloadBoard(),
@@ -271,6 +333,7 @@ async function reloadAll(): Promise<void> {
     reloadConfig(),
     reloadRemote(),
     reloadOutbox(),
+    reloadKnowledge(),
   ]);
 }
 
@@ -431,6 +494,8 @@ export function usePlatform() {
     reloadConfig,
     reloadRemote,
     reloadOutbox,
+    reloadKnowledge,
+    selectKnowledgeItem,
     reloadAll,
     selectItem,
     createItem,

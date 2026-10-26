@@ -63,5 +63,9 @@ apps/api-go/dist/*
 .agents/platform/index.db-journal
 .agents/platform/index.db-wal
 .agents/platform/index.db-shm
+.agents/platform/kb.db
+.agents/platform/kb.db-journal
+.agents/platform/kb.db-wal
+.agents/platform/kb.db-shm
 .agents/platform/outbox.jsonl
 

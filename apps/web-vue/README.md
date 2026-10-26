@@ -31,6 +31,7 @@
 | `src/views/BoardView.vue`              | 看板视图（`v-row`/`v-col` 分列 + 详情侧栏 + 提需求 + 验证）        |
 | `src/views/MachineView.vue`            | 状态机视图（图 + 声明编辑）                                        |
 | `src/views/TimelineView.vue`           | 事件时间线（倒序 + 按 id 过滤）                                    |
+| `src/views/KnowledgeView.vue`          | 知识库（按 group 分组 + 本地过滤 + 正文原文）                      |
 | `src/styles/main.css`                  | 只剩 Vuetify 不管的三块（见下「CSS：删了什么、留了什么」）         |
 
 ## 依赖与许可证
@@ -112,8 +113,11 @@ npm run dev -- --port 5399
 | POST | `/api/item`    | `{ title, body }`                 | 事件对象                                                               |
 | POST | `/api/verdict` | `{ id, to, actor_role, comment }` | 事件对象                                                               |
 | POST | `/api/verify`  | `{}`                              | `{ exitCode, output }`                                                 |
+| GET  | `/api/kb`      | —                                 | `{ items, count, builtAt }`                                            |
+| GET  | `/api/kb/item` | `?path=<仓库相对路径>`            | `{ path, sha256, bytes, text }`                                        |
 
 错误统一 `{ kind: "rejected" | "infra", code, message, extra }`：rejected → HTTP 409，infra → 500。
+知识库的路径拒绝是例外码：`/api/kb/item` 越界或条目不存在时是 `kind=rejected`、`code=E_KB_PATH`，HTTP 400 或 404。
 
 字段形状不被信任：`src/api/parse.ts` 里逐字段容错，缺字段显示占位而不是白屏；
 item 的状态字段 `state` 与 `to` 两种都认。
@@ -139,3 +143,10 @@ item 的状态字段 `state` 与 `to` 两种都认。
 - 时间线只读（事件是 append-only 账本），不做删除/重放。
 - 时间线读 `GET /api/events`。后端没起或路由缺失时，界面会原样显示
   `kind=infra · code=E_NO_ROUTE` 的原始错误——这是原样呈现，不是前端坏了。
+- 知识库只在已给的数据上做两件事：**本地过滤**（title / path 子串，不新增接口）与
+  **原样分组**。组顺序与组内顺序（notes → module → docs → postmortem，组内按 path 字典序）
+  是后端排好的，前端连排序都不做，只按后端顺序连续切段——换顺序就等于改契约。
+- 正文按**纯文本**显示（等宽、保留换行、走插值转义，不用 `v-html` 也不引 markdown 渲染库）：
+  展示层多一个渲染器就多一份「这段 HTML 会不会执行」的风险，而知识库读者的诉求是读原文。
+- `sha256` 只显示前 12 位：够人对齐，全文本来就在接口里。正文面板不再重复 title——
+  列表已经有 title，同一事实不留两处（`/api/kb/item` 本身也不返回 title）。

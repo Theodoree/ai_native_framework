@@ -132,6 +132,16 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.handleIndexRebuild(w, r)
 			return
 		}
+	case "/api/kb":
+		if r.Method == http.MethodGet {
+			a.handleKBList(w, r)
+			return
+		}
+	case "/api/kb/item":
+		if r.Method == http.MethodGet {
+			a.handleKBItem(w, r)
+			return
+		}
 	}
 	a.handleUnmatched(w, r)
 }
