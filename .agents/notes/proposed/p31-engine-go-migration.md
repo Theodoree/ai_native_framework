@@ -75,3 +75,11 @@
 
 **阶段 C 的耦合点（先说清，免得改错）**：`merge-gate.mjs` 是 **import 这三个 .mjs 的导出函数**（`buildIntent`/`resolveIssueRefs`/`renderSection`/`recordBody`），不是调 CLI —— Go 侧已有同名导出，阶段 C 是把 merge-gate 改成调库，入口契约不经过命令行。另：last-change 的 git 命令别换 plumbing（`-z` 等），`core.quotePath=true` 会把非 ASCII 路径转八进制转义，两侧逐字节一致正是靠它；writer-record 的退出码是「判定结论 × 评论成功」的合成，infra 评论成功仍退 1，不是可重试信号；`GITHUB_OUTPUT` 是追加写。
 **运行时方言第二次咬人（与阶段 A 同一类，这次的载体是 stderr 文案）**：last-change 的「EVENT 非法 JSON」用例本地（Node 24）全绿、CI（Node 20）红——JSON.parse 的坐标后缀 (line 1 column 2) 只在 Node 22+ 出现。修法与阶段 A 同口径：比对前把坐标后缀从两侧摘掉（位置数字仍比），并**单独断言 Go 侧一律带坐标**，避免「两边都摘」退化成什么都没比。判断：凡是把 JSON.parse 的消息写进输出面的入口，都按这条办。
+
+## 九、同步到 main 时暴露的一个状态机缺口（未修，登记）
+
+阶段 B 的 PR #83 基分支误设为 `develop`：GitHub 只在**指向默认分支**时自动关单，main 也就没快进。补的同步 PR #84（`develop → main`）又踩到第二层：门 G1 需要一个**还能被合并带到 done 的 issue**，而 #82 已被写者带到 `state:done`，门如实报 `E_TERMINAL_STATE 终态 done 不能再转换`。于是单独开 #85 作为同步单。
+
+PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progress`。原因查清：写者的意图表**只认 `issues.opened` 与 `issues.labeled`**（`scripts/build-intent.mjs:158`、`:164`，Go 侧同源），`issues.closed` 不产生意图；而 PR 关闭事件（`pull_request.closed && merged` → done）与 GitHub 的自动关单几乎同时发生，谁先谁后不确定。结果是「关单是平台外的动作，状态标签是平台内的记录」这两件事在时间上脱钩。
+
+不在这里手工改标签：状态只有一个写者，绕过写者改标签等于把契约当建议。这条缺口留给后续（要么给 `issues.closed` 建意图，要么把自动关单从平台外挪进写者）。当前状态如实写在 PR/issue 里，读的人能看到。
