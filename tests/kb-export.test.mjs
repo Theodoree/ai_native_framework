@@ -292,7 +292,7 @@ test("(b) commit 时间读不出就是 null：退出 3、不拿 now() 补位、�
   });
 });
 
-test("(c) 把产物喂两遍（模拟下一次合并重试）：按 path + sha256 去重后为零", () => {
+test("(c) 把产物喂两遍（模拟下一次合并重试）：什么都不新增，产物逐字节不变", () => {
   const { dir, base, tip } = mergedRange();
   const first = exportManifest(dir, { from: base, to: tip });
   expect(first.records).toHaveLength(3);
@@ -304,13 +304,80 @@ test("(c) 把产物喂两遍（模拟下一次合并重试）：按 path + sha25
   });
 
   expect(second.status).toBe(0);
-  expect(second.records).toEqual([]);
+  // 清单是累积的：上一轮的记录继承下来，新增为零。判「有没有新增」看 duplicates，不看文件长度。
   expect(second.stderr).toContain("duplicates=3");
-  // 两份产物合起来仍无重复：幂等键是 path + sha256。
-  const keys = [...first.records, ...second.records].map(
-    (r) => r.path + "|" + r.sha256,
-  );
+  expect(second.stderr).toContain("included=0 inherited=3");
+  // 头注释里的「新增/继承」计数按设计会变（同一份产物喂两遍，第一遍全新增、第二遍全继承），
+  // 逐字节不变的是记录本身与正文。
+  const body = (text) => text.split("\n").filter((l) => !l.startsWith("#"));
+  expect(body(second.text)).toEqual(body(first.text));
+  expect(second.records).toEqual(first.records);
+  const keys = second.records.map((r) => r.path + "|" + r.sha256);
   expect(new Set(keys).size).toBe(keys.length);
+});
+
+test("(c) 清单是累积的：第三次合并的产物 = 前两轮的全部记录 + 本轮新增", () => {
+  const { dir, base, tip } = mergedRange();
+  const first = exportManifest(dir, { from: base, to: tip });
+  const next = commit(
+    dir,
+    {
+      "docs/architecture.md": "arch v3\n",
+      "docs/postmortem/p02-second.md": "second\n",
+    },
+    { message: "m2" },
+  );
+
+  const second = exportManifest(dir, {
+    from: tip,
+    to: next,
+    extra: ["--existing", first.outPath],
+  });
+
+  expect(second.status).toBe(0);
+  expect(second.stderr).toContain("included=2 inherited=3");
+  // 6 条：3 条继承 + 2 条新增 + 1 条「arch v3」是新 sha 也是新记录（同路径不同内容）
+  expect(second.records).toHaveLength(5);
+  const keys = second.records.map((r) => r.path + "|" + r.sha256);
+  expect(new Set(keys).size).toBe(keys.length);
+  expect(second.records.filter((r) => r.path === "docs/architecture.md")).toHaveLength(2);
+  // 内容回滚到旧 sha 也不会被当成新记录：累积清单里已经有它。
+  const back = commit(dir, { "docs/architecture.md": "arch v2\n" }, { message: "m3" });
+  const third = exportManifest(dir, {
+    from: next,
+    to: back,
+    extra: ["--existing", second.outPath],
+  });
+  expect(third.stderr).toContain("included=0");
+  expect(third.records).toHaveLength(5);
+});
+
+test("(c) 基准本该存在却读不到：--require-existing 记 INFRA，不按空清单去重", () => {
+  const { dir, base, tip } = mergedRange();
+  const missing = join(dir, "not-restored/kb-manifest.yml");
+
+  const r = exportManifest(dir, {
+    from: base,
+    to: tip,
+    extra: ["--existing", missing, "--require-existing"],
+  });
+
+  expect(r.status).toBe(3);
+  expect(r.stderr).toContain("existing-missing");
+  expect(r.infra.kind).toBe("infra");
+  expect(r.infra.failures).toEqual([
+    { path: null, reason: "existing-missing: 去重基准读不到 " + missing },
+  ]);
+
+  // 没有这个开关时，同样的缺失仍按「首次汇入」处理——两种情形不能混。
+  const relaxed = exportManifest(dir, {
+    from: base,
+    to: tip,
+    extra: ["--existing", missing],
+  });
+  expect(relaxed.status).toBe(0);
+  expect(relaxed.records).toHaveLength(3);
+  expect(relaxed.stderr).toContain("--existing 不在（首次汇入）");
 });
 
 test("(c) 内容变了就是新记录：同路径不同 sha256 不会被去重掉", () => {
@@ -328,8 +395,14 @@ test("(c) 内容变了就是新记录：同路径不同 sha256 不会被去重�
     extra: ["--existing", first.outPath],
   });
 
-  expect(second.records.map((r) => r.path)).toEqual(["docs/architecture.md"]);
-  expect(second.records[0].sha256).toBe(sha256("arch v3\n"));
+  // 清单是累积的：3 条继承 + 1 条新增（同路径不同 sha 是另一条记录，不会被去重掉）。
+  expect(second.stderr).toContain("included=1 inherited=3");
+  expect(second.records).toHaveLength(4);
+  const arch = second.records.filter((r) => r.path === "docs/architecture.md");
+  expect(arch.map((r) => r.sha256)).toEqual([
+    sha256("arch v2\n"),
+    sha256("arch v3\n"),
+  ]);
 });
 
 test("(d) .env / secrets / 构建产物即使出现在 diff 里也不进清单（反向用例）", () => {
@@ -475,10 +548,20 @@ test("(f) wiring 钉在 YAML 上：只在合并后跑、真调脚本、失败走
   expect(infraStep.run).toContain("exit 0");
 
   // 上一轮的产物名必须和这一轮上传的对得上，否则 --existing/--retry 永远空转。
-  expect(byName("restore previous artifacts").run).toContain(
-    "--name kb-manifest",
-  );
-  expect(byName("restore previous artifacts").run).toContain("--name kb-infra");
+  const restoreStep = byName("restore previous artifacts");
+  expect(restoreStep.run).toContain("--name kb-manifest");
+  expect(restoreStep.run).toContain("--name kb-infra");
+  // 基准只能来自别的 run：把自己算进来，rerun 时就会从「本 run 自己」取（还没写出来的）产物。
+  expect(restoreStep.env.SELF_RUN).toContain("github.run_id");
+  expect(restoreStep.run).toContain("select(.databaseId != ");
+  expect(restoreStep.run).toContain("base=");
+  // 基准缺失的两种情形必须分开：none = 首次汇入（不许要求基准），unknown = 该有却没取到（要求基准 → INFRA）。
+  expect(restoreStep.run).toContain("BASE=none");
+  expect(restoreStep.run).toContain("BASE=unknown");
+  // 基准本该存在时脚本必须记 INFRA 而不是按空清单去重。
+  expect(exportStep.env.BASE).toContain("steps.restore.outputs.base");
+  expect(exportStep.run).toContain("--require-existing");
+  expect(exportStep.run).toContain('${BASE:-none}');
   expect(byName("upload manifest").with.name).toBe("kb-manifest");
   expect(byName("upload infra").with.name).toBe("kb-infra");
 });
@@ -523,6 +606,8 @@ function runWorkflow(
     "github.event.before": before,
     "github.event.after": after,
     "secrets.GITHUB_TOKEN": "stub-token",
+    // restore 步骤在沙箱里被跳过（要联网拉上一轮产物），所以基准就是「首次汇入」。
+    "steps.restore.outputs.base": "none",
   };
   const ghOutput = join(dir, "gh_output");
   writeFileSync(ghOutput, "");

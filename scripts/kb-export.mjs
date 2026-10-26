@@ -29,7 +29,8 @@ const USAGE = `kb-export — 从 commit 区间算出知识库汇入清单
   --ref <name>           source_ref（缺省 main）
   --cwd <dir>            跑 git 的仓库根（缺省当前目录）
   --updated-at <ISO8601> 覆盖 updated_at（缺省取 to 的 commit 时间，绝不取 now()）
-  --existing <file>      上一次的清单：按 path + sha256 去重
+  --existing <file>      上一次的清单：按 path + sha256 去重，并继承进本次产物（累积清单）
+  --require-existing     给了 --existing 就必须读得到：读不到记 INFRA，不静默按空清单去重
   --retry <file>         上一次的 INFRA 记录：把其中失败的路径按当前快照重算
   --out <file>           清单落盘（缺省 stdout）
   --infra-out <file>     INFRA 记录落盘
@@ -39,6 +40,8 @@ const USAGE = `kb-export — 从 commit 区间算出知识库汇入清单
 
 const USAGE_ERROR = 2;
 const INFRA = 3;
+// 不带值的开关。值开关一律 `--k v`，混用会让 `--out --require-existing` 这种顺序静默换义。
+const BOOLEAN_FLAGS = new Set(["help", "require-existing"]);
 const MAX_BUFFER = 64 * 1024 * 1024;
 
 function git(cwd, args, { raw = false } = {}) {
@@ -155,6 +158,21 @@ function commitDate(cwd, to) {
   }
 }
 
+// 累积清单：继承上一轮的记录 + 本次新增，按同一个幂等键（path + sha256）去重。
+// 这样「基准只有一次 run 深」不会退化成「只跟上一轮比」——每轮产物都是全量，
+// 内容回滚到旧 sha 时也能被认出来。
+export function mergeRecords(inherited, added) {
+  const merged = [];
+  const seen = new Set();
+  for (const record of [...inherited, ...added]) {
+    const key = recordKey(record);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(record);
+  }
+  return merged;
+}
+
 export function buildManifest({
   cwd,
   repo,
@@ -213,9 +231,11 @@ export function buildManifest({
   return { records, denied, duplicates, failures };
 }
 
-export function renderManifest(records, { repo, ref, from, to }) {
+export function renderManifest(records, { repo, ref, from, to, added }) {
+  const addedCount = typeof added === "number" ? added : records.length;
   const header =
     `# 知识库汇入清单 · source_repo=${repo} source_ref=${ref} range=${from}..${to}\n` +
+    `# 累积清单：本次区间新增 ${addedCount} 条、继承 ${records.length - addedCount} 条、共 ${records.length} 条\n` +
     "# 每条固定头见 docs/knowledge-base.md；sha256 取 git blob（commit 内的内容字节），不是工作区。\n";
   const body =
     records.length === 0 ? "[]\n" : YAML.stringify(records, { lineWidth: 0 });
@@ -242,13 +262,24 @@ export function renderInfra({ repo, ref, from, to, failures }) {
   );
 }
 
-function loadExisting(file, warn) {
+// required=true 时「读不到」不再当成首次汇入：基准其实存在、只是没取回来，
+// 按空集去重就会把同一个合并汇入两次（M3 幂等判据就是这么破的）。
+function loadExisting(file, warn, { required = false } = {}) {
   if (!file) return { records: [], failures: [] };
   let text;
   try {
     text = readFileSync(file, "utf8");
   } catch (e) {
     if (e.code === "ENOENT") {
+      if (required) {
+        warn(`existing-missing: 去重基准读不到 ${file} —— 不按空清单去重`);
+        return {
+          records: [],
+          failures: [
+            { path: null, reason: `existing-missing: 去重基准读不到 ${file}` },
+          ],
+        };
+      }
       warn(`--existing 不在（首次汇入）：按空清单去重 ${file}`);
       return { records: [], failures: [] };
     }
@@ -302,8 +333,8 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (!arg.startsWith("--")) throw new Error(`多余的参数: ${arg}`);
     const key = arg.slice(2);
-    if (key === "help") {
-      out.help = true;
+    if (BOOLEAN_FLAGS.has(key)) {
+      out[key.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = true;
       continue;
     }
     const value = argv[i + 1];
@@ -368,7 +399,9 @@ function main() {
     return USAGE_ERROR;
   }
 
-  const existing = loadExisting(args.existing, warn);
+  const existing = loadExisting(args.existing, warn, {
+    required: Boolean(args.requireExisting) && Boolean(args.existing),
+  });
   const retryPaths = loadRetry(args.retry, warn);
 
   const failures = [...existing.failures];
@@ -394,13 +427,23 @@ function main() {
 
   for (const d of built.denied) warn(`denied ${d.path} (${d.reason})`);
 
-  writeOut(args.out, renderManifest(built.records, { repo, ref, from, to }));
+  const merged = mergeRecords(existing.records, built.records);
+  writeOut(
+    args.out,
+    renderManifest(merged, {
+      repo,
+      ref,
+      from,
+      to,
+      added: built.records.length,
+    }),
+  );
   if (args["infra-out"])
     writeOut(args["infra-out"], renderInfra({ repo, ref, from, to, failures }));
 
   warn(
-    `included=${built.records.length} duplicates=${built.duplicates} ` +
-      `denied=${built.denied.length} infra=${failures.length}`,
+    `included=${built.records.length} inherited=${merged.length - built.records.length} ` +
+      `duplicates=${built.duplicates} denied=${built.denied.length} infra=${failures.length}`,
   );
   return failures.length > 0 ? INFRA : 0;
 }
