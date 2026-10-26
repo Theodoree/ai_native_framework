@@ -4,7 +4,7 @@
 
 | 文件                 | 唯一职责                                                                                                                                                            | 不做什么                                                         |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `state-validate.mjs` | 读声明、判定一次状态转换（0 allowed / 1 rejected / 3 INFRA），意图没有归属 issue 也判 INFRA                                                                         | 不写任何状态，不知道宿主是谁                                     |
+| `state-validate.mjs` | 读声明、判定一次状态转换（0 allowed / 1 rejected / 3 INFRA），意图没有归属 issue 也判 INFRA；声明了 guards 的转换必须带非空证据（写入口 fail-closed），给「门」另有只读咨询入口 | 不写任何状态，不知道宿主是谁；不校验证据内容真假                |
 | `build-intent.mjs`   | 把宿主事件映射成意图（PR 事件解析它引用的 issue）                                                                                                                   | 不判定；认不出的事件返回 null，解析不出 issue 就交 null 给判定器 |
 | `writer-record.mjs`  | 判定之后怎么留痕：评论正文 + job 红绿（rejected→0 / infra→1）                                                                                                       | 不判定，不写状态                                                 |
 | `ledger.mjs`         | append-only 账本：追加事件、折叠成投影                                                                                                                              | 不判定，不决定状态                                               |
@@ -21,12 +21,13 @@
 ```bash
 npm run cli -- board [--json]
 npm run cli -- new "标题" [--body "正文"] [--json]
-npm run cli -- verdict --id REQ-1 --to in-progress [--role owner|ci|proposer|platform] [--comment "…"] [--json]
+npm run cli -- verdict --id REQ-1 --to in-progress [--role owner|ci|proposer|platform] [--comment "…"] [--guard name=evidence]... [--json]
 npm run cli -- verify [--json]
 npm run cli -- outbox [--json]
 ```
 
 - 后端地址：`--api <url>` 或 `PLATFORM_API`，默认 `http://127.0.0.1:4317`；只向这个 origin 发请求。
+- `--guard name=evidence` 可重复，落进请求体的 `guards` 对象，值是 `name=` 之后的全部内容（证据里可以再有 `=`）；缺 `=` 或 name 为空算用法错误（退出 `2`，不发请求）。一次都没给时请求体里没有 `guards` 字段。
 - 退出码：`0` 成功；`1` 后端回 `kind=rejected`（400/409，message 打到 stderr）；`2` 用法错误；`3` 网络错误 / 5xx / `kind=infra`。
 - `verify` 独占 `4`：校验真的跑了、`exitCode != 0`（判红）。拿不到可信结论（超时、被杀、响应里没有 `exitCode`）仍走 `3`——「没过」和「不知道过没过」必须分开，否则流水线会把没跑完当通过、把没过当故障。
 - 它唯一的输出是 stdout 文本与发出去的 HTTP 请求：没有账本读写，`--to` 的合法性只由后端判定。

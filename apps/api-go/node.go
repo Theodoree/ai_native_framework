@@ -27,14 +27,18 @@ type intent struct {
 	To        string   `json:"to"`
 	ActorRole string   `json:"actor_role"`
 	Comment   string   `json:"comment,omitempty"`
+	// Guards 是写者给的守卫证据（名 → 证据字符串）。Go 只搬形状，不判内容：
+	// 「这个守卫需要什么证据」只有声明说，「证据是真的」只有写者担保。
+	Guards map[string]string `json:"guards,omitempty"`
 }
 
 type decision struct {
-	From  string
-	To    string
-	By    string
-	Flow  json.RawMessage
-	Event json.RawMessage
+	From   string
+	To     string
+	By     string
+	Flow   json.RawMessage
+	Event  json.RawMessage
+	Guards map[string]string
 }
 
 type ledgerEvent struct {
@@ -47,6 +51,9 @@ type ledgerEvent struct {
 	By      string          `json:"by"`
 	Flow    json.RawMessage `json:"flow"`
 	Comment string          `json:"comment"`
+	// omitempty 是契约的一部分：没有证据的事件一个字节都不多出来，
+	// 既有账本行的形状因此与改动前完全一致。
+	Guards map[string]string `json:"guards,omitempty"`
 }
 
 type stateMeta struct {
@@ -188,12 +195,17 @@ func (a *app) decide(ctx context.Context, in intent) (*decision, error) {
 	}
 	switch verdict {
 	case "allowed":
+		guards, guardErr := parseGuardObject(extra["guards"])
+		if guardErr != nil {
+			return nil, infraErr("E_VALIDATOR_OUTPUT", "判定器回的 guards 形状不对: "+guardErr.Error())
+		}
 		return &decision{
-			From:  anyString(extra["from"]),
-			To:    anyString(extra["to"]),
-			By:    anyString(extra["by"]),
-			Flow:  rawOrNull(extra["flow"]),
-			Event: rawOrNull(extra["event"]),
+			From:   anyString(extra["from"]),
+			To:     anyString(extra["to"]),
+			By:     anyString(extra["by"]),
+			Flow:   rawOrNull(extra["flow"]),
+			Event:  rawOrNull(extra["event"]),
+			Guards: guards,
 		}, nil
 	case "rejected":
 		return nil, &apiError{Kind: "rejected", Code: code, Message: message, Extra: extra}
@@ -302,6 +314,27 @@ func rawOrNull(value any) json.RawMessage {
 func anyString(value any) string {
 	text, _ := value.(string)
 	return text
+}
+
+// parseGuardObject 只搬形状：对象且每个值都是字符串才收下，nil 表示「没有证据」。
+// 这里刻意不判「证据够不够/真不真」—— 那是判定器与写者各自的事，Go 重判就是第二份判定。
+func parseGuardObject(value any) (map[string]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, errors.New("guards 必须是对象（守卫名 → 证据字符串）")
+	}
+	guards := make(map[string]string, len(object))
+	for name, evidence := range object {
+		text, ok := evidence.(string)
+		if !ok {
+			return nil, errors.New("守卫证据 " + name + " 不是字符串")
+		}
+		guards[name] = text
+	}
+	return guards, nil
 }
 
 func shorten(text string) string {

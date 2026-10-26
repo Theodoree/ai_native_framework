@@ -42,7 +42,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolveIssueRefs } from "./build-intent.mjs";
 import { BLOCK_BEGIN, BLOCK_END, renderLastChange } from "./last-change.mjs";
-import { loadConfig, validateIntent } from "./state-validate.mjs";
+import { consultTransition, loadConfig } from "./state-validate.mjs";
 
 const CHECK = "merge-gate";
 const DEFAULT_CONFIG = ".agents/platform/state-machine.yml";
@@ -255,7 +255,9 @@ function guardIssueState(ctx) {
     .filter(Boolean);
   // 状态规则不在这里：整条意图交给 state-validate 判定。两处规则就是两个真相源，
   // 改一处另一处就会撒谎。
-  const result = validateIntent(cfg, {
+  // 用咨询入口而不是写入口：门问的是「这条转换被声明了吗」，守卫证据由写者提供；
+  // 门自己就是证据的生产者，拿写入口问自己会永远问不出绿。
+  const result = consultTransition(cfg, {
     issue: ctx.issue.number,
     to: "done",
     actor_role: "ci",

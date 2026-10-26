@@ -14,6 +14,9 @@ export interface BoardTransition {
   by: string;
   event: string;
   commentRequired: boolean;
+  // guards 是这条转换声明的守卫名（如 merge-gate）：原样取，缺省 []，非字符串丢弃。
+  // 前端只据此收集证据，够不够由后端判定（E_GUARD_MISSING），这里不做任何守卫判断。
+  guards: string[];
   raw: Loose;
 }
 

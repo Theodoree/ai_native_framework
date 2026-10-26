@@ -12,6 +12,8 @@ export interface VerdictInput {
   to: string;
   actor_role: string;
   comment: string;
+  // undefined = 请求体里不出现 guards 这个键；「证据不够」由后端判定，前端不补空对象。
+  guards?: Record<string, string>;
 }
 
 function failureOf(
@@ -116,12 +118,15 @@ export function postItem(
 }
 
 export function postVerdict(input: VerdictInput): Promise<ApiResult<unknown>> {
-  return request<unknown>("POST", "/verdict", {
+  const payload: Record<string, unknown> = {
     id: input.id,
     to: input.to,
     actor_role: input.actor_role,
     comment: input.comment,
-  });
+  };
+  // 只有调用方给了非空证据表才带上这个键：没有声明守卫的转换不能凭空多出一个字段。
+  if (input.guards !== undefined) payload["guards"] = input.guards;
+  return request<unknown>("POST", "/verdict", payload);
 }
 
 export function postVerify(): Promise<ApiResult<unknown>> {

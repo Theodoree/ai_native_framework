@@ -53,6 +53,8 @@ function normalizeTransition(raw: unknown): BoardTransition {
     event: readString(loose, "event") ?? "",
     commentRequired:
       readFlag(loose, "comment_required") || readFlag(loose, "commentRequired"),
+    // guards 只在声明里出现时才有；缺省 [] 表示「这条转换没声明守卫」。
+    guards: readStringList(loose["guards"]),
     raw: loose,
   };
 }

@@ -24,8 +24,10 @@ const USAGE = `用法: cli <命令> [选项] [--api <url>] [--json]
 命令:
   board [--json]                                   列出条目（id / state / title / 漂移）
   new <title> [--body <text>] [--json]             新建需求，打印新 id 与落到的状态
-  verdict --id <id> --to <state> [--role <role>] [--comment <text>] [--json]
-                                                   发起一次状态变更（--role 缺省 owner）
+  verdict --id <id> --to <state> [--role <role>] [--comment <text>]
+          [--guard <name>=<evidence>]... [--json]
+                                                   发起一次状态变更（--role 缺省 owner；
+                                                   --guard 可重复，声明了守卫的转换必须带证据）
   verify [--json]                                  真跑校验，打印 exitCode 与输出尾部（判红则退出 4）
   outbox [--json]                                  列出在途条目（status/attempts/nextCheckAt）
 
@@ -51,10 +53,13 @@ const infraError = (message) => new CliError(EXIT_INFRA, message);
 const COMMAND_FLAGS = {
   board: {},
   new: { body: true },
-  verdict: { id: true, to: true, role: true, comment: true },
+  verdict: { id: true, to: true, role: true, comment: true, guard: true },
   verify: {},
   outbox: {},
 };
+
+// 可重复的选项：同一个 flag 收多次不覆盖，按出现顺序攒成数组。
+const REPEATABLE = new Set(["guard"]);
 
 const takeValue = (tokens, flag) => {
   if (tokens.length === 0) throw usageError(`选项 ${flag} 缺少取值`);
@@ -99,7 +104,9 @@ const parseArgv = (argv) => {
             : `不认识全局选项 ${token}`,
         );
       }
-      parsed.flags[name] = takeValue(tokens, token);
+      const value = takeValue(tokens, token);
+      if (REPEATABLE.has(name)) (parsed.flags[name] ??= []).push(value);
+      else parsed.flags[name] = value;
       continue;
     }
     if (parsed.command === null) {
@@ -119,6 +126,21 @@ const parseArgv = (argv) => {
   for (const name of required) {
     if (parsed.flags[name] === undefined)
       throw usageError(`命令 ${parsed.command} 缺少必填选项 --${name}`);
+  }
+  // --guard name=evidence：值是 name= 之后的全部内容（证据里可以再有 =）。
+  // 形状不对就是用法错误 —— 在发请求之前拦住，别让后端去猜。
+  if (parsed.command === "verdict" && parsed.flags.guard !== undefined) {
+    const guards = {};
+    for (const entry of parsed.flags.guard) {
+      const at = entry.indexOf("=");
+      if (at === -1)
+        throw usageError(`--guard 需要 name=evidence 形状: ${entry}`);
+      const name = entry.slice(0, at);
+      if (name === "")
+        throw usageError(`--guard 的 name 不能为空: ${entry}`);
+      guards[name] = entry.slice(at + 1);
+    }
+    parsed.guards = guards;
   }
   if (parsed.command === "new") {
     if (parsed.positionals.length === 0)
@@ -344,6 +366,8 @@ const verdict = async (context) => {
     actor_role: context.flags.role ?? "owner",
     comment: context.flags.comment ?? "",
   };
+  // 一次 --guard 都没给就不带这个字段：请求形状与改动前逐字节一致。
+  if (context.guards) payload.guards = context.guards;
   const created = await request(context.api, "/api/verdict", {
     method: "POST",
     body: payload,
@@ -415,6 +439,7 @@ const execute = async (argv) => {
     api,
     json: parsed.json,
     flags: parsed.flags,
+    guards: parsed.guards ?? null,
     positionals: parsed.positionals,
   });
   // 处理器默认只产文本（成功）；需要独立退出码的（verify）自己回 { code, stdout }。

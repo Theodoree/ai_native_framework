@@ -25,6 +25,35 @@ const chosenHints = computed(() =>
   candidates.value.filter((transition) => transition.to === target.value),
 );
 
+// 守卫名来自选中的候选转换（声明里写了 guards 的那些）：多个候选合并、按出现顺序去重。
+// 这里只决定「要收集哪几个键」，不判断证据够不够——那是后端（E_GUARD_MISSING）的事。
+const guardNames = computed<string[]>(() => {
+  const list: string[] = [];
+  for (const transition of chosenHints.value) {
+    for (const guard of transition.guards) {
+      if (!list.includes(guard)) list.push(guard);
+    }
+  }
+  return list;
+});
+
+// 证据按 guard 名存：换了目标再换回来，已填内容还在；清空就交空值，由 store 丢弃。
+const guardEvidenceInput = ref<Record<string, string>>({});
+
+function guardPlaceholder(name: string): string {
+  return "证据，例如 " + name + " PASS 4/4";
+}
+
+// 只收集当前目标声明过的 guard；空值不在这里拦，store 会丢弃、后端会判够不够。
+function guardsForSubmit(): Record<string, string> {
+  const collected: Record<string, string> = {};
+  for (const name of guardNames.value) {
+    const value = guardEvidenceInput.value[name];
+    if (value !== undefined) collected[name] = value;
+  }
+  return collected;
+}
+
 watch(
   targets,
   (list) => {
@@ -59,6 +88,7 @@ async function submit(): Promise<void> {
     to: target.value,
     actorRole: actorRole.value,
     comment: comment.value,
+    guards: guardsForSubmit(),
   });
 }
 </script>
@@ -99,6 +129,20 @@ async function submit(): Promise<void> {
         </v-chip>
       </li>
     </ul>
+    <div v-if="guardNames.length > 0" class="guards">
+      <p class="text-caption text-medium-emphasis mb-1">
+        这条转换声明了守卫（guards）：证据随提交一并发给后端，够不够由后端判定。
+      </p>
+      <v-text-field
+        v-for="guard in guardNames"
+        :key="guard"
+        v-model="guardEvidenceInput[guard]"
+        :label="guard"
+        :placeholder="guardPlaceholder(guard)"
+        density="compact"
+        class="mb-1"
+      />
+    </div>
     <v-btn
       color="primary"
       class="mt-2"

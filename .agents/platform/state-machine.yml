@@ -1,6 +1,8 @@
 # 状态机 · 声明真源（issue 状态的唯一家）
 # 状态存在 issue 的 state:* label 上；平台不存第二份状态。
 # none = 「还没有 state 标签」，只作为起点出现，不是真实状态。
+# guards 是「这次转换必须能被某个东西证明」的声明，声明即要求：写入口缺证据就拒绝，
+# 规则对任何守卫名都成立（判定器不判断证据真假）。详见 docs/workflow.md「守卫证据」一节。
 version: 1
 label_prefix: "state:"
 issue_types:

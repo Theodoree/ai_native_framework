@@ -259,3 +259,18 @@ func stringField(object map[string]any, key string) string {
 	value, _ := object[key].(string)
 	return value
 }
+
+// guardsField：请求体的 guards 只接受「对象且每个值是字符串」。
+// 形状不对不静默忽略 —— 静默忽略等于把写者的错形状当成「没证据」，也等于替判定器放行；
+// 显式 null 与判定器的 null 语义对齐：按「没有证据」处理。
+func guardsField(object map[string]any) (map[string]string, error) {
+	value, present := object["guards"]
+	if !present || value == nil {
+		return nil, nil
+	}
+	guards, err := parseGuardObject(value)
+	if err != nil {
+		return nil, infraErr("E_GUARD_SHAPE", "请求体的 guards 形状不对: "+err.Error()+"；要 {\"<守卫名>\": \"<证据字符串>\"}")
+	}
+	return guards, nil
+}

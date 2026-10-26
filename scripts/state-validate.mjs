@@ -11,6 +11,16 @@ import YAML from "yaml";
 
 const NONE = "none"; // 「还没有 state 标签」，只作起点
 
+const USAGE = `用法: state-validate [--config <path>] [--intent <file|->] [--json] [--check-config]
+
+  --config <path>   状态机声明，默认 .agents/platform/state-machine.yml
+  --intent <file>   意图 JSON（- 或缺省 = stdin）
+  --json            机器可读输出（allowed 带 from/to/by/flow/event/guards）
+  --check-config    只校验声明自洽
+  --help            打印本用法
+
+guards: 转换声明了 guards 时，意图必须在 guards 里给非空证据 —— 缺一个就拒绝。`;
+
 class Fail extends Error {
   constructor(kind, code, message, extra = {}) {
     super(message);
@@ -113,7 +123,9 @@ export function resolveEntry(cfg, flow) {
   return { ...candidates[0], flow: effective };
 }
 
-export function validateIntent(cfg, intent) {
+// 解析一次意图：形状、角色、状态标签、转换匹配、角色匹配、评论要求。
+// 写入口和咨询入口共用这一段 —— 唯一的差别是「守卫证据」只在写入口评估。
+function resolveTransition(cfg, intent) {
   const { states, transitions, roles, label_prefix: prefix } = cfg;
   if (!intent || typeof intent !== "object")
     throw infra("E_INTENT_SHAPE", "意图不是对象");
@@ -211,7 +223,64 @@ export function validateIntent(cfg, intent) {
     by: transition.by,
     flow: transition.flow ?? null,
     event: transition.event ?? null,
+    transition,
   };
+}
+
+// 写入口（唯一）：CLI --intent、--api /verdict 走这里落账本。
+// 声明了 guards 的转换必须带非空证据：fail-closed，漏写等于拒绝，
+// 规则对任何 guard 名都成立（不认识 merge-gate 之外的任何特例）。
+export function validateIntent(cfg, intent) {
+  const supplied = guardEvidence(intent);
+  const { transition, ...resolved } = resolveTransition(cfg, intent);
+  const declared = Array.isArray(transition.guards) ? transition.guards : [];
+  const missing = declared.filter(
+    (name) => !String(supplied?.[name] ?? "").trim(),
+  );
+  if (missing.length > 0) {
+    throw reject(
+      "E_GUARD_MISSING",
+      `${resolved.from} → ${resolved.to} 需要守卫证据：${missing.join("、")}`,
+      { from: resolved.from, to: resolved.to, guards: missing },
+    );
+  }
+  const evidence = {};
+  for (const name of declared) evidence[name] = supplied[name];
+  return {
+    ...resolved,
+    // 未声明 guards 的转换不输出这个字段（响应形状与改动前一致）。
+    ...(declared.length > 0 ? { guards: evidence } : {}),
+  };
+}
+
+// 咨询入口：只读，给「门」回答一个问题 —— 这条转换是否被声明、角色是否对、
+// 评论要求是否满足。它明确不评估 guards，也明确不产出可落账本的结论：
+// 返回值标 consult: true，且不带 event / guards 这些写路径才需要的东西。
+// 任何写者都不得拿它的结论去改状态；写状态只有 validateIntent 一条路。
+export function consultTransition(cfg, intent) {
+  const { from, to, by, flow } = resolveTransition(cfg, intent);
+  return { consult: true, from, to, by, flow };
+}
+
+// guards 的证据形状先判：形状不对属「没判过」（INFRA），不是「拒绝」。
+function guardEvidence(intent) {
+  const supplied = intent.guards ?? null;
+  if (supplied === null) return null;
+  if (typeof supplied !== "object" || Array.isArray(supplied)) {
+    throw infra(
+      "E_GUARD_SHAPE",
+      `意图的 guards 必须是对象（{ "<guard 名>": "<证据>" }），实际是 ${Array.isArray(supplied) ? "数组" : typeof supplied}`,
+    );
+  }
+  for (const [name, value] of Object.entries(supplied)) {
+    if (typeof value !== "string") {
+      throw infra(
+        "E_GUARD_SHAPE",
+        `守卫证据 ${name} 必须是字符串，实际是 ${typeof value}`,
+      );
+    }
+  }
+  return supplied;
 }
 
 function main(argv) {
@@ -219,6 +288,10 @@ function main(argv) {
     const at = argv.indexOf(name);
     return at === -1 ? fallback : argv[at + 1];
   };
+  if (argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(USAGE + "\n");
+    process.exit(0);
+  }
   const configPath = flag("--config", ".agents/platform/state-machine.yml");
   const checkOnly = argv.includes("--check-config");
   const asJson = argv.includes("--json");
