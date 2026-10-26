@@ -12,6 +12,7 @@
 | `merge-gate.mjs`     | 合并资格的四条独立守卫（0 可合 / 1 拒绝 / 3 INFRA），每条判 flush 一行到 stdout                                                                                     | 不合并 PR、不改 issue 状态、不写门牌；不联网（输入全部注入）     |
 | `audit-findings.mjs` | findings 的执行层：校验固定 schema、合并多个执行器的 verdict、按 path+line+criterion 逐条比对并给出 Check conclusion（0 pass / 1 needs_revision\|reject / 3 INFRA） | 不跑模型、不联网；不判代码好坏，只判「这次结论能不能算数」       |
 | `audit-slot.mjs`     | 把上游 findings 落到 review-a / review-b 槽，并校验自报身份与槽位一致（不符即 INFRA）                                                                               | 不改写 verdict、不补造 evidence；坏 JSON 原样交给口径层点名      |
+| `audit-collect.mjs`  | 审计编排层：预检两份 findings、发一次 `audit.yml` 的 workflow_dispatch、轮询本次 run、读回该 sha 上 `name=audit` 的 Check Run（0 success / 1 failure / 3 判不了）   | 不判定；不写文件；流水线用 `node` 直调或 `npm run --silent`      |
 | `copy-dist.mjs`      | 把 `apps/web-vue/dist` 复制进 `apps/api-go/dist`，让 Go 把它内嵌进单二进制                                                                                          | 不构建前端、不改产物内容；源缺 `index.html` 时只提示不失败       |
 | `routing.mjs`        | 读路由真源 `.agents/platform/routing.yml`：校验声明自洽 + 扫 workflow 里的硬编码模型名（0 通过 / 1 有问题）                                                         | 不联网、不调网关、不判定审计结论；模型名只认真源，不猜命名规范   |
 | `cli.mjs`            | 接入层：终端/流水线发命令（board/new/verdict/verify/outbox），退出码 0 / 1 rejected / 2 用法 / 3 infra / 4 verify 判红                                              | 不写状态、不读账本、不判断状态转换；`--to` 原样交给后端判定器    |
