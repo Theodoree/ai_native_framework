@@ -9,6 +9,7 @@
     "check:state": "node scripts/state-validate.mjs --check-config",
     "check:go": "cd apps/api-go && test -z \"$(gofmt -l *.go)\" && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
     "check:web": "npm --prefix apps/web-vue run build && node scripts/copy-dist.mjs",
+    "cli": "node scripts/cli.mjs",
     "format": "prettier --write .",
     "lint": "oxlint scripts tests",
     "test": "vitest run",
