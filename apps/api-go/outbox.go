@@ -442,15 +442,18 @@ func pollInterval(attempts int) time.Duration {
 
 // NextInspection 是纯决策函数：给定 pending 集合与当前时间，给出下次巡检时间。
 // **在途为空时返回 nil —— 零请求**，绝不为了「保持轮询」而空转。
+// 过期条目从「现在」重新计时一个退避间隔：把过期当成「立刻」会让巡检协程以零等待空转，
+// 上一次巡检没有改变任何事实时，下一次也必须真的等。
 func NextInspection(pending []pendingEntry, now time.Time) *time.Time {
 	if len(pending) == 0 {
 		return nil
 	}
 	var next *time.Time
 	for _, entry := range pending {
-		due := entry.RequestedAt.Add(pollInterval(entry.Attempts))
-		if due.Before(now) {
-			due = now
+		interval := pollInterval(entry.Attempts)
+		due := entry.RequestedAt.Add(interval)
+		if !due.After(now) {
+			due = now.Add(interval)
 		}
 		if next == nil || due.Before(*next) {
 			copied := due

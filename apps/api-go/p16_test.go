@@ -545,6 +545,31 @@ func TestNextInspectionIsNilWhenEmpty(t *testing.T) {
 	}
 }
 
+// 排期不许「零等待」：上一次巡检没改变任何事实时，下一次必须至少等一个退避间隔。
+// 归零会让 runOutboxLoop 以 wait=0 空转（实测 161% CPU，46% 花在读在途台账）。
+func TestNextInspectionNeverSchedulesImmediately(t *testing.T) {
+	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// 早该巡检的在途：RequestedAt 远在过去，attempts 已涨到 5。
+	overdue := []pendingEntry{{AttemptID: "att-old", RequestedAt: now.Add(-24 * time.Hour), Attempts: 5}}
+	next := NextInspection(overdue, now)
+	if next == nil {
+		t.Fatal("有在途却没排巡检")
+	}
+	if !next.After(now) {
+		t.Fatalf("排期 %v 不晚于现在 %v —— 等待为 0 会让巡检协程空转", *next, now)
+	}
+	if want := pollInterval(5); next.Sub(now) < want {
+		t.Fatalf("过期在途的等待 = %v，短于退避间隔 %v", next.Sub(now), want)
+	}
+
+	// 刚发起的在途同样按退避间隔排，不就地触发。
+	fresh := []pendingEntry{{AttemptID: "att-new", RequestedAt: now, Attempts: 0}}
+	if scheduled := NextInspection(fresh, now); scheduled == nil || !scheduled.After(now) {
+		t.Fatalf("新在途的排期 = %v，必须晚于现在", scheduled)
+	}
+}
+
 // 磁盘没有 dist 时照样出页面：内嵌 FS 就是页面来源。
 func TestEmbeddedDistServesWithoutDiskDist(t *testing.T) {
 	if _, err := fs.ReadFile(distFS, "README.md"); err != nil {
