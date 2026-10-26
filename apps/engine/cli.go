@@ -38,6 +38,7 @@ const EngineUsage = `用法: engine <子命令> [参数]
   build-intent 宿主事件 → 状态机意图（[--resolve-issue]）
   last-change  门牌幂等重算（[--in <file>] [--out <file>]）
   writer-record 判定结果 → 留痕（[--verdict <file>] [--issue <n>]）
+  merge-gate   合并资格：四道守卫 G1–G4（[--event <file>] [--pr <file>] [--issue <file>] [--checks <file>] [--infra <file>]）
 
 退出码：0 允许 / 0 成功 · 1 拒绝 · 2 用法错 · 3 INFRA`
 
@@ -67,6 +68,8 @@ func Run(argv []string, stdin io.Reader, stdout, stderr io.Writer, root string) 
 		return RunLastChange(rest, stdout, stderr, root)
 	case "writer-record":
 		return RunWriterRecord(rest, stdout, stderr)
+	case "merge-gate":
+		return RunMergeGate(rest, stdout, stderr, root)
 	default:
 		io.WriteString(stderr, EngineUsage+"\n")
 		return 2
