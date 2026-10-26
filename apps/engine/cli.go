@@ -35,6 +35,9 @@ const EngineUsage = `用法: engine <子命令> [参数]
   check-config 只校验声明自洽（[--config <path>] [--json]）
   consult      只读咨询：不评估 guards、不产出可落账本的结论（--intent <file|->）
   ledger       账本子命令（fold|events|next-id|append|entry|config [--json]）
+  build-intent 宿主事件 → 状态机意图（[--resolve-issue]）
+  last-change  门牌幂等重算（[--in <file>] [--out <file>]）
+  writer-record 判定结果 → 留痕（[--verdict <file>] [--issue <n>]）
 
 退出码：0 允许 / 0 成功 · 1 拒绝 · 2 用法错 · 3 INFRA`
 
@@ -58,6 +61,12 @@ func Run(argv []string, stdin io.Reader, stdout, stderr io.Writer, root string) 
 		return RunConsult(rest, stdin, stdout)
 	case "ledger":
 		return RunLedger(rest, stdin, stdout, stderr, root)
+	case "build-intent":
+		return RunBuildIntent(rest, stdout, stderr)
+	case "last-change":
+		return RunLastChange(rest, stdout, stderr, root)
+	case "writer-record":
+		return RunWriterRecord(rest, stdout, stderr)
 	default:
 		io.WriteString(stderr, EngineUsage+"\n")
 		return 2
