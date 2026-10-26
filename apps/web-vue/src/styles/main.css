@@ -215,6 +215,11 @@ pre {
   max-width: 220px;
 }
 
+/* 看板的搜索框和状态筛选条同一行：窄一点，把右边留给状态 chip。 */
+.board-search {
+  max-width: 260px;
+}
+
 /* ---------- 4) 知识库：列表与正文的滚动区（Vuetify 没有滚动容器） ---------- */
 .kb-list {
   max-height: 62vh;
