@@ -149,6 +149,16 @@ export function buildIntent({
   if (eventName === "issues" && action === "labeled") {
     const label = payload.label?.name ?? "";
     if (!label.startsWith("state:")) return null;
+    // 状态就是标签本身：宿主上除这次加上的这个标签以外再没有别的 state 标签，
+    // 说明状态已经是它了 —— 这不是一次转换。写者自己打标签会引发一串标签事件，
+    // 不在这里拦住，每个事件都会去判定一次并留下一条「没有从 X 到 X 的转换」。
+    // 拿不到宿主标签（null）时保持原样：事实缺失交给判定器判 INFRA，不当成无操作。
+    if (Array.isArray(issueLabelsFromHost)) {
+      const others = issueLabelsFromHost.filter(
+        (name) => name !== label && name.startsWith("state:"),
+      );
+      if (others.length === 0) return null;
+    }
     return make(issue.number ?? null, label.slice("state:".length), actorRole);
   }
 

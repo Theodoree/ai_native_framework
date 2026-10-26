@@ -75,6 +75,55 @@ test("非 state 标签的 labeled 事件不动状态", () => {
   ).toBeNull();
 });
 
+// 写者自己打标签会引发一串标签事件：状态就是标签，如果宿主上除这次加的这个标签
+// 再没有别的 state 标签，那状态已经是它了 —— 这不是一次转换，不该去判定，更不该
+// 在每个事件上留一条「没有从 X 到 X 的转换」。
+test("labeled 的标签就是当前唯一 state 标签 → 不是转换（无操作）", () => {
+  expect(
+    buildIntent({
+      eventName: "issues",
+      action: "labeled",
+      payload: issue(["state:done"], { label: { name: "state:done" } }),
+      actorRole: "ci",
+      issueLabelsFromHost: ["state:done"],
+    }),
+  ).toBeNull();
+});
+
+test("labeled：宿主上还有别的 state 标签就是转换，照旧产出意图", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "labeled",
+    payload: issue(["state:analyzing"], { label: { name: "state:accepted" } }),
+    actorRole: "owner",
+    issueLabelsFromHost: ["state:analyzing", "state:accepted"],
+  });
+  expect(out.to).toBe("accepted");
+});
+
+test("labeled：非 state 标签不参与「还有别的状态」判断", () => {
+  expect(
+    buildIntent({
+      eventName: "issues",
+      action: "labeled",
+      payload: issue(["state:accepted"], { label: { name: "state:accepted" } }),
+      actorRole: "ci",
+      issueLabelsFromHost: ["state:accepted", "type:bugfix"],
+    }),
+  ).toBeNull();
+});
+
+test("labeled：拿不到宿主标签（null）时不当无操作，交给判定器判 INFRA", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "labeled",
+    payload: issue(["state:done"], { label: { name: "state:done" } }),
+    actorRole: "ci",
+    issueLabelsFromHost: null,
+  });
+  expect(out.to).toBe("done");
+});
+
 test("pull_request.opened → in-progress，归属它引用的 issue", () => {
   const out = buildIntent({
     eventName: "pull_request",
