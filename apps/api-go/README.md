@@ -301,6 +301,7 @@ node scripts/ledger-cli.mjs config   --json   # stdout: 本文件 §board.config
 - 远端 label 变成别的值（且不是本次起点）→ §conflict§，不自动重试，交给人
 - 对账在每次同步后跑：拿每条未结在途的 §target§ 与远端当前 labels 比
 - 巡检只在**在途非空**时排期，指数退避 5s→5min 封顶；调度决策是纯函数（在途集合 + 现在 → 下次时间或 §nil§），协程里没有写死的 sleep
+- 已过期的条目从**现在**重新计时一个退避间隔，不返回「立刻」：把过期当成「立刻」会让巡检协程零等待空转（实测两个核心跑满）
 - 为什么单独一个文件：进 §ledger.jsonl§ 会污染折叠（折叠器按每行的 §event.to§ 投影状态），只放 §index.db§ 又与「索引纯派生」矛盾 —— 在途是唯一无法从真源重建的本地事实
 
 ## 知识库本体（§/api/kb§ + §.agents/platform/kb.db§）
