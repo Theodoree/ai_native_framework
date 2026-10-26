@@ -11,13 +11,13 @@
 - 派生索引：§.agents/platform/index.db§（SQLite）存折叠结果、事件时间线、远端快照、在途记录，纯派生、删了自愈
 - 在途台账：§.agents/platform/outbox.jsonl§ 记「本地改了状态、还没确认远端生效」的外发，只有它能回答「这条是不是还在路上」
 - 知识库本体：§GET /api/kb§（列目录）与 §GET /api/kb/item§（看全文），索引落 §.agents/platform/kb.db§，纯派生、删了自愈
-- 判定与账本全部经两个 Node 入口（见「Node 入口契约」）
+- 判定与账本全部经 §apps/engine§ 这个 Go 库直接调用（见「引擎契约」）：进程内调用，不再起子进程
 
 ## 不做什么
 
-- 不判断状态机：§from/to/flow/labels§ 合法性、入口落点、声明的结构校验，全部只由 §scripts/state-validate.mjs§ 回答
+- 不判断状态机：§from/to/flow/labels§ 合法性、入口落点、声明的结构校验，全部只由 §apps/engine§ 回答
 - 不解析 §state-machine.yml§：在 Go 里复制转换表校验，等于给真源开第二份实现
-- 不自己读写账本结构：事件对象原样交给 §scripts/ledger-cli.mjs§
+- 不自己读写账本结构：事件对象原样交给 §apps/engine§ 的账本函数
 - 不做鉴权（本机单用户）
 - 不替 label 与账本选边：两者不一致时只标 §divergence: true§ 并同时给出两边，不猜哪个对
 - 默认不写远端：§PLATFORM_WRITE§ 不是 §1§ 时，发起变更只记在途、不联网；没有 token 时也不联网写
@@ -34,7 +34,7 @@ PLATFORM_ROOT=$(git rev-parse --show-toplevel) PORT=4317 go run .
 | 环境变量                    | 默认                                                     | 含义                                                         |
 | --------------------------- | -------------------------------------------------------- | ------------------------------------------------------------ |
 | §PORT§                      | §4317§                                                   | 只监听 §127.0.0.1§                                           |
-| §PLATFORM_ROOT§             | 从当前目录向上找到带 §scripts/state-validate.mjs§ 的目录 | 仓库根；两个 Node 入口与账本都以它为工作目录                 |
+| §PLATFORM_ROOT§             | 从当前目录向上找到带 §.agents/platform/state-machine.yml§ 的目录 | 仓库根；声明、账本、索引都以它为根                     |
 | §PLATFORM_DIST§             | 空（用内嵌）                                             | 开发态指向真实 dist 目录，覆盖内嵌页                         |
 | §GH_TOKEN§ / §GITHUB_TOKEN§ | 空                                                       | 只读同步用的 token；都没有 → 同步回 §E_NO_TOKEN§，不假装成功 |
 | §PLATFORM_REPO§             | 从 §git remote get-url origin§ 解析                      | 同步/投递的目标仓库 §owner/repo§                             |
@@ -212,7 +212,7 @@ cd ../.. && npm run check   # 链尾的 check:go = gofmt 干净 + go vet + go te
 
 ### §POST /api/item§ · body §{"title","body"}§ → 200 <新事件对象>
 
-标题（trim 后）为空 → 409 §E_TITLE_REQUIRED§。落到哪个状态、由谁触发，取自声明：§ledger-cli entry§ 给出 §{to,by}§，再交给判定器确认；Go 不做 flow 分支。
+标题（trim 后）为空 → 409 §E_TITLE_REQUIRED§。落到哪个状态、由谁触发，取自声明：引擎的入口解析给出 §{to,by}§，再交给判定器确认；Go 不做 flow 分支。
 
 ### §POST /api/verdict§ · body §{"id","to","actor_role","comment","guards"}§ → 200 <新事件对象>
 
@@ -242,42 +242,42 @@ cd ../.. && npm run check   # 链尾的 check:go = gofmt 干净 + go vet + go te
 | kind       | HTTP | 何时                                         |
 | ---------- | ---- | -------------------------------------------- |
 | §rejected§ | 409  | 业务拒绝（判定器拒绝、标题为空、找不到需求） |
-| §infra§    | 500  | 基础设施（配置坏、node 起不来、请求体坏）    |
+| §infra§    | 500  | 基础设施（配置坏、引擎读不到、请求体坏）      |
 | ——         | 404  | 没有这个路由，§code: E_NO_ROUTE§             |
 
 请求体解析失败 → 500 §E_BODY_UNPARSABLE§（与原型一致）；请求体超过 1MB → 500 §E_BODY_TOO_LARGE§。
 
-## Node 入口契约（Go 侧唯一能调的两个）
+## 引擎契约（§apps/engine§，进程内调用）
 
-工作目录固定为仓库根；所有命令输出机器可读 JSON。
+判定与账本只有一份实现：§apps/engine§。本服务 §import§ 它，不起子进程、不读 §scripts/§ 下的任何 JS 文件；同一份库另有单二进制命令行（`engine validate|check-config|consult|ledger`）给人和其他脚本用，契约同源。
 
-### 判定器 §scripts/state-validate.mjs§
+### 判定器
 
-```bash
-node scripts/state-validate.mjs --json --intent -      # 意图 JSON 从 stdin 进
-node scripts/state-validate.mjs --json --check-config --config <path>
+```go
+cfg, fail := engine.LoadConfigAt(root, configRel) // 绝对路径用 engine.LoadConfig(path)
+res, fail := cfg.ValidateIntent(intent)           // 完整判定（含 guards）
+res, fail := cfg.ResolveTransition(intent)        // 只读咨询：不评估 guards
+res, fail := cfg.ResolveEntry(nil)                // 入口落点 {to,by}
 ```
 
-- stdin：一个意图对象 §{"labels": [], "to": "<状态>", "actor_role": "<角色>", "comment": "<可选>", "guards": {"<守卫名>": "<证据>"}}§
-- stdout：一行 §{"verdict":"allowed|rejected|infra","code","message", ...extra}§
-  - §allowed§ 的 extra 含 §from/to/by/flow/event§，转换声明了 §guards§ 时还含 §guards§（采纳的证据）；未声明时不出现该键
-  - 转换声明了 §guards§ 而证据缺失 → §rejected§ §E_GUARD_MISSING§；§guards§ 形状错 → §infra§ §E_GUARD_SHAPE§
-  - §rejected/infra§ 的 extra 含判定器给出的细节
-- 退出码：§0§ allowed · §1§ rejected · §3§ infra
+- §intent§ 是 §*engine.Value§：§{"labels": [], "to": "<状态>", "actor_role": "<角色>", "comment": "<可选>", "guards": {"<守卫名>": "<证据>"}}§
+- 成功时 §res§ 的键序固定：§from/to/by/flow/event§；转换声明了 §guards§ 时还含 §guards§（采纳的证据），未声明时不出现该键
+- 失败统一是 §*engine.Fail§：§Kind§（§rejected§/§infra§）、§Code§、§Message§、§Extra§，本服务原样搬成错误响应；§ExitCode()§ 与命令行一致（§0§ allowed · §1§ rejected · §3§ infra）
+- 转换声明了 §guards§ 而证据缺失 → §rejected§ §E_GUARD_MISSING§；§guards§ 形状错 → §infra§ §E_GUARD_SHAPE§
+- 「声明自洽」就是 §LoadConfig/ParseConfig§ 成功（等同原 §--check-config§ 的全部检查）
 
-### 账本/声明适配器 §scripts/ledger-cli.mjs§
+### 账本/声明适配器
 
-```bash
-node scripts/ledger-cli.mjs fold     --json   # stdout: JSON 数组（items）
-node scripts/ledger-cli.mjs events   --json   # stdout: JSON 数组（原始事件）
-node scripts/ledger-cli.mjs next-id  --json   # stdout: {"id":"REQ-4"}
-node scripts/ledger-cli.mjs append   --json   # stdin: 一个事件对象 → stdout: 落盘后的事件
-node scripts/ledger-cli.mjs entry    --json   # stdout: {"to","by"}（来自 resolveEntry）
-node scripts/ledger-cli.mjs config   --json   # stdout: 本文件 §board.config§ 的形状
+```go
+events, fail := engine.ReadEvents(path)  // 逐行事件（原始顺序）
+items := engine.Fold(events)             // board.items 的折叠结果
+id := engine.NextID(events)              // "REQ-4"
+fail = engine.AppendEvent(path, event)   // 追加一行并回显落盘后的事件
+view := cfg.View()                       // board.config 的形状
 ```
 
-出错时 stderr 一行 §{"kind","code","message","extra"}§ 且退出非 0，Go 侧原样搬运成错误响应。
-§config§ 是契约之外新增的一条：§board.config§ 只能由 §loadConfig§ 产生，Go 解析 YAML 等于复制真源。
+出错时 §*engine.Fail§ 照样带 §kind/code/message/extra§，本服务原样搬运成错误响应。
+§config§ 是契约之外新增的一条：字段与文案由引擎产出，本服务只做透传与反序列化，不自己解析声明。
 
 ## 静态页托管
 
@@ -328,6 +328,7 @@ node scripts/ledger-cli.mjs config   --json   # stdout: 本文件 §board.config
 | 依赖                 | 版本      | 许可证       | 为什么                                                                                                   |
 | -------------------- | --------- | ------------ | -------------------------------------------------------------------------------------------------------- |
 | §modernc.org/sqlite§ | §v1.34.5§ | BSD-3-Clause | 纯 Go SQLite（无 cgo，跨平台交叉编译不需要 C 工具链）；索引是 SQL 查询面，手写文件格式会自己造一个数据库 |
+| §ai-native-framework/apps/engine§ | §replace => ../engine§ | 本仓 | 判定器与账本的唯一实现（进程内调用）；它带进来的第三方依赖只有 §gopkg.in/yaml.v3§（MIT） |
 
 传递依赖（§go.sum§ 全部已提交，CI 里 §go build§/§go test§ 按需下载）：§modernc.org/libc§、§modernc.org/mathutil§、§modernc.org/memory§、§github.com/remyoudompheng/bigfft§、§golang.org/x/sys§（BSD-3-Clause）；§github.com/dustin/go-humanize§、§github.com/mattn/go-isatty§、§github.com/ncruces/go-strftime§、§github.com/google/uuid§（MIT / BSD-3-Clause）。
 
@@ -335,7 +336,7 @@ node scripts/ledger-cli.mjs config   --json   # stdout: 本文件 §board.config
 
 ## 已知取舍
 
-1. 每次读账本/读声明都新起一个 node 进程 —— 本机单用户，先求正确与单一真源，再谈性能。
+1. 每次读账本/读声明都重新读一遍文件（进程内 Go 库调用，没有缓存）—— 本机单用户，先求正确与单一真源，再谈性能。
 2. 空标题、缺 id 先判：坏账本 + 空标题时原型回 500，这里回 409。
 3. 字段类型比原型严：§title/body/comment/text§ 只认字符串，非字符串按缺失处理（原型会 §String()§ 强转）。
 4. 请求体超 1MB 的 code 用 §E_BODY_TOO_LARGE§（原型落到 §E_UNEXPECTED§）。

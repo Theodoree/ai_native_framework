@@ -31,42 +31,13 @@ func copyFile(t *testing.T, from, to string) {
 	}
 }
 
-func copyTree(t *testing.T, from, to string) error {
-	t.Helper()
-	return filepath.WalkDir(from, func(name string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		relative, relErr := filepath.Rel(from, name)
-		if relErr != nil {
-			return relErr
-		}
-		target := filepath.Join(to, relative)
-		if entry.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		payload, readErr := os.ReadFile(name)
-		if readErr != nil {
-			return readErr
-		}
-		return os.WriteFile(target, payload, 0o644)
-	})
-}
-
-// newRoot 造一个「像仓库根」的沙箱：scripts 软链回真仓库（Node 按 realpath 解析依赖），
-// 声明拷一份。账本不建 —— 每个用例从空账本开始，也就不必碰真账本。
+// newRoot 造一个「像仓库根」的沙箱：只拷一份声明。判定与折叠都在进程内完成，
+// 所以沙箱里不需要 scripts/ 也不需要 node_modules —— 少一份脚手架就少一处假象。
+// 账本不建 —— 每个用例从空账本开始，也就不必碰真账本。
 func newRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	repo := repoRoot(t)
-	// 脚本必须是真文件：判定器按字面路径认自己是不是入口，软链会让它静默退出 0。
-	if err := copyTree(t, filepath.Join(repo, "scripts"), filepath.Join(root, "scripts")); err != nil {
-		t.Fatalf("复制 scripts 失败: %v", err)
-	}
-	// Node 按真实文件位置向上找依赖，所以 node_modules 软链回仓库即可。
-	if err := os.Symlink(filepath.Join(repo, "node_modules"), filepath.Join(root, "node_modules")); err != nil {
-		t.Fatalf("建 node_modules 软链失败: %v", err)
-	}
 	platformDir := filepath.Join(root, ".agents", "platform")
 	if err := os.MkdirAll(platformDir, 0o755); err != nil {
 		t.Fatalf("建配置目录失败: %v", err)
