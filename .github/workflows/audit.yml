@@ -143,19 +143,101 @@ jobs:
             echo "::warning::取不到 PR #${pr:-?} 的 head sha：本次判不了，按 INFRA 回写"
           fi
 
+      # ---- findings 的两个来源：自动产出 / 人给输入，二选一，绝不混用 ----
+      # 两个 input 都为空 = 没人给：这一次由 workflow 自己产出两份（github 执行器）。
+      # 任一非空 = 有人给了：只认人给的，自动路径整段不跑。混着用会让「这一票是谁投的」
+      # 变成两个来源拼出来的混合物，而口径层逐条比对的前提正是「两个槽各自独立投一票」。
+      # 判断结果落成 output、由后面的步骤按 if 分两路：run 块里不许出现 ${{ inputs.* }}
+      # （那是一次 shell 拼接），所以判断只能读 env。
+      - name: 选择 findings 来源
+        id: source
+        if: steps.ctx.outputs.ok == '1'
+        env:
+          AUDIT_FINDINGS_A: ${{ inputs.findings_a }}
+          AUDIT_FINDINGS_B: ${{ inputs.findings_b }}
+        run: |
+          auto=1
+          for injected in "$AUDIT_FINDINGS_A" "$AUDIT_FINDINGS_B"; do
+            # 只含空白的输入等同于没给：它落进槽位也只写得出 INFRA。
+            if [ -n "${injected//[[:space:]]/}" ]; then auto=0; fi
+          done
+          echo "auto=$auto" >> "$GITHUB_OUTPUT"
+          if [ "$auto" = "1" ]; then
+            echo "两个 input 都为空：本次 findings 由 workflow 自己产出"
+          else
+            echo "有人给了 findings：本次只用注入的输入，不调模型"
+          fi
+
+      # diff 只有一种取法：直接问 GitHub 要这个 PR 的补丁。
+      # 不走 fetch 基线 / 比对 base sha 那套：checkout 是浅克隆，那条路要为 CI 额外开一条
+      # 下载面（fetch-depth: 0 或再 fetch 一次 base），而这里要的只是「被审对象改了什么」。
+      # 空 diff 不是「没有问题」而是「没有可审的对象」，所以这里要求非空：让它在
+      # 取输入这一步就红，而不是让模型对着一张白纸说 pass。
+      - name: 取 PR diff
+        if: steps.ctx.outputs.ok == '1' && steps.source.outputs.auto == '1'
+        env:
+          PR_NUMBER: ${{ steps.ctx.outputs.pr }}
+        run: |
+          gh pr diff "$PR_NUMBER" > "$RUNNER_TEMP/pr.diff"
+          test -s "$RUNNER_TEMP/pr.diff"
+          echo "diff 已取到：$(wc -c < "$RUNNER_TEMP/pr.diff") 字节"
+
+      # 自动路径的落盘：记录由 scripts/audit-review.mjs 写成契约形状（schema 校验在脚本里做），
+      # 这里只把它交给同一个口径层，自报身份是 github/本槽 —— 与「人给输入」的 sandbox 槽
+      # 不是同一个执行器，所以两条路径只能二选一（见「选择 findings 来源」）。
+      # 退出 3 = 判不了（没有 key / 上游不可达 / 回的不合契约）：那时脚本已经写下一份 INFRA
+      # 记录，结论由口径层算成 action_required —— 那是一条结论，不是一次故障。在这里 exit
+      # 非 0，「判不了」就和「真没过」压成同一种红，而两者的责任方向相反。
+      # 退出 2（用法错）与「退出 3 但文件根本没落地」才是故障：结论的唯一接口是文件。
+      - name: 自动 review-a
+        if: steps.ctx.outputs.ok == '1' && steps.source.outputs.auto == '1'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          code=0
+          node scripts/audit-review.mjs --slot review-a --diff "$RUNNER_TEMP/pr.diff" --out "$RUNNER_TEMP/review-a.json" || code=$?
+          if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+            echo "::error title=audit 执行器::review-a 没跑成（退出码 $code）：用法或写盘故障，不是判不了"
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/review-a.json" ]; then
+            echo "::error title=audit 执行器::review-a 没有落出 findings 文件"
+            exit 1
+          fi
+          AUDIT_INPUT="$(cat "$RUNNER_TEMP/review-a.json")" node scripts/audit-slot.mjs --slot review-a --executor github --out .audit/review-a.json
+
+      - name: 自动 review-b
+        if: steps.ctx.outputs.ok == '1' && steps.source.outputs.auto == '1'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          code=0
+          node scripts/audit-review.mjs --slot review-b --diff "$RUNNER_TEMP/pr.diff" --out "$RUNNER_TEMP/review-b.json" || code=$?
+          if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+            echo "::error title=audit 执行器::review-b 没跑成（退出码 $code）：用法或写盘故障，不是判不了"
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/review-b.json" ]; then
+            echo "::error title=audit 执行器::review-b 没有落出 findings 文件"
+            exit 1
+          fi
+          AUDIT_INPUT="$(cat "$RUNNER_TEMP/review-b.json")" node scripts/audit-slot.mjs --slot review-b --executor github --out .audit/review-b.json
+
       # 值只经 env 进入脚本：JSON 里的引号/换行由 env 原样传递，
       # 绝不在 run 里内联输入（那是一次 shell 拼接）。
       # 「输入自称的执行器」与「它所在的槽」是否一致，由 scripts/audit-slot.mjs 判，
       # 规则不在这两份 run 块里各写一遍。
+      # 这两步只在「有人给了 findings」时跑：auto=1 时两个 input 都是空的，跑到这里
+      # 只会把空输入落成 INFRA，而真正的输入已经在上面自动产出了。
       - name: 落盘 review-a
-        if: steps.ctx.outputs.ok == '1'
+        if: steps.ctx.outputs.ok == '1' && steps.source.outputs.auto == '0'
         env:
           AUDIT_FINDINGS_A: ${{ inputs.findings_a }}
         run: |
           AUDIT_INPUT="$AUDIT_FINDINGS_A" node scripts/audit-slot.mjs --slot review-a --executor sandbox --out .audit/review-a.json
 
       - name: 落盘 review-b
-        if: steps.ctx.outputs.ok == '1'
+        if: steps.ctx.outputs.ok == '1' && steps.source.outputs.auto == '0'
         env:
           AUDIT_FINDINGS_B: ${{ inputs.findings_b }}
         run: |

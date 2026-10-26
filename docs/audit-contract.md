@@ -45,3 +45,15 @@
 ## 四、路由不进 CI 配置
 
 workflow 里只写逻辑名（`review-a` / `review-b` / `impl`），真实模型由网关映射；网关必须回传上游真实模型名 + request_id + token 用量。逻辑名 → 模型的真源在仓库（`.agents/platform/routing.yml`），网关只是执行者。
+
+## 五、findings 从哪来
+
+两个来源，二选一，**不混用**：
+
+- **人给**：`workflow_dispatch` 的 `findings_a` / `findings_b`，两条记录自报 `executor: sandbox`。
+- **自动产出**：两个 input 都为空时，`audit.yml` 自己取 `gh pr diff <PR>` 并调
+  `scripts/audit-review.mjs` 跑两个槽（同一个 secret、两个不同模型），记录自报 `executor: github`。
+
+自动路径**判不了就是判不了**：没有 key、上游不可达、回的不合 schema 时，执行器写下 INFRA 记录并退出 3，
+那一步不红——结论由口径层算成 `action_required`。只有退出 2（用法错、写不出文件）才让步骤红：
+红代表「管线坏了」，不是「代码没过」。
