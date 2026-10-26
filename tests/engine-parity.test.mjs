@@ -102,7 +102,8 @@ function spawnPair(caseDef) {
 // V8 的 JSON.parse 报错文本跨 Node 版本不同：Node 20 是「… at position 1」，
 // Node 22+ 追加坐标「(line 1 column 2)」。坐标系是运行时方言，不是本仓契约，
 // 所以比对前从两侧摘掉，仅保留位置数字；Go 侧一律带坐标，另有单独断言钉住。
-const POSITION_SUFFIX = /\(line \d+ column \d+\)/g;
+// 连同坐标前那个空格一起摘：Go 输出 "at position 1 (line 1 column 2)"，摘完若留下尾空格就与 Node 20 不等。
+const POSITION_SUFFIX = / ?\(line \d+ column \d+\)/g;
 const withoutPosition = (buf) => buf.toString().replace(POSITION_SUFFIX, '');
 
 function expectParity(caseDef) {
