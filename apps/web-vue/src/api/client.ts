@@ -148,3 +148,13 @@ export function postOutboxRetry(
 export function postIndexRebuild(): Promise<ApiResult<unknown>> {
   return request<unknown>("POST", "/index/rebuild", {});
 }
+
+// 知识库两条只读接口：目录与单篇正文。path 走 query，后端按白名单校验，
+// 越界时回来的 400/404 由 failureOf 折成 ApiFailure 原样呈现。
+export function getKnowledgeList(): Promise<ApiResult<unknown>> {
+  return request<unknown>("GET", "/kb");
+}
+
+export function getKnowledgeItem(path: string): Promise<ApiResult<unknown>> {
+  return request<unknown>("GET", "/kb/item?path=" + encodeURIComponent(path));
+}

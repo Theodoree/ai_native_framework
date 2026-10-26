@@ -10,6 +10,7 @@
 - 远端同步：§POST /api/sync§ 只读拉 issue 列表（number/title/state/labels/updated_at），条件请求只靠 §If-None-Match§ + ETag，304 一个字节都不写盘
 - 派生索引：§.agents/platform/index.db§（SQLite）存折叠结果、事件时间线、远端快照、在途记录，纯派生、删了自愈
 - 在途台账：§.agents/platform/outbox.jsonl§ 记「本地改了状态、还没确认远端生效」的外发，只有它能回答「这条是不是还在路上」
+- 知识库本体：§GET /api/kb§（列目录）与 §GET /api/kb/item§（看全文），索引落 §.agents/platform/kb.db§，纯派生、删了自愈
 - 判定与账本全部经两个 Node 入口（见「Node 入口契约」）
 
 ## 不做什么
@@ -21,6 +22,7 @@
 - 不替 label 与账本选边：两者不一致时只标 §divergence: true§ 并同时给出两边，不猜哪个对
 - 默认不写远端：§PLATFORM_WRITE§ 不是 §1§ 时，发起变更只记在途、不联网；没有 token 时也不联网写
 - 不把在途写进 §ledger.jsonl§：折叠器对每行按 §event.to§ 投影状态，非状态事件进去会污染折叠结果
+- 不判定「该不该汇」：白名单在 Go 里是 §scripts/kb-export.mjs§ 的同一口径（见「知识库本体」），不改汇入范围、不做去重、不写知识库
 
 ## 运行
 
@@ -152,6 +154,46 @@ cd ../.. && npm run check   # 链尾的 check:go = gofmt 干净 + go vet + go te
 }
 ```
 
+### §GET /api/kb§ → 200
+
+```json
+{
+  "items": [
+    {
+      "path": ".agents/notes/implemented/p19-kb.md",
+      "title": "P-19 知识库本体",
+      "sha256": "<64 hex>",
+      "bytes": 1234,
+      "group": "notes"
+    }
+  ],
+  "count": 1,
+  "builtAt": "<ISO8601>"
+}
+```
+
+- §group§ 只有四个值：§notes§（§.agents/notes/implemented/*.md§）、§module§（任意层级的 §README.md§）、§docs§（§docs/architecture.md§、§docs/permissions.md§、§docs/audit-contract.md§）、§postmortem§（§docs/postmortem/*.md§）
+- 排序固定：先按 §notes → module → docs → postmortem§ 的组序，组内按 §path§ 字典序；前端不必再排
+- §title§：文件第一行（跳过开头的空行）以 §"# "§ 开头就去掉 §#§ 与空白；没有标题则用文件名去扩展名
+- §sha256§ 是**工作区文件字节**的摘要（不是 §kb-export.mjs§ 用的 git blob 字节）；§bytes§ 是同一份字节的长度
+- §builtAt§ 只在索引重建时变：现盘没变它就稳定，可用来判断「这份目录是不是新的」
+- 一次请求就把全部白名单文件读一遍并复算 §sha256§：索引是缓存，不是真相源；对几十个小文件，这比「按 mtime 猜」更不可能漏掉漂移
+
+### §GET /api/kb/item?path=<仓库相对路径>§ → 200
+
+```json
+{
+  "path": "docs/architecture.md",
+  "sha256": "<64 hex>",
+  "bytes": 4893,
+  "text": "<原文>"
+}
+```
+
+- §text§ 是磁盘上的原文字节按 UTF-8 转成的字符串，不做任何改写
+- 路径不在白名单、含 §..§、是绝对路径、用反斜杠、或解析软链后跑出仓库根 → §400§；白名单内但文件不存在 / 不是普通文件 → §404§。两种都是 §{"kind":"rejected","code":"E_KB_PATH","message":"…","extra":{}}§，**绝不读到白名单外的文件**
+- 单文件上限 §4MB§：超过回 §400 E_KB_PATH§。先看 §stat§ 大小再读，读后又按长度兜一次（文件可能在两次之间长大），避免一个大文件把响应撑爆
+
 ### §GET /api/events§ → 200
 
 ```json
@@ -256,6 +298,24 @@ node scripts/ledger-cli.mjs config   --json   # stdout: 本文件 §board.config
 - 巡检只在**在途非空**时排期，指数退避 5s→5min 封顶；调度决策是纯函数（在途集合 + 现在 → 下次时间或 §nil§），协程里没有写死的 sleep
 - 为什么单独一个文件：进 §ledger.jsonl§ 会污染折叠（折叠器按每行的 §event.to§ 投影状态），只放 §index.db§ 又与「索引纯派生」矛盾 —— 在途是唯一无法从真源重建的本地事实
 
+## 知识库本体（§/api/kb§ + §.agents/platform/kb.db§）
+
+知识库要「汇什么」由 §docs/knowledge-base.md§ 定义；这里只负责把同一批文件做成可查询的派生索引。**白名单两处同口径，改一处必须改另一处：§scripts/kb-export.mjs§ 的 §ALLOWED§ 与 §apps/api-go/kb.go§ 的 §kbAllowRules§。**
+
+| 命中路径                                     | group        |
+| -------------------------------------------- | ------------ |
+| §.agents/notes/implemented/<单层>.md§         | §notes§      |
+| 任意层级的 §README.md§                        | §module§     |
+| §docs/architecture.md§ 等三份契约文档         | §docs§       |
+| §docs/postmortem/<单层>.md§                   | §postmortem§ |
+
+- 判定顺序与导出器一致：**先 deny 再 allow**。deny 目录 §node_modules/dist/build/coverage/.next/out/tmp/vendor§，deny 名字 §.env*§、§*.pem/*.key/*.p12/…§、§*secret*/*credential*/*api_key*/*token*§ 等十条，与导出器的 §DENY_NAMES§ 逐条对应
+- 扫描额外跳过 §.git§ 与 §.cache§：前者不是汇入内容，后者是本机的 Go 构建缓存（上万个文件）
+- 索引表 §kb_items(path, title, sha256, bytes, grp)§ + §meta(schema_version, built_at)§；重建在**一个事务**里 §DROP§ 后重写，半途失败不会留下半份结构
+- 重建触发只有三条：索引文件不存在、§schema_version§ 不符、现盘扫描结果与索引记录的集合或 §sha256/bytes§ 有任一不符（增、删、改都算）。命中任一条就**整份重建**，不做增量
+- 索引**不是真相源**：每次列表请求先扫白名单现盘并复算 §sha256§，再拿它跟索引比 —— 真相永远是 git 里的文件，删掉 §kb.db§ 只是让下一次请求多干一次重建
+- 两处同口径由测试钉住，不靠自觉：§tests/kb-allowlist-parity.test.mjs§ 读这两份源码，比对 §ALLOWED/DENY_DIRS/DENY_NAMES§ 与 §kbAllowRules/kbDenyDirs/kbDenyNames§ 是同一集合，再用一张判定表断言两边对同一路径给出同样结论 —— **只改一处就会红**；§kb_test.go§ 的 §TestKBWhitelistParityTable§ 另行钉住 Go 侧自己的容许/拒绝语义
+
 ## 依赖与许可证
 
 | 依赖                 | 版本      | 许可证       | 为什么                                                                                                   |
@@ -282,3 +342,7 @@ node scripts/ledger-cli.mjs config   --json   # stdout: 本文件 §board.config
 12. 在途的记录形状是 append-only JSONL 而不是数据库行：它是唯一无法从真源重建的本地事实，必须能被人直接读、直接改、直接 git diff。
 13. 索引重建是「检测陈旧 → 全量重算」，不做增量：真源是几份小文件，增量复杂度换不来时间。
 14. 巡检协程的调度是纯函数（在途集合 + 现在 → 下次时间或 §nil§），协程只负责等：在途为空时它不排期，也不发请求。
+15. 知识库索引的 §sha256§ 用**工作区文件字节**，导出器用 **git blob 字节**：Go 侧不调 §git§（不联网、不依赖 PATH 里有什么），代价是同一文件的两种摘要不相等 —— 两边都只拿它判「这份文件变没变」，从不互相比对。
+16. §GET /api/kb§ 每次请求都全量复扫白名单并复算 §sha256§（当前 30 条），而不是信的 §mtime§ 或索引：这样删掉 §kb.db§、手改一个字节、新增一份笔记都会在下一次响应里体现，代价是每次多读几十个小文件。
+17. 路径非法（400）与文件不存在（404）共用同一个 §code§：§E_KB_PATH§。前端只需认这一个 code 做统一提示，区别只在 HTTP 状态与 §message§ 里；分成两个 code 会让前端多一条永远走不到的分支。
+18. §title§ 只存在索引里、不在 §GET /api/kb/item§ 的响应里返回：列表已经给了 title，正文接口只管正文，同一个事实不留两处生成。

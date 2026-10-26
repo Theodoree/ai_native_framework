@@ -1,17 +1,19 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import BoardView from "./views/BoardView.vue";
+import KnowledgeView from "./views/KnowledgeView.vue";
 import MachineView from "./views/MachineView.vue";
 import SyncView from "./views/SyncView.vue";
 import TimelineView from "./views/TimelineView.vue";
 import { usePlatform } from "./stores/platform";
 
-type ViewKey = "board" | "machine" | "timeline" | "sync";
+type ViewKey = "board" | "machine" | "timeline" | "sync" | "knowledge";
 
 const tabs: { key: ViewKey; label: string }[] = [
   { key: "board", label: "看板" },
   { key: "machine", label: "状态机" },
   { key: "timeline", label: "时间线" },
+  { key: "knowledge", label: "知识库" },
   { key: "sync", label: "同步" },
 ];
 
@@ -24,7 +26,8 @@ const loading = computed<boolean>(
     state.eventsLoading ||
     state.configLoading ||
     state.remoteLoading ||
-    state.outboxLoading,
+    state.outboxLoading ||
+    state.knowledge.loading,
 );
 
 function refresh(): void {
@@ -74,6 +77,7 @@ onMounted(() => {
     <v-main>
       <BoardView v-if="view === 'board'" />
       <MachineView v-else-if="view === 'machine'" />
+      <KnowledgeView v-else-if="view === 'knowledge'" />
       <SyncView v-else-if="view === 'sync'" />
       <TimelineView v-else />
     </v-main>

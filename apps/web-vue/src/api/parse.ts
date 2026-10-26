@@ -11,6 +11,9 @@ import {
   type BoardState,
   type BoardTransition,
   type IndexRebuildReport,
+  type KnowledgeDocument,
+  type KnowledgeEntry,
+  type KnowledgeIndex,
   type OutboxEntry,
   type OutboxSnapshot,
   type OutboxTarget,
@@ -225,6 +228,44 @@ export function parseSyncReport(payload: unknown): SyncReport {
     etag: readString(loose, "etag"),
     issues: readNumber(loose, "issues"),
     reconciled: normalizeReconciled(loose["reconciled"]),
+  };
+}
+
+function normalizeKnowledgeEntry(raw: unknown): KnowledgeEntry {
+  const loose = asLoose(raw);
+  const path = readString(loose, "path") ?? "";
+  return {
+    path,
+    // title 缺了就退回 path：列表上一行都不该是空白。
+    title: readString(loose, "title") ?? (path === "" ? "(未命名)" : path),
+    sha256: readString(loose, "sha256") ?? "",
+    bytes: readNumber(loose, "bytes"),
+    // group 是分组的唯一依据，缺失不猜，交给界面显示成「未标注 group」。
+    group: readString(loose, "group") ?? "",
+    raw: loose,
+  };
+}
+
+export function parseKnowledgeIndex(payload: unknown): KnowledgeIndex {
+  const source = Array.isArray(payload)
+    ? payload
+    : readList(asLoose(payload)["items"]);
+  const loose = asLoose(payload);
+  return {
+    entries: source.map(normalizeKnowledgeEntry),
+    count: readNumber(loose, "count"),
+    builtAt: readString(loose, "builtAt"),
+  };
+}
+
+export function parseKnowledgeDocument(payload: unknown): KnowledgeDocument {
+  const loose = asLoose(payload);
+  return {
+    path: readString(loose, "path") ?? "",
+    sha256: readString(loose, "sha256") ?? "",
+    bytes: readNumber(loose, "bytes"),
+    text: readString(loose, "text") ?? "",
+    raw: loose,
   };
 }
 

@@ -214,3 +214,22 @@ pre {
 .filter {
   max-width: 220px;
 }
+
+/* ---------- 4) 知识库：列表与正文的滚动区（Vuetify 没有滚动容器） ---------- */
+.kb-list {
+  max-height: 62vh;
+  overflow-y: auto;
+}
+
+.kb-path {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.kb-body {
+  max-height: 68vh;
+  padding: 8px;
+  overflow: auto;
+  background: rgb(var(--v-theme-surface-variant));
+  border-radius: 6px;
+}

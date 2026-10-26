@@ -195,3 +195,34 @@ export function readStringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((entry): entry is string => typeof entry === "string");
 }
+
+// 知识库：列表条目（GET /api/kb 的 items 形状）、列表快照与单篇正文（GET /api/kb/item）。
+// 组的先后与组内顺序是后端给的，前端不重排——这里只做原样承载。
+export interface KnowledgeEntry {
+  path: string;
+  title: string;
+  sha256: string;
+  bytes: number | null;
+  group: string;
+  raw: Loose;
+}
+
+export interface KnowledgeGroup {
+  key: string;
+  label: string;
+  entries: KnowledgeEntry[];
+}
+
+export interface KnowledgeIndex {
+  entries: KnowledgeEntry[];
+  count: number | null;
+  builtAt: string | null;
+}
+
+export interface KnowledgeDocument {
+  path: string;
+  sha256: string;
+  bytes: number | null;
+  text: string;
+  raw: Loose;
+}
