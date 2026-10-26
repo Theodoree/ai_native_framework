@@ -121,3 +121,8 @@ PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progres
 
 **运行时方言第三次咬人（这次是 stdout 里的 JSON.parse 文案）**：本地 Node 24 的 JSON.parse 报错带 (line L column C)，CI 的 Node 20 不带，于是 E_EVENT_UNPARSABLE 与 E_INPUT_UNPARSABLE 两个夹具在 CI 红、本地绿。修法与阶段 A/B 同口径：比对前把坐标后缀从两侧摘掉（position N 的数字仍比），并**单独断言「Go 侧只要报了 at position 就必须带坐标」**——否则两侧都摘成空等于什么都没比。代价是 line/column 的数值不再参与比较（实测：把 column 改 +1 仍绿，把 column 写成 col 则 2 红），position 的数值仍比。
 这些都在 parity 夹具里以「照原样复刻」的形式钉住了——**先复刻再议**，改语义是另一件事（阶段 D 之后再单独决定）。
+**第二次发生（阶段 C 的 #86，2026-10-26）**：PR #87 基分支是 `main`，`Fixes #86` 生效、issue 被关，标签又停在 `state:in-progress`。同一个缺口第二次咬人，说明它不是一次性事故。
+
+顺带看清了它的**后果不只是显示难看**：门 G1 拿标签去咨询转换表，标签停在 `state:in-progress` 的已关单看起来「还能被合并带到 done」，于是 G1 会对一个已经关掉的 issue 判 PASS。也就是说，缺口的真实风险是**门可能把已关单当成在途单放行**，而不只是标签不准。
+
+修法仍是那两条（给 `issues.closed` 建意图，或把自动关单挪进写者），本轮不动：状态只有一个写者这条约束优先。
