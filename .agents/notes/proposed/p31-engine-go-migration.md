@@ -74,3 +74,4 @@
 **变异验证**（我亲跑四组，就地改 + /tmp 备份 + 先打印改后行 + 恢复）：lastchange 分隔行 `-`→`=` 8 红；`intent.go` 的 `"ci"`→`"bot"` 1 红；writer 正文文案改 4 红；**`value.go` 的 `EncodeIndent` 缩进 +1 → 10 红**（这组是我自己找的，交付方未测）。恢复后 parity 55 全绿、整仓 `npm run check` 609 tests 全绿、工作树无残留。
 
 **阶段 C 的耦合点（先说清，免得改错）**：`merge-gate.mjs` 是 **import 这三个 .mjs 的导出函数**（`buildIntent`/`resolveIssueRefs`/`renderSection`/`recordBody`），不是调 CLI —— Go 侧已有同名导出，阶段 C 是把 merge-gate 改成调库，入口契约不经过命令行。另：last-change 的 git 命令别换 plumbing（`-z` 等），`core.quotePath=true` 会把非 ASCII 路径转八进制转义，两侧逐字节一致正是靠它；writer-record 的退出码是「判定结论 × 评论成功」的合成，infra 评论成功仍退 1，不是可重试信号；`GITHUB_OUTPUT` 是追加写。
+**运行时方言第二次咬人（与阶段 A 同一类，这次的载体是 stderr 文案）**：last-change 的「EVENT 非法 JSON」用例本地（Node 24）全绿、CI（Node 20）红——JSON.parse 的坐标后缀 (line 1 column 2) 只在 Node 22+ 出现。修法与阶段 A 同口径：比对前把坐标后缀从两侧摘掉（位置数字仍比），并**单独断言 Go 侧一律带坐标**，避免「两边都摘」退化成什么都没比。判断：凡是把 JSON.parse 的消息写进输出面的入口，都按这条办。

@@ -103,11 +103,19 @@ function readOrNull(path) {
   }
 }
 
+// JSON.parse 的报错文本跨 Node 版本不同：Node 20 止于 "at position N"，Node 22+ 追加 "(line L column C)"。
+// 比对前把坐标后缀从两侧摘掉（位置数字仍比），并单独断言 Go 侧一律带坐标——否则「两边都摘了」会退化成什么都没比。
+const POSITION_SUFFIX = / ?\(line \d+ column \d+\)/g;
+const withoutPosition = (buf) => buf.toString().replace(POSITION_SUFFIX, '');
+
 function parity(js, go, label) {
   expect(go.stdout.toString(), label + ' stdout 文本').toBe(js.stdout.toString());
   expect(go.stdout.equals(js.stdout), label + ' stdout 逐字节').toBe(true);
-  expect(go.stderr.toString(), label + ' stderr 文本').toBe(js.stderr.toString());
-  expect(go.stderr.equals(js.stderr), label + ' stderr 逐字节').toBe(true);
+  expect(withoutPosition(go.stderr), label + ' stderr 文本').toBe(withoutPosition(js.stderr));
+  expect(Buffer.from(withoutPosition(go.stderr)).equals(Buffer.from(withoutPosition(js.stderr))), label + ' stderr 逐字节').toBe(true);
+  if (/ at position \d+/.test(withoutPosition(js.stderr))) {
+    expect(go.stderr.toString(), label + ' Go 侧坐标没丢').toMatch(/ at position \d+ \(line \d+ column \d+\)/);
+  }
   expect(go.status ?? -1, label + ' 退出码').toBe(js.status ?? -1);
 }
 
