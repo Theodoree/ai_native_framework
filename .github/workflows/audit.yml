@@ -199,10 +199,12 @@ jobs:
           test -s "$RUNNER_TEMP/pr.diff"
           echo "diff 已取到：$(wc -c < "$RUNNER_TEMP/pr.diff") 字节"
 
-      # 自动路径的落盘：记录由 scripts/audit-review.mjs 写成契约形状（schema 校验在脚本里做），
-      # 这里只把它交给同一个口径层，自报身份是 github/本槽 —— 与「人给输入」的 sandbox 槽
-      # 不是同一个执行器，所以两条路径只能二选一（见「选择 findings 来源」）。
-      # 退出 3 = 判不了（没有 key / 上游不可达 / 回的不合契约）：那时脚本已经写下一份 INFRA
+      # 自动路径的落盘：记录由 engine audit-review 写成契约形状（schema 校验在引擎里做），
+      # 再由 engine audit-slot 交给同一个口径层，自报身份是 github/本槽 —— 与「人给输入」的
+      # sandbox 槽不是同一个执行器，所以两条路径只能二选一（见「选择 findings 来源」）。
+      # 两处都是编译产物（.cache/bin/engine），不是 scripts/*.mjs：退出码语义由引擎的
+      # --explain 自证，run 块里只负责按退出码分流。
+      # 退出 3 = 判不了（没有 key / 上游不可达 / 回的不合契约）：那时引擎已经写下一份 INFRA
       # 记录，结论由口径层算成 action_required —— 那是一条结论，不是一次故障。在这里 exit
       # 非 0，「判不了」就和「真没过」压成同一种红，而两者的责任方向相反。
       # 退出 2（用法错）与「退出 3 但文件根本没落地」才是故障：结论的唯一接口是文件。
@@ -212,7 +214,7 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           code=0
-          node scripts/audit-review.mjs --slot review-a --diff "$RUNNER_TEMP/pr.diff" --out "$RUNNER_TEMP/review-a.json" || code=$?
+          ./.cache/bin/engine audit-review --slot review-a --diff "$RUNNER_TEMP/pr.diff" --out "$RUNNER_TEMP/review-a.json" || code=$?
           if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
             echo "::error title=audit 执行器::review-a 没跑成（退出码 $code）：用法或写盘故障，不是判不了"
             exit 1
@@ -221,7 +223,7 @@ jobs:
             echo "::error title=audit 执行器::review-a 没有落出 findings 文件"
             exit 1
           fi
-          AUDIT_INPUT="$(cat "$RUNNER_TEMP/review-a.json")" node scripts/audit-slot.mjs --slot review-a --executor github --out .audit/review-a.json
+          AUDIT_INPUT="$(cat "$RUNNER_TEMP/review-a.json")" ./.cache/bin/engine audit-slot --slot review-a --executor github --out .audit/review-a.json
 
       - name: 自动 review-b
         if: steps.ctx.outputs.ok == '1' && steps.source.outputs.auto == '1'
@@ -229,7 +231,7 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           code=0
-          node scripts/audit-review.mjs --slot review-b --diff "$RUNNER_TEMP/pr.diff" --out "$RUNNER_TEMP/review-b.json" || code=$?
+          ./.cache/bin/engine audit-review --slot review-b --diff "$RUNNER_TEMP/pr.diff" --out "$RUNNER_TEMP/review-b.json" || code=$?
           if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
             echo "::error title=audit 执行器::review-b 没跑成（退出码 $code）：用法或写盘故障，不是判不了"
             exit 1
@@ -238,11 +240,11 @@ jobs:
             echo "::error title=audit 执行器::review-b 没有落出 findings 文件"
             exit 1
           fi
-          AUDIT_INPUT="$(cat "$RUNNER_TEMP/review-b.json")" node scripts/audit-slot.mjs --slot review-b --executor github --out .audit/review-b.json
+          AUDIT_INPUT="$(cat "$RUNNER_TEMP/review-b.json")" ./.cache/bin/engine audit-slot --slot review-b --executor github --out .audit/review-b.json
 
       # 值只经 env 进入脚本：JSON 里的引号/换行由 env 原样传递，
       # 绝不在 run 里内联输入（那是一次 shell 拼接）。
-      # 「输入自称的执行器」与「它所在的槽」是否一致，由 scripts/audit-slot.mjs 判，
+      # 「输入自称的执行器」与「它所在的槽」是否一致，由 engine audit-slot 判，
       # 规则不在这两份 run 块里各写一遍。
       # 这两步只在「有人给了 findings」时跑：auto=1 时两个 input 都是空的，跑到这里
       # 只会把空输入落成 INFRA，而真正的输入已经在上面自动产出了。
@@ -251,14 +253,14 @@ jobs:
         env:
           AUDIT_FINDINGS_A: ${{ inputs.findings_a }}
         run: |
-          AUDIT_INPUT="$AUDIT_FINDINGS_A" node scripts/audit-slot.mjs --slot review-a --executor sandbox --out .audit/review-a.json
+          AUDIT_INPUT="$AUDIT_FINDINGS_A" ./.cache/bin/engine audit-slot --slot review-a --executor sandbox --out .audit/review-a.json
 
       - name: 落盘 review-b
         if: steps.ctx.outputs.ok == '1' && steps.source.outputs.auto == '0'
         env:
           AUDIT_FINDINGS_B: ${{ inputs.findings_b }}
         run: |
-          AUDIT_INPUT="$AUDIT_FINDINGS_B" node scripts/audit-slot.mjs --slot review-b --executor github --out .audit/review-b.json
+          AUDIT_INPUT="$AUDIT_FINDINGS_B" ./.cache/bin/engine audit-slot --slot review-b --executor github --out .audit/review-b.json
 
       # 这一步永不失败（set +e + 最后 exit 0）：口径层的判不了是一种结论，
       # 不是一种故障。失败只体现在 result.json / check-run.json 有没有落地，
