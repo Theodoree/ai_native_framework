@@ -17,7 +17,7 @@ func main() {
 	driver := flag.String("db-driver", "sqlite", "存储驱动（目前只有 sqlite）")
 	dbPath := flag.String("db", "data/chain.db", "数据库：sqlite 是文件路径")
 	execKind := flag.String("exec", "fake", "执行器：fake（不连外部）或 docker（本机 docker）")
-	templates := flag.String("templates", "", "容器模板表 JSON（增量覆盖默认模板）")
+	templates := flag.String("templates", DefaultTemplateFile, "节点模板表（.yaml/.yml 按 YAML 读，其余按老 JSON；文件不存在回落内嵌默认表）")
 	dockerBin := flag.String("docker", "docker", "docker 可执行文件")
 	timeout := flag.Duration("timeout", 10*time.Minute, "单次容器执行上限")
 	uploads := flag.String("uploads", "data/uploads", "需求图片落盘目录（不存在会按需创建）")
@@ -33,22 +33,24 @@ func main() {
 
 	var exec Executor = FakeExecutor{}
 	if *execKind == "docker" {
-		tmpls, err := LoadTemplates(*templates)
+		table, err := LoadTemplatesOrFallback(*templates, log.Printf)
 		if err != nil {
 			log.Fatal(err)
 		}
+		log.Printf("节点模板表：%s（模板 %s）", orNone(table.Source, "内嵌默认"), strings.Join(sortedKeys(table.Templates), "、"))
 		exec = DockerExecutor{
-			Templates: tmpls,
+			Templates: table.Templates,
+			Nodes:     table.Nodes,
 			Docker:    *dockerBin,
 			Timeout:   *timeout,
 			BaseURL:   *baseURL,
 			Model:     *model,
-			Workspace: func(r *Requirement) string {
+			Repo: func(r *Requirement) string {
 				p, err := store.Project(r.ProjectKey)
-				if err != nil || !strings.HasPrefix(p.Repo, "/") {
+				if err != nil {
 					return ""
 				}
-				return p.Repo
+				return strings.TrimSpace(p.Repo)
 			},
 		}
 	} else if *execKind != "fake" {
