@@ -21,6 +21,8 @@ go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 
 页面可以建 project、提需求、逐站运行 / 通过 / 驳回 / 评论 / 追加规则，并看到只追加的事件流。
 
+平台外面（脚本、另一个系统）走接入层：带 `-admin-token` 启动后，用它建 project 并拿到该 project 的访问口令，之后用口令提需求、用口令拉结论。整条需求被拒时会尽力回告一次，**回告失败不改状态**——所以拉模式永远是可信的那条路。接口表见 `apps/chain/README.md` 的「接入层」一节。
+
 - **存储**：SQLite（纯 Go 驱动，免 cgo），库文件默认 `data/chain.db`。`Store` 是接口，换 MySQL 只加一个实现。
 - **执行**：`-exec fake` 只写一条评论并声明自己没连过外部服务；`-exec docker` 会用 `docker run` 起真容器并注入 `BASE_URL` / 模型 / AGENTS.md / 需求正文，密钥只从环境变量取且会从日志里抹掉。
 - **前端**：Vue 3 + Vite + TS，构建产物已入库（`apps/chain/webui/dist`），被 `//go:embed` 打进二进制。改了 `apps/web` 要记得 `npm run build`。
