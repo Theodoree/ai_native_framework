@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-// 页面产物在构建期由 scripts/copy-dist.mjs 复制进 dist/，运行期不再依赖磁盘。
+// 页面产物在构建期由引擎的 copy-dist 子命令复制进 dist/，运行期不再依赖磁盘。
 // 没有产物时 dist/ 里只有占位文件：构建照样成功，只是 /api 之外全部 404。
 //
 //go:embed all:dist
