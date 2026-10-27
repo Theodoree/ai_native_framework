@@ -19,11 +19,11 @@
 三个 Dockerfile 只差两行：`npm i -g` 的包名，和 `AGENT_CMD`。想换成自己的 registry，
 改 `nodes.yaml` 里各模板的 `image` 一行即可，代码不用动。
 
-| 镜像 | 装的包（2026-10-28 核实） | 默认 AGENT_CMD |
-| --- | --- | --- |
-| `<项目名>/agent-codex:latest` | `@openai/codex@0.164.0` | `codex exec` |
-| `<项目名>/agent-claude:latest` | `@anthropic-ai/claude-code@2.1.311` | `claude -p` |
-| `<项目名>/agent-deepseek-harness:latest` | `@deepseek-ai/dsh@0.2.1-rc.2` | `dsh` |
+| 镜像                                     | 装的包（2026-10-28 核实）           | 默认 AGENT_CMD |
+| ---------------------------------------- | ----------------------------------- | -------------- |
+| `<项目名>/agent-codex:latest`            | `@openai/codex@0.164.0`             | `codex exec`   |
+| `<项目名>/agent-claude:latest`           | `@anthropic-ai/claude-code@2.1.311` | `claude -p`    |
+| `<项目名>/agent-deepseek-harness:latest` | `@deepseek-ai/dsh@0.2.1-rc.2`       | `dsh`          |
 
 > `deepseek-harness@0.0.1` 是占位包，别装。真正的包名是 `@deepseek-ai/dsh`。
 
@@ -31,15 +31,15 @@
 
 宿主（`apps/chain` 的 docker 执行器）注入这些环境变量，entrypoint 照着做：
 
-| 变量 | 含义 |
-| --- | --- |
-| `CHAIN_NODE` | 节点键，如 `crosstest` |
-| `CHAIN_REPO` | 仓库地址；本机绝对路径表示开发用的挂载模式 |
-| `CHAIN_BRANCH` | 这次要处理的分支 |
-| `CHAIN_WORKSPACE_MODE` | `clone`（默认）或 `mount` |
+| 变量                                  | 含义                                            |
+| ------------------------------------- | ----------------------------------------------- |
+| `CHAIN_NODE`                          | 节点键，如 `crosstest`                          |
+| `CHAIN_REPO`                          | 仓库地址；本机绝对路径表示开发用的挂载模式      |
+| `CHAIN_BRANCH`                        | 这次要处理的分支                                |
+| `CHAIN_WORKSPACE_MODE`                | `clone`（默认）或 `mount`                       |
 | `CHAIN_REQUIREMENT` / `CHAIN_CONTEXT` | 需求 id 与正文，拼成 prompt 从 stdin 喂给 agent |
-| `CHAIN_AGENTS_MD` | 本次追加策略，写成（或追加到）`/work/AGENTS.md` |
-| `AGENT_CMD` | 镜像里声明的 agent 命令，入口用 `sh -c` 跑它 |
+| `CHAIN_AGENTS_MD`                     | 本次追加策略，写成（或追加到）`/work/AGENTS.md` |
+| `AGENT_CMD`                           | 镜像里声明的 agent 命令，入口用 `sh -c` 跑它    |
 
 顺序是：打头部信息 → **clone 或复用挂载** → 写策略 → 跑 agent → **最后一行必须是 `CHAIN_VERDICT:`**（前提是真的有结论）。
 
