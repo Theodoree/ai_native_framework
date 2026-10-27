@@ -26,7 +26,7 @@ go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 平台外面（脚本、另一个系统）走接入层：在「我的密钥」页建一把 API 密钥（`ak_…`，secret 只出现一次），之后带 `Authorization: Bearer ak_…` 提需求、拉结论。密钥只认人、不分权，能不能进某个项目仍看那个账号的项目成员资格。整条需求被拒时会尽力回告一次，**回告失败不改状态**——所以拉模式永远是可信的那条路。接口表见 `apps/chain/README.md` 的「接入层」一节。
 
 - **存储**：SQLite（纯 Go 驱动，免 cgo），库文件默认 `data/chain.db`。`Store` 是接口，换 MySQL 只加一个实现。
-- **执行**：`-exec fake` 只写一条评论并声明自己没连过外部服务；`-exec docker` 会用 `docker run` 起真容器并注入 `BASE_URL` / 模型 / AGENTS.md / 需求正文，密钥只从环境变量取且会从日志里抹掉。
+- **执行**：`-exec fake` 只写一条评论并声明自己没连过外部服务；`-exec docker` 会用 `docker run` 起真容器并注入 `BASE_URL` / 模型 / AGENTS.md / 需求正文，密钥只从环境变量取且会从日志里抹掉。想让某一站的 agent 多会一件事（插件、技能），写那一站的规则就够——平台不做插件管理，见 `apps/chain/README.md` 的「给 agent 加插件、加技能」。
 - **镜像**：节点镜像与 `nodes.yaml` 都编在二进制里；第一次用容器节点前先 `go run . assets` 把它们展开到 `$HOME/.<项目名>/`，再 `sh "$HOME/.<项目名>/agent-image/build-images.sh"` 本地烘三个 agent 镜像。来路与字段见 `apps/chain/README.md` 的「节点镜像从哪来」。
 - **前端**：Vue 3 + Vite + TS + Arco Design Vue（MIT，全量注册），构建产物已入库（`apps/chain/webui/dist`），被 `//go:embed` 打进二进制。改了 `apps/web` 要记得 `npm run build`。
 
