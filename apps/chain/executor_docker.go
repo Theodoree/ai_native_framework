@@ -160,9 +160,11 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 	if err != nil {
 		log = "命令: " + shown + "\n错误: " + redact(err.Error(), key) + "\n---\n" + outText
 	}
+	verdict, reason := parseVerdict(outText)
 	body := strings.Join([]string{
 		fmt.Sprintf("【容器执行】模板 %s（镜像 %s），节点 %s（%s）", tmpl.Key, tmpl.Image, n.Key, n.Type),
 		fmt.Sprintf("分支 %s，退出码 %d，结论 %s", r.Branch, exit, outcome),
+		verdictLine(n, verdict, reason),
 		rulesLine(n.Rules),
 		"--- 容器输出（尾部）---",
 		outText,
@@ -171,7 +173,10 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 	log = redact(log, key)
 	body = redact(body, key)
 
-	a := Attempt{StartedAt: now, EndedAt: time.Now(), ExitCode: exit, Template: tmpl.Key, Log: log, Outcome: outcome}
+	a := Attempt{
+		StartedAt: now, EndedAt: time.Now(), ExitCode: exit, Template: tmpl.Key, Log: log, Outcome: outcome,
+		Verdict: verdict, VerdictReason: reason,
+	}
 	c := Comment{ID: newID("c"), AuthorType: "container", Author: tmpl.Key, Body: body, At: now}
 	return a, c, nil
 }

@@ -39,6 +39,14 @@ const (
 	ReviewHuman = "human"
 )
 
+// 容器自审给出的结论。判不出来必须是一个有别于「通过」的显式结果：
+// 一个不会说「我不确定」的审核者，最后等于没有审核。
+const (
+	VerdictPass    = "pass"
+	VerdictReject  = "reject"
+	VerdictUnknown = "unknown"
+)
+
 var nodeTypes = map[string]bool{
 	TypeCreate: true, TypeAssess: true, TypeDev: true,
 	TypeCrossTest: true, TypeMerge: true, TypeRelease: true,
@@ -88,6 +96,9 @@ type Attempt struct {
 	Template  string    `json:"template"`
 	Log       string    `json:"log"`
 	Outcome   string    `json:"outcome"`
+	// 自审结论只在 review=ai 的节点上有意义；人审节点这里恒为空。
+	Verdict       string `json:"verdict,omitempty"`
+	VerdictReason string `json:"verdictReason,omitempty"`
 }
 
 // Comment 只追加，不改不删，也不往下游传。
@@ -161,6 +172,10 @@ func ValidateChain(c Chain) error {
 		}
 		if n.Review != ReviewAI && n.Review != ReviewHuman {
 			return fmt.Errorf("节点 %s 的审核方只能是 ai 或 human：%s", n.Key, n.Review)
+		}
+		// 空节点没有容器，没人替它自审：声明 ai 会造出一个永远过不去、也永远没人能按的站。
+		if n.Review == ReviewAI && !IsContainer(n.Type) {
+			return fmt.Errorf("节点 %s 是空节点（%s），没有容器可以自审，审核方只能是 human", n.Key, n.Type)
 		}
 	}
 	if c.Nodes[0].Type != TypeAssess {
@@ -253,6 +268,11 @@ func (r *Requirement) FinishRun(key string, a Attempt, comment Comment, artifact
 	if n.State != StateRunning {
 		return fmt.Errorf("节点 %s 当前是 %s，只有 running 才能收执行结果", key, n.State)
 	}
+	// 自审结论只在 review=ai 的节点上是结论；人审节点上它只是容器说的话。
+	// 这条规则只在这里落地：执行器负责如实报告，落库的地方负责定性。
+	if n.Review != ReviewAI {
+		a.Verdict, a.VerdictReason = "", ""
+	}
 	a.N = len(n.Attempts) + 1
 	n.Attempts = append(n.Attempts, a)
 	n.Artifacts = append(n.Artifacts, artifacts...)
@@ -285,8 +305,14 @@ func (r *Requirement) Accept(key string, comment Comment, now time.Time) error {
 	return nil
 }
 
-// Reject 是审核不通过：回滚到上一站；已经是第一站就拒掉整条需求。
+// Reject 是人按下的驳回。
 func (r *Requirement) Reject(key string, reason string, author string, now time.Time) error {
+	return r.RejectBy(key, reason, "human", author, now)
+}
+
+// RejectBy 是谁按都行的驳回：人按的记成 human，容器自审按的记成 container。
+// 两者在状态机上是同一个动作——回滚到上一站，第一站则拒掉整条需求。
+func (r *Requirement) RejectBy(key string, reason string, authorType string, author string, now time.Time) error {
 	n, err := r.actionable(key)
 	if err != nil {
 		return err
@@ -298,7 +324,7 @@ func (r *Requirement) Reject(key string, reason string, author string, now time.
 		return errors.New("拒绝必须带理由")
 	}
 	n.Comments = append(n.Comments, Comment{
-		ID: newID("c"), AuthorType: "human", Author: author, Body: reason, Verdict: "reject", At: now,
+		ID: newID("c"), AuthorType: authorType, Author: author, Body: reason, Verdict: "reject", At: now,
 	})
 	n.State = StateRejected
 	n.Rev++
@@ -321,6 +347,59 @@ func (r *Requirement) Reject(key string, reason string, author string, now time.
 	r.State = ReqActive
 	r.touch(now)
 	return nil
+}
+
+// ApplyReview 把容器自审的结论落到节点上，返回「最后发生了什么」：
+// accepted（本节点定案）、rejected（回滚了）、human（人审节点，容器说了不算）、
+// awaiting_review（容器没给出可信结论，退回人工）。
+//
+// 判不出来必须留在待审而不是当通过：审核者的价值在能说「我不确定」，
+// 一个只会点头的审核者比没有审核更坏。
+func (r *Requirement) ApplyReview(key string, verdict string, reason string, now time.Time) (string, error) {
+	n := r.Node(key)
+	if n == nil {
+		return "", fmt.Errorf("没有这个节点：%s", key)
+	}
+	if n.Review != ReviewAI {
+		return "human", nil
+	}
+	switch verdict {
+	case VerdictPass:
+		body := strings.TrimSpace(reason)
+		if body == "" {
+			body = "容器自审通过：这一站的产出满足本节点的要求。"
+		}
+		c := Comment{ID: newID("c"), AuthorType: "container", Author: "AI 自审（" + lastTemplate(n) + "）", Body: body, At: now}
+		if err := r.Accept(key, c, now); err != nil {
+			return "", err
+		}
+		return "accepted", nil
+	case VerdictReject:
+		if strings.TrimSpace(reason) == "" {
+			return r.backToHuman(key, "容器说有没通过的项，但没给理由——没有理由的驳回没法回滚。已转人工审核。", now)
+		}
+		if err := r.RejectBy(key, reason, "container", "AI 自审（"+lastTemplate(n)+"）", now); err != nil {
+			return "", err
+		}
+		return "rejected", nil
+	default:
+		return r.backToHuman(key, "容器没有给出自审结论（没有 CHAIN_VERDICT 标记，或标记认不出）。已转人工审核。", now)
+	}
+}
+
+// backToHuman 让一个 review=ai 的节点在容器没给结论时停在待审，并把人需要知道的事写成平台留言。
+func (r *Requirement) backToHuman(key, why string, now time.Time) (string, error) {
+	if err := r.AddSystemComment(key, why, now); err != nil {
+		return "", err
+	}
+	return StateAwaitingReview, nil
+}
+
+func lastTemplate(n *Node) string {
+	if len(n.Attempts) == 0 {
+		return "容器"
+	}
+	return n.Attempts[len(n.Attempts)-1].Template
 }
 
 // Comment 是给任一节点留一条记录，不改变状态。
