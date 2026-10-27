@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -17,7 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { dirname, join, posix } from "node:path";
 import YAML from "yaml";
 import {
   assess,
@@ -1184,11 +1185,13 @@ try {
   const pass = JSON.stringify(result());
   const infra = JSON.stringify(result({ verdict: "INFRA" }));
 
-  // 真事件 run 40284427925 的教训：自动审查第一件事是读 routing.yml（要 YAML），
-  // 而 audit.yml 当时从头到尾没装依赖 —— 本机有 node_modules，所以 198 条用例全绿，
+  // 历史（真事件 run 40284427925）：自动审查当时第一件事是读 routing.yml（要 YAML），
+  // 而 audit.yml 从头到尾没装依赖 —— 本机有 node_modules 所以 198 条用例全绿，
   // CI 里第一次真跑就崩在 ERR_MODULE_NOT_FOUND: Cannot find package 'yaml'。
-  // 沙箱跳过这条联网步（NETWORK_STEPS），所以它必须被形状断言钉住，否则「跳过」会变成「可以不装」。
-  it("先装依赖：routing.mjs 要读 YAML，不装依赖自动审查第一步就崩", () => {
+  // **本步在当前 workflow 里已无消费者**：读 routing.yml 的现在是引擎（编译产物），
+  // run 块里没有 node 脚本了 —— 下面这几条只钉住「它没有被偷偷删掉」这个事实，
+  // 不再用「routing.mjs 要读 YAML」当理由（那个理由已经不成立了）。删/留另定。
+  it("安装依赖：本步在当前 workflow 里已无消费者（删/留另定），但不许被静默删掉", () => {
     const names = steps.map((s) => s.name);
     const at = names.indexOf("安装依赖");
     expect(at, "audit.yml 没有「安装依赖」这一步").toBeGreaterThan(-1);
@@ -1197,6 +1200,31 @@ try {
     expect(install.run).toContain("npm ci");
     // 装依赖不能带 continue-on-error：装不上就该红，而不是让后面以「判不了」收场。
     expect(install["continue-on-error"]).toBeUndefined();
+  });
+
+  // 测试接缝不许变成生产参数：AUDIT_COLLECT_POLL_INTERVAL_MS 只为 Go 侧单测把 10 秒轮询
+  // 缩到毫秒级。一旦它出现在 CI 里，接缝就成了别人能改门行为的旋钮（改的不是夹具，是判定）。
+  const AUDIT_POLL_SEAM = "AUDIT_COLLECT_POLL_INTERVAL_MS";
+  function auditPollSeamLeaks(text) {
+    return String(text)
+      .split("\n")
+      .map((line, index) => ({ line: index + 1, text: line }))
+      .filter((entry) => entry.text.includes(AUDIT_POLL_SEAM));
+  }
+
+  it("测试接缝不许进 CI：workflow 里出现 AUDIT_COLLECT_POLL_INTERVAL_MS 即违规", () => {
+    const offenders = workflowFiles({ root: ROOT }).flatMap((file) =>
+      auditPollSeamLeaks(
+        readFileSync(join(ROOT, WORKFLOW_DIR, file), "utf8"),
+      ).map((entry) => ({ file, ...entry })),
+    );
+    expect(offenders, JSON.stringify(offenders, null, 2)).toEqual([]);
+    // 判据不是空转：同一函数在含该变量的文本上必须报出一条。
+    expect(
+      auditPollSeamLeaks(
+        "run: AUDIT_COLLECT_POLL_INTERVAL_MS=1 ./.cache/bin/engine audit-collect",
+      ),
+    ).toHaveLength(1);
   });
 
   it("全 pass：POST check-runs，conclusion=success，判定步骤退出 0", () => {
@@ -3170,8 +3198,9 @@ try {
   // ---- 阶段 D3：判定步执行编译产物 ----
   // 「谁读/写 .audit/*.json」本来是文本判据。编译产物让文本这一层看不见写面，降级不换信任，
   // 靠四条钉子：
-  // ① 只承认一条通路：工作目录相对的 ./.cache/bin/engine，且**子命令与参数整条钉死**
-  //    （SANCTIONED_CONTRACT）—— 多一个参数、少一个参数、换个路径、换个子命令，都退回默认拒绝；
+  // ① 只承认一条通路：工作目录相对的 ./.cache/bin/engine，且**按子命令逐条钉死**
+  //    （SANCTIONED_CONTRACTS）—— 多一个参数、少一个参数、换个路径、换个子命令、
+  //    换到表外的子命令，都退回默认拒绝；
   // ② 这条通路的读写面由引擎自证（engine audit-findings --explain），测试拿它与 workflow 的
   //    实际参数、与实现三方对齐；
   // ③ 白名单之外的二进制、绝对路径、变量拼出来的路径仍然默认拒绝（反面对照用例钉住）；
@@ -3196,10 +3225,63 @@ try {
   const sameArgv = (left, right) =>
     left.length === right.length && left.every((word, i) => word === right[i]);
 
+  // 白名单是**按子命令的契约表**，不是一条契约：阶段 D3 只切了判定步，切换批次把
+  // auto 路径的 audit-review / audit-slot 也换了进来，于是一条 run 块里会出现两次产物调用
+  // （review 先写、slot 再落盘）。每一格自己钉死自己的参数形状，一条不多、一条不少。
+  const AUDIT_SLOTS = Object.freeze(["review-a", "review-b"]);
+  const AUDIT_EXECUTORS = Object.freeze(["sandbox", "github"]);
+  // 写面必须落在 .audit/*.json：这一层是被审对象的落盘口，换到别处就等于把写面搬出判据。
+  const AUDIT_OUT_ARG = /^\.audit\/[A-Za-z0-9._-]+\.json$/;
+  // 其余路径参数只判形状（可回仓库相对，也可带一层 $VAR 变量前缀）：具体路径不在这一格的可证范围。
+  const AUDIT_PATH_ARG = /^(?:\$[A-Za-z_][A-Za-z0-9_]*\/)?[A-Za-z0-9._\/-]+$/;
+
+  // 契约判的不是「子命令出现过」，是**这一次调用的完整词序列**：子命令 + 固定顺序 + 固定词数。
+  // 入参是 shellCommands 切出来的 argv（第 0 个就是子命令），多一个词、少一个词都退回默认拒绝。
+
+  // audit-review：audit-review --slot <槽> --diff <路径> --out <路径>。
+  function reviewContractHolds(argv) {
+    const words = argv.map((word) => String(word));
+    if (words.length !== 7) return false;
+    return (
+      words[0] === "audit-review" &&
+      words[1] === "--slot" &&
+      AUDIT_SLOTS.includes(words[2]) &&
+      words[3] === "--diff" &&
+      AUDIT_PATH_ARG.test(words[4]) &&
+      words[5] === "--out" &&
+      AUDIT_PATH_ARG.test(words[6])
+    );
+  }
+
+  // audit-slot：audit-slot --slot <槽> --executor <执行器> --out <.audit/*.json>。
+  function slotContractHolds(argv) {
+    const words = argv.map((word) => String(word));
+    if (words.length !== 7) return false;
+    return (
+      words[0] === "audit-slot" &&
+      words[1] === "--slot" &&
+      AUDIT_SLOTS.includes(words[2]) &&
+      words[3] === "--executor" &&
+      AUDIT_EXECUTORS.includes(words[4]) &&
+      words[5] === "--out" &&
+      AUDIT_OUT_ARG.test(words[6])
+    );
+  }
+
+  const SANCTIONED_CONTRACTS = new Map([
+    [
+      SANCTIONED_CONTRACT.subcommand,
+      (argv) => sameArgv(argv.map(String).slice(1), SANCTIONED_CONTRACT.argv),
+    ],
+    ["audit-slot", (argv) => slotContractHolds(argv)],
+    ["audit-review", (argv) => reviewContractHolds(argv)],
+  ]);
+
   function sanctionedContractHolds(argv) {
     const words = argv.map((word) => String(word));
-    if (words[0] !== SANCTIONED_CONTRACT.subcommand) return false;
-    return sameArgv(words.slice(1), SANCTIONED_CONTRACT.argv);
+    const contract = SANCTIONED_CONTRACTS.get(words[0]);
+    if (!contract) return false;
+    return contract(words);
   }
 
   // 一段载荷文本里「执行 ./.cache/bin/engine」的每一次调用（只看执行，不看提及）。
@@ -5799,9 +5881,25 @@ try {
     expect(scripts.unfollowable, JSON.stringify(scripts.unfollowable)).toEqual(
       [],
     );
-    // 阶段 D3：判定步不再以脚本形态出现（它是编译产物，闭包里没有可跟随的文本），
-    // 所以这里的样本换成仍在执行的另一个脚本 —— 覆盖不靠某一格的具体名字。
-    expect(scripts.files).toContain("scripts/audit-review.mjs");
+    // 阶段 D3 切换批次之后，workflow 的执行面全部收进编译产物这一格：六个调用点
+    // （review / slot / findings）执行的是同一个二进制，run 块里再没有 node scripts/*.mjs。
+    // 所以样本从「某个具体脚本名」换成更硬的一条：真仓库执行面的脚本集合恰好只有编译产物。
+    // 不做成空集断言 —— 空集也可能来自扫描器坏了，所以紧跟一条正控（扫描器必须数得出来）。
+    const wiringRefs = steps.flatMap((step) =>
+      stepScriptRefs(step, { root: ROOT }),
+    );
+    expect([...new Set(wiringRefs)]).toEqual([SANCTIONED_BINARY]);
+    // 正控：同一个扫描器对脚本形态的引用必须数得出来（空集不等于「扫干净了」）。
+    expect(
+      stepScriptRefs(
+        {
+          id: "probe",
+          name: "探针",
+          run: "node scripts/audit-review.mjs --slot review-a\n",
+        },
+        { root: ROOT },
+      ),
+    ).toEqual(["scripts/audit-review.mjs"]);
     // 判定步本身不再引用任何脚本（它是编译产物）。注意不能断言「脚本闭包里没有
     // scripts/audit-findings.mjs」：那份模块现在作为库被 audit-review import，
     // 它仍在闭包里 —— 断言的是**执行面**，不是整个仓库的 import 图。
@@ -5905,10 +6003,11 @@ try {
     const oneStep = (command) => [
       { id: "decide", name: "判定", run: command + "\n" },
     ];
-    // 对照 1：路径对、子命令不对。
+    // 对照 1：路径对、子命令不在表里。切换批次之后 audit-slot 已被 sanction，
+    // 这一格必须换成表外的子命令 —— 否则「判据是否放水」这条分界线就没有了。
     const wrongSub = auditDirReferenceViolations(
       oneStep(
-        "./.cache/bin/engine audit-slot --slot review-a --executor github --out .audit/review-a.json",
+        "./.cache/bin/engine audit-ledger --slot review-a --executor github --out .audit/review-a.json",
       ),
     );
     // 这一行还会顺带在 .audit 下写出 review-a.json，所以另有 run 面的违规；
@@ -5934,6 +6033,35 @@ try {
       sanctionedBinaryUse(SANCTIONED_BINARY, ["echo ./.cache/bin/engine"]),
     ).toBe(false);
     expect(sanctionedBinaryUse(".cache/bin/other", [contract])).toBe(false);
+    // 表里三格各自成立：review / slot 是切换批次新放行的两条通路，
+    // 放行的是「参数形状对得上」，不是「这个子命令出现过」。
+    const reviewCall =
+      "./.cache/bin/engine audit-review --slot review-a --diff $RUNNER_TEMP/pr.diff --out $RUNNER_TEMP/review-a.json";
+    const slotCall =
+      "./.cache/bin/engine audit-slot --slot review-a --executor github --out .audit/review-a.json";
+    expect(sanctionedBinaryUse(SANCTIONED_BINARY, [reviewCall])).toBe(true);
+    expect(sanctionedBinaryUse(SANCTIONED_BINARY, [slotCall])).toBe(true);
+    // 换槽位 / 多一个参数 / 把写面搬出 .audit，都退回默认拒绝。
+    expect(
+      sanctionedBinaryUse(SANCTIONED_BINARY, [
+        reviewCall.replace("--slot review-a", "--slot review-c"),
+      ]),
+    ).toBe(false);
+    expect(
+      sanctionedBinaryUse(SANCTIONED_BINARY, [reviewCall + " --model x"]),
+    ).toBe(false);
+    expect(
+      sanctionedBinaryUse(SANCTIONED_BINARY, [
+        slotCall.replace(".audit/review-a.json", "out/review-a.json"),
+      ]),
+    ).toBe(false);
+    // 一条 run 块里两次调用：两次都得对得上，差一次整格不放行。
+    expect(sanctionedBinaryUse(SANCTIONED_BINARY, [reviewCall, slotCall])).toBe(
+      true,
+    );
+    expect(
+      sanctionedBinaryUse(SANCTIONED_BINARY, [reviewCall, slotCall + " --x"]),
+    ).toBe(false);
     // 跳过要留账：上面两格默认拒绝都翻过二进制，账本里必须逐条看得见（文件 + 为什么跳）。
     // 静默 continue 会让「把执行体换成二进制」成为一条谁都查不到的暗道。
     const skips = takeBinarySkips().filter(
@@ -6995,35 +7123,79 @@ try {
     expect(out.outputs.decide.verdict).toBe("pass");
   });
 
-  it("自动路径真能落成 pass：记录过了 schema 就交给同一个口径层，结论走 success", () => {
-    // audit-review 是唯一会联网的一层，单测里不能真调模型：把它换成一个只按契约写记录的
-    // 空壳（两个槽各写一份 pass）。测的是 workflow 的接线：落盘身份、口径层判据不变、
-    // 结论真的能变成 success —— 「自动产出永远只能 action_required」不是设计意图。
-    const stub = [
-      'import { writeFileSync } from "node:fs";',
-      "const argv = process.argv.slice(2);",
-      "const value = (flag) => argv[argv.indexOf(flag) + 1];",
-      'const slot = value("--slot");',
-      "writeFileSync(",
-      '  value("--out"),',
-      "  JSON.stringify(",
-      "    {",
-      '      verdict: "pass",',
-      "      findings: [],",
-      '      evidence: { executor: "github", agent: slot, model: "model-" + slot, request_id: "req-" + slot },',
-      "    },",
-      "    null,",
-      "    2,",
-      '  ) + "\\n",',
-      ");",
-      "process.exit(0);",
+  // 引擎替身：先把真产物改名成 engine-real（同一条 run 块里的 slot 调用、以及判定步
+  // 还要用它），再放一个**按子命令分流**的 sh 替身。替身写一行 marker（.audit/stub-ran），
+  // 断言里有它 —— 替身没被执行时用例立刻红，而不是「桩没跑到 → 结论正常 → 用例绿」
+  // （阶段 D3 就踩过这个坑：桩钉在 scripts/audit-review.mjs 上，调用点换成产物后成了空操作）。
+  function installEngineStub(dir, body) {
+    const enginePath = join(dir, SANCTIONED_BINARY);
+    const real = join(dir, ".cache/bin/engine-real");
+    mkdirSync(dirname(real), { recursive: true });
+    copyFileSync(enginePath, real);
+    chmodSync(real, 0o755);
+    writeFileSync(enginePath, body);
+    chmodSync(enginePath, 0o755);
+  }
+
+  const engineStubHeader = [
+    "#!/bin/sh",
+    "mkdir -p .audit",
+    ": > .audit/stub-ran",
+    'if [ "$1" != "audit-review" ]; then',
+    '  exec "$(dirname "$0")/engine-real" "$@"',
+    "fi",
+  ].join("\n");
+
+  // 按契约写一份 pass 记录：两个槽各自自报 github/本槽，model/request_id 与槽绑定。
+  const REVIEW_PASS_STUB =
+    engineStubHeader +
+    "\n" +
+    [
+      'slot=""',
+      'out=""',
+      'prev=""',
+      'for a in "$@"; do',
+      '  if [ "$prev" = "--slot" ]; then slot="$a"; fi',
+      '  if [ "$prev" = "--out" ]; then out="$a"; fi',
+      '  prev="$a"',
+      "done",
+      'mkdir -p "$(dirname "$out")"',
+      "printf '{\"verdict\":\"pass\",\"findings\":[],\"evidence\":{\"executor\":\"github\",\"agent\":\"%s\",\"model\":\"model-%s\",\"request_id\":\"req-%s\"}}\\n' \"$slot\" \"$slot\" \"$slot\" > \"$out\"",
+      "exit 0",
       "",
     ].join("\n");
+
+  // 用法错（退出 2）：写了记录也要让步骤红 —— 退出码本身就是判据的一部分。
+  const REVIEW_EXIT_2_STUB =
+    engineStubHeader +
+    "\n" +
+    [
+      'prev=""',
+      'out=""',
+      'for a in "$@"; do',
+      '  if [ "$prev" = "--out" ]; then out="$a"; fi',
+      '  prev="$a"',
+      "done",
+      'printf %s \'{"verdict":"INFRA","findings":[]}\' > "$out"',
+      "exit 2",
+      "",
+    ].join("\n");
+
+  // 退出 3 但一个字的记录都没写：结论的唯一接口是文件，没文件同样是故障。
+  const REVIEW_EXIT_3_STUB = engineStubHeader + "\nexit 3\n";
+
+  it("自动路径真能落成 pass：记录过了 schema 就交给同一个口径层，结论走 success", () => {
+    // audit-review 是唯一会联网的一层，单测里不能真调模型：把引擎换成按子命令分流的替身
+    // —— audit-review 只按契约写记录（两个槽各写一份 pass），其余子命令原样交给真产物。
+    // 测的是 workflow 的接线：落盘身份（audit-slot 走真产物）、口径层判据不变、
+    // 结论真的能变成 success —— 「自动产出永远只能 action_required」不是设计意图。
     const out = runWorkflow(
       { AUDIT_FINDINGS_A: "", AUDIT_FINDINGS_B: "" },
       {},
-      (dir) => writeFileSync(join(dir, "scripts/audit-review.mjs"), stub),
+      (dir) => installEngineStub(dir, REVIEW_PASS_STUB),
     );
+    // 替身真的被执行了（不是没跑到）：marker 是断言的一部分。
+    expect(existsSync(join(out.dir, ".audit/stub-ran"))).toBe(true);
     expect(
       out.ran
         .filter((s) => s.name.startsWith("自动 review"))
@@ -7045,29 +7217,22 @@ try {
 
   it("自动路径的退出 3 不算故障、退出 2 才算：判不了不等于没跑成", () => {
     // 用法错（退出 2）是真故障：这时没有结论可以交给口径层，步骤必须红。
-    const argvBroken = [
-      'import { writeFileSync } from "node:fs";',
-      "const argv = process.argv.slice(2);",
-      "const value = (flag) => argv[argv.indexOf(flag) + 1];",
-      'writeFileSync(value("--out"), \'{"verdict":"INFRA","findings":[]}\');',
-      "process.exit(2);",
-      "",
-    ].join("\n");
     const usage = runWorkflow(
       { AUDIT_FINDINGS_A: "", AUDIT_FINDINGS_B: "" },
       {},
-      (dir) => writeFileSync(join(dir, "scripts/audit-review.mjs"), argvBroken),
+      (dir) => installEngineStub(dir, REVIEW_EXIT_2_STUB),
     );
+    expect(existsSync(join(usage.dir, ".audit/stub-ran"))).toBe(true);
     expect(usage.ran.find((s) => s.name === "自动 review-a")?.status).not.toBe(
       0,
     );
     // 退出 3 但一个字的记录都没写：结论的唯一接口是文件，没文件同样是故障。
-    const silent = ["process.exit(3);", ""].join("\n");
     const noFile = runWorkflow(
       { AUDIT_FINDINGS_A: "", AUDIT_FINDINGS_B: "" },
       {},
-      (dir) => writeFileSync(join(dir, "scripts/audit-review.mjs"), silent),
+      (dir) => installEngineStub(dir, REVIEW_EXIT_3_STUB),
     );
+    expect(existsSync(join(noFile.dir, ".audit/stub-ran"))).toBe(true);
     expect(noFile.ran.find((s) => s.name === "自动 review-a")?.status).not.toBe(
       0,
     );
