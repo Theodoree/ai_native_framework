@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -616,5 +617,146 @@ func TestOpenStoreAddsRolesTableToOldDatabase(t *testing.T) {
 	role, err := store.RoleByToken("rl_old")
 	if err != nil || role.Name != "张三" {
 		t.Fatalf("老库应当能读角色：%v %+v", err, role)
+	}
+}
+
+// ---- 建项目即发 owner 口令 ----
+// 这一组钉的是 t36 的那个断点：不配管理口令时，建项目的人得当场拿到项目的钥匙，
+// 否则角色管理 503、闸门 403，整条链谁也按不动。
+
+// createProjectRaw 建一个 project，把 201 的原始响应体拿回来（要看 ownerToken）。
+func createProjectRaw(t *testing.T, ts *httptest.Server, key string) Project {
+	t.Helper()
+	raw := callRaw(t, ts, "POST", "/api/projects", "", map[string]any{"key": key, "repo": "o/r"}, 201)
+	var p Project
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("建项目的响应不是 project JSON：%v（%s）", err, raw)
+	}
+	return p
+}
+
+func TestCreateProjectIssuesOwnerToken(t *testing.T) {
+	ts, store := newReviewServer(t, roleChain(), FakeExecutor{})
+	p := createProjectRaw(t, ts, "fresh")
+	if !strings.HasPrefix(p.OwnerToken, "rl_") {
+		t.Fatalf("建项目应当当场发一个 rl_ 开头的 owner 口令，实际 %q", p.OwnerToken)
+	}
+	// 库里落的是角色，不是口令本身之外的什么：owner 角色四权齐全。
+	roles, err := store.Roles("fresh")
+	if err != nil || len(roles) != 1 {
+		t.Fatalf("建项目应当顺手落一个角色，实际 %v %+v", err, roles)
+	}
+	if roles[0].Name != ownerRoleName || len(roles[0].Powers) != 4 {
+		t.Fatalf("owner 角色应当四权齐全，实际 %+v", roles[0])
+	}
+	// 拿这个口令就能直接对该项目的节点动手。
+	raw := callRaw(t, ts, "POST", "/api/p/fresh/requirements", "", map[string]any{"context": "加个按钮"}, 201)
+	var req Requirement
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatal(err)
+	}
+	first := req.Nodes[0].Key
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/"+first+"/run", p.OwnerToken, map[string]any{}, 200)
+}
+
+func TestCreateProjectWithoutAdminTokenIsUsable(t *testing.T) {
+	// newReviewServer 不带管理口令：这正是「最普通的启动方式」。
+	ts, _ := newReviewServer(t, roleChain(), FakeExecutor{})
+	p := createProjectRaw(t, ts, "solo")
+	if p.OwnerToken == "" {
+		t.Fatal("没有管理口令的部署里，建项目必须当场发口令，否则没人能按")
+	}
+	// 角色管理接口仍然要管理口令：这条规则没因为 owner 口令而放宽。
+	callRaw(t, ts, "POST", "/api/p/solo/roles", "", map[string]any{"name": "x", "powers": []string{"review"}}, 503)
+	callRaw(t, ts, "POST", "/api/p/solo/roles", p.OwnerToken, map[string]any{"name": "x", "powers": []string{"review"}}, 503)
+
+	raw := callRaw(t, ts, "POST", "/api/p/solo/requirements", "", map[string]any{"context": "端到端"}, 201)
+	var req Requirement
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatal(err)
+	}
+	// run 与 accept 全通：assess 站要 review，owner 有。
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/run", p.OwnerToken, map[string]any{}, 200)
+	got := callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/accept", p.OwnerToken,
+		map[string]any{"comment": "自己建的自己按"}, 200)
+	c := lastComment(nodeOf(t, got, "assess"))
+	if c.AuthorType != "role" || c.Author != ownerRoleName {
+		t.Fatalf("按的人应当记成 owner 角色，实际 %+v", c)
+	}
+}
+
+func TestListProjectsHidesOwnerToken(t *testing.T) {
+	ts, _ := newReviewServer(t, roleChain(), FakeExecutor{})
+	createProjectRaw(t, ts, "hidden")
+	raw := callRaw(t, ts, "GET", "/api/projects", "", nil, 200)
+	if strings.Contains(raw, "rl_") {
+		t.Fatalf("列表不该出现角色口令，实际 %s", raw)
+	}
+	if strings.Contains(raw, "ownerToken") {
+		t.Fatalf("列表不该出现 ownerToken 字段，实际 %s", raw)
+	}
+}
+
+func TestOwnerRoleNameCannotBeDuplicated(t *testing.T) {
+	ts, _ := newRoleServer(t)
+	createProjectRaw(t, ts, "dup")
+	// 同一 project 里再建一个叫 owner 的角色：重名就报错，不静默改名。
+	errText := callRaw(t, ts, "POST", "/api/p/dup/roles", testAdminToken,
+		map[string]any{"name": ownerRoleName, "powers": []string{"review"}}, 400)
+	if !strings.Contains(errText, "这个 project 里已经有同名角色：owner") {
+		t.Fatalf("重名应当点名 owner，实际 %s", errText)
+	}
+}
+
+func TestCreateProjectFailsWhenOwnerRoleCannotBeIssued(t *testing.T) {
+	ts, store := newRoleServer(t)
+	// 先占住 owner 这个名字：建项目时发不出角色，就不该建出「没人能按」的项目。
+	seedRole(t, store, "ghost", ownerRoleName, "rl_ghost", PowerReview)
+	errText := callRaw(t, ts, "POST", "/api/projects", "", map[string]any{"key": "ghost", "repo": "o/r"}, 500)
+	if !strings.Contains(errText, "建项目失败：owner 角色没有落库：这个 project 里已经有同名角色：owner") {
+		t.Fatalf("发不出 owner 口令时应当如实说清，实际 %s", errText)
+	}
+	if _, err := store.Project("ghost"); err == nil {
+		t.Fatal("owner 角色没落库时，项目也不该留下半截")
+	}
+}
+
+// failingProjectStore 只让指定的 project 写不进去：用来测「项目没落库时，刚发的 owner 角色要回滚」。
+// Store 是接口，所以这不需要真的把磁盘写坏——那反而会变成一条只在坏机器上跑得起来的用例。
+type failingProjectStore struct {
+	Store
+	key string
+}
+
+func (f failingProjectStore) SaveProject(p *Project) error {
+	if p.Key == f.key {
+		return errors.New("磁盘写不进去")
+	}
+	return f.Store.SaveProject(p)
+}
+
+func TestCreateProjectRollsBackOwnerRoleWhenProjectSaveFails(t *testing.T) {
+	inner, err := OpenStore("sqlite", filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { inner.Close() })
+	ts := httptest.NewServer(NewServer(failingProjectStore{Store: inner, key: "half"}, FakeExecutor{}).Handler())
+	t.Cleanup(ts.Close)
+
+	errText := callRaw(t, ts, "POST", "/api/projects", "", map[string]any{"key": "half", "repo": "o/r"}, 500)
+	if !strings.Contains(errText, "磁盘写不进去") {
+		t.Fatalf("项目写不进去时应当如实回 500，实际 %s", errText)
+	}
+	// 同生共死的另一半：项目没进去，刚发的钥匙不能留在库里占名字。
+	roles, err := inner.Roles("half")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 0 {
+		t.Fatalf("项目没写进去时 owner 角色必须回滚，实际留下 %d 个：%+v", len(roles), roles)
+	}
+	if _, err := inner.Project("half"); err == nil {
+		t.Fatal("这个项目本来就没写进去，不该读得出来")
 	}
 }

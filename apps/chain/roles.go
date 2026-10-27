@@ -43,6 +43,42 @@ func newRoleToken() (string, error) {
 	return roleTokenPrefix + hex.EncodeToString(b), nil
 }
 
+// ownerRoleName 是建项目时自动发的那个角色名。它和手建角色共用同一条「同名报错」规则：
+// 重名就报错，不静默改名——名字是评论里记的那个名字，悄悄改掉等于换了一个人。
+const ownerRoleName = "owner"
+
+// issueOwnerRole 给项目发一个四权齐全的 owner 角色，返回它（含口令）。
+//
+// 为什么建项目就能拿到钥匙：POST /api/projects 本来就不需要认证，谁能建项目，
+// 谁就该能用起来——不配 -admin-token 的部署里，这是唯一的入口。
+// 这不放宽「角色管理要管理口令」那条：建 / 列 / 删 / 换口令仍然要管理口令，
+// owner 只是一个普通角色，管理员照样能删掉它、换掉它的口令。
+func (s *Server) issueOwnerRole(projectKey string) (Role, error) {
+	existing, err := s.store.Roles(projectKey)
+	if err != nil {
+		return Role{}, err
+	}
+	for _, r := range existing {
+		if r.Name == ownerRoleName {
+			return Role{}, fmt.Errorf("这个 project 里已经有同名角色：%s", ownerRoleName)
+		}
+	}
+	token, err := newRoleToken()
+	if err != nil {
+		return Role{}, err
+	}
+	role := Role{
+		ID: newID("r"), ProjectKey: projectKey, Name: ownerRoleName,
+		Powers:    []string{PowerReview, PowerDev, PowerTest, PowerRelease},
+		Token:     token,
+		CreatedAt: s.now(),
+	}
+	if err := s.store.SaveRole(role); err != nil {
+		return Role{}, err
+	}
+	return role, nil
+}
+
 type createRoleReq struct {
 	Name   string   `json:"name"`
 	Powers []string `json:"powers"`

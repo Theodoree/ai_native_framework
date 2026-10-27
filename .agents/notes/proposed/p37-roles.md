@@ -82,8 +82,18 @@ roles(id TEXT PK, project_key TEXT, name TEXT, powers TEXT /* JSON string[] */, 
 
 **已知代价（未解）**：不给 `-admin-token` 的部署里，角色管理接口返 503，于是建不出角色 → 所有动作 403，整条链按不动。这是"建角色必须用管理口令"的直接后果，处置见下一节。
 
-## 待办：没有管理口令时的引导
+## 没有管理口令时的引导（已落地，2026-10-27）
 
 单机跑起来（`-exec fake` 什么都不配）是最常见的第一次体验，不能让它卡在"建不出角色"。方案：建 project 的响应里带回一个 `owner` 角色口令（四个权力全给），只显示这一次。
 
 理由是它与现有的信任模型一致：`POST /api/projects` 本来就不需要认证，谁能建项目谁就拿到这个项目的钥匙。**不**放宽"角色管理需要管理口令"，否则那一条就成了摆设。
+
+**做法**：`POST /api/projects` 成功时顺手建一个四权齐全的 `owner` 角色，口令只在那条 201 响应里出现一次；`Project.OwnerToken` 带 `omitempty` 且不落库（`SaveProject` 逐列写），所以列表接口叫不出来。
+
+**顺序与回滚**：先发钥匙再挂门牌。角色表没有外键，反过来「项目落库后建角色失败」要删项目，而 Store 没有删 project 的口子，只能留下「项目有了但没人能按」的半截状态。所以角色发不出来 → 项目不建（500）；项目写不进去 → 把刚发的角色删掉再 500。
+
+**我补的那条用例**：t36 自己承认「SaveProject 失败的回滚分支没有用例覆盖（无法注入 Store 失败）」。但 Store 是接口，注入失败只是个包装类型的事——一条没人钉的回滚分支等于没有回滚。我加了 `failingProjectStore` 与 `TestCreateProjectRollsBackOwnerRoleWhenProjectSaveFails`，并亲自变异确认：删掉那行 `DeleteRole(owner.ID)` 后这条用例红（当时全仓其它用例 0 红）。
+
+**独立黑盒复验（我起真服务，不配 `-admin-token`）**：建项目 201 且响应含 `rl_` 开头的 39 字符口令；列表响应体不含 `rl_`/`ownerToken`；角色管理接口仍 503；提需求后 assess 站 `power=review`；用 owner 口令 run + accept 均 200，评论作者记成 `role/owner`；无口令 run → 403。
+
+**仍未解**：老库里已存在的项目不补建 owner 角色（那是管理员动作，要管理口令）；口令不落库，丢了只能 rotate；owner 与手建角色共用「同 project 同名报错」规则，名字是评论里记的那个名字，不静默改名。

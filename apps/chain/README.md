@@ -25,7 +25,7 @@
 
 | 实体 | 关键字段 |
 | --- | --- |
-| Project | key、name、repo、defaultBranch、chains、intakeToken（只在建 project 时交出去一次） |
+| Project | key、name、repo、defaultBranch、chains、intakeToken（只在建 project 时交出去一次）、ownerToken（同上，且不落库） |
 | Chain | key、type、version、nodes[]（key、type、review） |
 | Node | key、type、review、power、index、state、attempts[]、comments[]、rules[]、artifacts[]、rev |
 | Role | id、projectKey、name、powers[]、token（只在建角色与换口令的响应里出现一次）、createdAt |
@@ -54,7 +54,7 @@
 | --- | --- | --- |
 | GET | `/` | 内嵌前端（`webui/dist`） |
 | GET | `/assets/` | 内嵌前端的静态资源 |
-| GET / POST | `/api/projects` | 列表 / 创建（key 重复 409） |
+| GET / POST | `/api/projects` | 列表 / 创建（key 重复 409）；创建会顺手发一个 owner 角色口令，只在 201 里出现 |
 | GET | `/api/requirements` | 全部需求 |
 | POST | `/api/p/{project}/requirements` | 提需求（body: context、images、source、chain） |
 | GET | `/api/requirements/{id}` | `{ requirement, events }` |
@@ -112,7 +112,7 @@
 
 - 同一个 project 里角色名唯一：评论里记的是角色名，重名就分不清是谁按的。
 - 角色只在它自己的 project 里有意义：拿一个 project 的管理口令改不到别的 project 的角色。
-- 没配 `-admin-token` 的部署里这四个接口一律 503（接入层没开），也就建不出角色。
+- 没配 `-admin-token` 的部署里这四个接口一律 503（接入层没开）。但**链不会因此按不动**：建 project 时平台顺手发一个四权齐全的 `owner` 角色，口令就在那条 201 响应里——建项目的人当场拿到这个项目的钥匙。手建别的角色仍然要管理口令，这条没放宽。
 
 ### 动作默认拒绝
 

@@ -322,10 +322,22 @@ func (s *Server) createProject(c *gin.Context) {
 		}
 		p.Chains = in.Chains
 	}
+	// 先发钥匙再挂门牌：角色表没有外键，反过来「项目落库后建角色失败」要删项目，
+	// 而 Store 没有删 project 的口子，那就只能留下「项目有了但没人能按」的半截状态。
+	owner, err := s.issueOwnerRole(key)
+	if err != nil {
+		// 项目与它的 owner 角色同生共死：这一步没成，项目就不建。
+		fail(c, 500, "建项目失败：owner 角色没有落库："+err.Error())
+		return
+	}
 	if err := s.store.SaveProject(p); err != nil {
+		// 同生共死的另一半：项目写不进去，刚发的角色也不能留着占名字。
+		_ = s.store.DeleteRole(owner.ID)
 		fail(c, 500, err.Error())
 		return
 	}
+	// 口令只在这一次响应里出现；落库的 Project 没有它，列表接口也叫不出来。
+	p.OwnerToken = owner.Token
 	writeJSON(c, 201, p)
 }
 

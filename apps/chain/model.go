@@ -123,13 +123,16 @@ type Chain struct {
 
 // Project 是一个代码仓库加若干条链条。
 type Project struct {
-	Key           string    `json:"key"`
-	Name          string    `json:"name"`
-	Repo          string    `json:"repo"`
-	DefaultBranch string    `json:"defaultBranch"`
-	Chains        []Chain   `json:"chains"`
-	IntakeToken   string    `json:"intakeToken,omitempty"`
-	CreatedAt     time.Time `json:"createdAt"`
+	Key           string  `json:"key"`
+	Name          string  `json:"name"`
+	Repo          string  `json:"repo"`
+	DefaultBranch string  `json:"defaultBranch"`
+	Chains        []Chain `json:"chains"`
+	IntakeToken   string  `json:"intakeToken,omitempty"`
+	// OwnerToken 只在建项目那一条 201 响应里出现一次：建项目的人顺手拿到这个项目的钥匙。
+	// 它不落库、也不出现在列表里——库里存的是钥匙之外的一切。
+	OwnerToken string    `json:"ownerToken,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
 }
 
 // Role 是「谁有权按这个 project 的节点」。身份用口令承载，不做账号体系：
