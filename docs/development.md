@@ -4,52 +4,77 @@
 
 > 所用语言的 format / lint 规范见 `docs/language-standards.md`（含各语言的 CI 检查命令）。
 
-本仓库用三种语言，各自有明确的归属：
-
-- **JavaScript（ESM，Node ≥ 20）**：只剩测试与工具链（vitest 用例、`tests/goldens/freeze.mjs` 的冻结脚本、prettier / oxlint），**不执行任何判据**：`scripts/` 里已经没有任何 `.mjs`（15 个 Node 载体整批删除，判据只在 `apps/engine`）。`yaml` 因此降为 devDependency，只被测试 `import`。workflow 里还留有内联 `node -e/-p`（`audit.yml` 4 处 / `state-writer.yml` 5 处 / `merge-gate.yml` 1 处，取 check runs、拼读 JSON 片段），所以 `setup-node` 不能撤。
-- **Go（≥ 1.22）**：本机平台实例的 HTTP 面（`apps/api-go`）与判定/账本引擎（`apps/engine`，库 + 单二进制 CLI，16 个子命令）：CI 与 npm 脚本跑判据时调的就是构建出来的 `.cache/bin/engine`。第三方依赖：`apps/engine` 只有 `gopkg.in/yaml.v3`（解析状态机声明），`apps/api-go` 另加 `modernc.org/sqlite`（纯 Go，无需 cgo）。
-- **TypeScript + Vue 3（Vite）**：本机平台实例的页面（`apps/web-vue`）。
+本仓现状：后端与判据是 Go（`apps/chain`，module `ai-native-framework/apps/chain`，`go 1.26.0`），
+前端是 Vue 3 + Vite + TypeScript（`apps/web`）。没有 Node 判据脚本，也没有 JS 测试套件。
 
 ## 安装
 
+**Go（`apps/chain`）**
+
+- 需要 Go ≥ 1.26（`apps/chain/go.mod` 的 `go 1.26.0`）。
+- 第三方依赖只有 `modernc.org/sqlite v1.61.0`（纯 Go 实现，免 cgo）及其间接依赖；`go mod download` 即可。
+- **构建缓存必须落在仓库内**：沙箱与 CI 都不写家目录，默认 `GOCACHE` 指向 `~/Library` 会被拒写。
+
+  ```bash
+  cd apps/chain
+  export GOCACHE=$PWD/.cache/go-build GOPATH=$PWD/.cache/go
+  ```
+
+  `.cache/` 已在 `.gitignore`（`.gitignore:10` 与 `apps/chain/.cache/` 各一行）。
+
+**前端（`apps/web`）**
+
 ```bash
-npm install                        # 根：判定/门/审计 + 测试
-npm --prefix apps/web-vue install  # 前端自带依赖树
+cd apps/web && npm ci
 ```
 
 ## 测试
 
+**Go**
+
 ```bash
-npm test              # vitest（引擎二进制缺失或比源文件旧会自动构建，见下）
-npm run check:state   # 先 build:engine，再跑 check-config（状态机声明自检）
-npm run check:go      # gofmt + go vet + go test（apps/api-go）
-npm run check:engine  # gofmt + go vet + go test（apps/engine）
-npm run check:web     # 构建 apps/web-vue，再用引擎的 copy-dist 把产物铺进 apps/api-go
+cd apps/chain
+export GOCACHE=$PWD/.cache/go-build GOPATH=$PWD/.cache/go
+go test ./...
 ```
 
-- 对照（parity）测试是 `npm test` 的一部分：`tests/engine-parity*.test.mjs` 把同一批夹具喂给编译好的引擎，与 `tests/goldens/<suite>/` 里 Node 时代冻下来的期望值逐字节比 stdout / stderr / 退出码 / 写出文件 / 请求记录。期望值不是现算的：`freeze.mjs` 要跑旧 Node 实现才能重冻，而 `scripts/` 里的参照物已删，所以 a / b / c 三套**不可重冻**，命中即以可读说明中止（不崩溃、不静默跳过）。各套用例数与已登记例外见 `apps/engine/README.md` 的「验证」节。
-- `check:web` 与 `web:dist` 都调 `./.cache/bin/engine`：**单独跑它们之前先 `npm run build:engine`**，否则退出码是 127。`npm run check` 因为先跑 `check:state` 不会踩到这一条。
+**前端**：`apps/web` 目前没有测试脚本（`package.json` 只有 `dev` / `build` / `typecheck` / `preview`），
+类型检查用 `cd apps/web && npm run typecheck`（`vue-tsc --noEmit`）。
 
 ## 构建
 
-- 引擎：`npm run build:engine` → `.cache/bin/engine`（唯一入口，CI 与测试共用；`.cache/` 已忽略，产物不进仓库。测试缺二进制会自动调它，构建失败即红）。六个 workflow 在 `npm ci` 之后都有一份 `actions/setup-go@v5`(1.22)，其中五个（`audit` / `kb-sync` / `last-change` / `merge-gate` / `state-writer`）另有一步无名 `npm run build:engine`；`check.yml` 不单列这一步，它跑 `npm run check`，构建由链首的 `check:state` 完成。先有二进制，调用点才可能绿。
-- 后端：`npm run api` 直接 `go run .`（无发行产物；需要二进制时 `cd apps/api-go && go build`）。
-- 前端：`npm run web:build`，产物在 `apps/web-vue/dist`；`npm run web:dist`（引擎的 `copy-dist`）把它铺进 `apps/api-go/dist` 供内嵌，后端发现该目录存在就托管它。
-
-## 本机实例
+**Go 二进制**
 
 ```bash
-npm run api        # Go 后端，127.0.0.1:4317（PORT 可覆盖）
-npm run web:dev    # Vite dev server，/api 代理到 4317
-npm run cli -- board   # 接入层命令行（引擎的 cli 子命令，默认打 127.0.0.1:4317，见 apps/engine/README.md）
+cd apps/chain
+export GOCACHE=$PWD/.cache/go-build GOPATH=$PWD/.cache/go
+go build -o ../../.cache/chain .
+```
+
+写成 `-o` 指向 `.cache/` 是有原因的：`go build ./...` 对 main 包会把可执行文件写进
+`.cache/` 之外的当前目录（产物名 `chain`），工作树里凭空多一个未跟踪文件。
+只想做编译检查而非留下产物时用 `go build -o /dev/null ./...`。
+
+**前端产物**（给 Go 内嵌，见 `apps/web/package.json` 的 `description`）
+
+```bash
+cd apps/web && npm run build
 ```
 
 ## 验证
 
+一次改动的完整顺序（Go 侧）：
+
 ```bash
-npm run check     # 配置自检 + lint + 测试 + Go + 前端构建；退出码非 0 即不可合
+cd apps/chain
+export GOCACHE=$PWD/.cache/go-build GOPATH=$PWD/.cache/go
+gofmt -l $(find . -name '*.go' -not -path './.cache/*')   # 必须没有任何输出
+go vet ./...
+go test ./...
 ```
 
-退出码语义：`0` 通过 · `1` 拒绝（判定为不合法） · `3` INFRA（配置或输入不可判定）。**INFRA 不算通过。**
+一键跑法：`.agents/skills/verify-change/scripts/verify.sh`（`--help` 有用法）。它识别到
+`apps/chain/go.mod` 时跑 gofmt / go vet / go test 三步，并打印逐项结果与汇总行。
 
-长会话有一个运行时上限要先知道：上下文压缩只改写「模型看得见的请求」，工具调用前置审查是另一次请求、读未压缩原始会话，因此它会随工具输出单调增长并先撞窗口（`413 side_request_payload_too_large`，连 `compress` 一起被拦）。机制与应对见 `.agents/notes/implemented/dsh-side-request-payload.md`；习惯上大文件只读需要的行区间、日志只读尾部、子代理报告要摘要。
+退出码语义：`0` = 没有任何步骤失败；`1` = 至少一步失败；全部 SKIP（未识别到技术栈）不是错误，
+但此时必须按上面三条命令手工跑一遍并贴出输出。
