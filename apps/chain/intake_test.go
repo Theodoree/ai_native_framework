@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -13,89 +11,66 @@ import (
 	"time"
 )
 
-const testAdminToken = "admin-secret-for-test"
+// 接入层现在的身份是「登录态或 API 密钥，且要是这个项目的成员」。
+// reporter 是测试里那个「平台外提需求的人」：普通账号，靠被授予角色成为成员。
+const reporterUser = "reporter"
+const reporterPass = "reporter-password-1"
+const outsiderUser = "outsider"
+const outsiderPass = "outsider-password-1"
 
-// newIntakeServer 起一个打开了接入层的服务。store 拿回去是为了直接读事件与评论。
+// newIntakeServer 起一个服务，并建好 reporter 与 outsider 两个普通账号。
 func newIntakeServer(t *testing.T) (*httptest.Server, Store) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "chain.db")
-	store, err := OpenStore("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
-	mux := http.NewServeMux()
-	NewServer(store, FakeExecutor{}).WithAdminToken(testAdminToken).Routes(mux)
-	ts := httptest.NewServer(mux)
-	t.Cleanup(ts.Close)
+	ts, store, _ := newTestServer(t)
+	addUser(t, ts, reporterUser, reporterPass)
+	addUser(t, ts, outsiderUser, outsiderPass)
 	return ts, store
 }
 
-func intakeCall(t *testing.T, ts *httptest.Server, method, path, token string, body any, want int) []byte {
+// intakeProject 以管理员身份建一个 project，并把 reporter 放进它的一个角色里。
+// 「是不是成员」看的是有没有角色，所以给一个 review 权力就够提需求。
+func intakeProject(t *testing.T, ts *httptest.Server, key string) {
 	t.Helper()
-	var buf bytes.Buffer
-	if body != nil {
-		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			t.Fatal(err)
-		}
+	call(t, ts, "POST", "/api/projects", map[string]any{"key": key, "repo": "/tmp/" + key}, 201)
+	grantRole(t, ts, key, key+"-审核员", reporterUser, PowerReview)
+}
+
+// intakeCall 以 who 的身份发请求（who 为空表示匿名），只断言状态码并返回原始响应体。
+func intakeCall(t *testing.T, ts *httptest.Server, who, method, path string, body any, want int) []byte {
+	t.Helper()
+	var cl *http.Client
+	if who != "" {
+		cl = clientOf(t, ts, who)
 	}
-	req, err := http.NewRequest(method, ts.URL+path, &buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	raw, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.StatusCode != want {
-		t.Fatalf("%s %s 期望 %d，实际 %d：%s", method, path, want, res.StatusCode, raw)
+	code, raw := exchange(t, ts, cl, method, path, body)
+	if code != want {
+		t.Fatalf("%s %s 期望 %d，实际 %d：%s", method, path, want, code, raw)
 	}
 	return raw
 }
 
-// intakeProject 走管理口令建一个 project，返回它的访问口令。
-func intakeProject(t *testing.T, ts *httptest.Server, key string) string {
-	t.Helper()
-	raw := intakeCall(t, ts, "POST", "/api/intake/projects", testAdminToken,
-		map[string]any{"key": key, "repo": "/tmp/" + key}, 201)
-	var out intakeCreatedProject
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(out.IntakeToken, "pk_") {
-		t.Fatalf("建 project 应发一个 pk_ 开头的访问口令，实际 %q", out.IntakeToken)
-	}
-	if len(out.Chains) == 0 {
-		t.Fatal("没给链条时应落默认链条")
-	}
-	return out.IntakeToken
-}
-
-// 老库没有接入层的列：CREATE TABLE IF NOT EXISTS 不会补，得靠 migrate。
+// 老库既没有接入层那几列，也没有账号/会话/授予那几张表：
+// CREATE TABLE IF NOT EXISTS 不会补列，得靠 migrate 一路补齐。
 func TestOpenStoreMigratesOldDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 	db, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec(`CREATE TABLE projects (
+	if _, err := db.Exec(`CREATE TABLE projects (
   key TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL,
-  default_branch TEXT NOT NULL, chains TEXT NOT NULL, created_at TEXT NOT NULL)`)
-	if err != nil {
+  default_branch TEXT NOT NULL, chains TEXT NOT NULL, created_at TEXT NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO projects VALUES ('old','old','/tmp/old','main','[]','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	// 老库里的 roles 表还带着「口令」列，而且是 NOT NULL：搬过来的第一件事就是把它放开。
+	if _, err := db.Exec(`CREATE TABLE roles (id TEXT PRIMARY KEY, project_key TEXT NOT NULL,
+  name TEXT NOT NULL, powers TEXT NOT NULL, token TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO roles VALUES ('r-old','old','老角色','["review"]','rl_legacy','2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -111,66 +86,55 @@ func TestOpenStoreMigratesOldDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.IntakeToken != "" {
-		t.Fatalf("老库补出来的访问口令应当为空（接入层没开过），实际 %q", p.IntakeToken)
+	if p.Key != "old" || p.DefaultBranch != "main" {
+		t.Fatalf("老库的 project 应当原样读回来，实际 %+v", p)
 	}
-	p.IntakeToken = "pk_x"
 	if err := store.SaveProject(p); err != nil {
+		t.Fatalf("老库的 project 应当还能写回去：%v", err)
+	}
+	// 角色不再有口令列：同一个 id 覆盖写一次不该撞唯一约束。
+	if err := store.SaveRole(Role{ID: "r-old", ProjectKey: "old", Name: "老角色",
+		Powers: []string{PowerReview}, CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("口令列放开之后角色应当能不带口令写进去：%v", err)
+	}
+	if _, err := store.Role("r-old"); err != nil {
 		t.Fatal(err)
 	}
-	again, err := store.Project("old")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if again.IntakeToken != "pk_x" {
-		t.Fatalf("补列之后应当能写能读访问口令，实际 %q", again.IntakeToken)
+	// 新表也要在老库上建出来。
+	if n, err := store.CountUsers(); err != nil || n != 0 {
+		t.Fatalf("老库补出来的账号表应当是空的：%v %d", err, n)
 	}
 }
 
-func TestIntakeStaysClosedWithoutAdminToken(t *testing.T) {
-	ts, _, _ := newTestServer(t)
-	intakeCall(t, ts, "POST", "/api/intake/projects", "", map[string]any{"key": "a", "repo": "/tmp/a"}, 503)
-}
-
-func TestIntakeCreateProjectNeedsAdminToken(t *testing.T) {
+func TestIntakeNeedsLogin(t *testing.T) {
 	ts, _ := newIntakeServer(t)
-	intakeCall(t, ts, "POST", "/api/intake/projects", "wrong", map[string]any{"key": "a", "repo": "/tmp/a"}, 401)
-	intakeCall(t, ts, "POST", "/api/intake/projects", testAdminToken, map[string]any{"key": "a"}, 400)       // 缺 repo
-	intakeCall(t, ts, "POST", "/api/intake/projects", testAdminToken, map[string]any{"repo": "/tmp/a"}, 400) // 缺 key
-	intakeProject(t, ts, "a")
-	intakeCall(t, ts, "POST", "/api/intake/projects", testAdminToken, map[string]any{"key": "a", "repo": "/tmp/a"}, 409)
+	intakeProject(t, ts, "alpha")
+	raw := intakeCall(t, ts, "", "POST", "/api/intake/requirements",
+		map[string]any{"project": "alpha", "context": "加个按钮"}, 401)
+	if !strings.Contains(string(raw), "没有登录") {
+		t.Fatalf("没登录应当说要先登录，实际 %s", raw)
+	}
+	intakeCall(t, ts, "", "GET", "/api/intake/requirements/x", nil, 401)
 }
 
-func TestIntakeTokenOnlySeesOwnProject(t *testing.T) {
+func TestIntakeNeedsMembership(t *testing.T) {
 	ts, _ := newIntakeServer(t)
-	tokenA := intakeProject(t, ts, "alpha")
-	tokenB := intakeProject(t, ts, "beta")
-	if tokenA == tokenB {
-		t.Fatal("两个 project 的访问口令不该相同")
+	intakeProject(t, ts, "alpha")
+	raw := intakeCall(t, ts, outsiderUser, "POST", "/api/intake/requirements",
+		map[string]any{"project": "alpha", "context": "加个按钮"}, 403)
+	if !strings.Contains(string(raw), "不是 alpha 的成员") {
+		t.Fatalf("不是成员应当点名 project，实际 %s", raw)
 	}
-
-	raw := intakeCall(t, ts, "GET", "/api/intake/projects", tokenA, nil, 200)
-	var view intakeProjectView
-	if err := json.Unmarshal(raw, &view); err != nil {
-		t.Fatal(err)
-	}
-	if view.Key != "alpha" {
-		t.Fatalf("alpha 的口令只该看见 alpha，实际 %s", view.Key)
-	}
-	if strings.Contains(string(raw), tokenA) {
-		t.Fatal("列表接口不该把访问口令再交回去")
-	}
-	intakeCall(t, ts, "GET", "/api/intake/projects", tokenB, nil, 200)
-	intakeCall(t, ts, "GET", "/api/intake/projects", "pk_deadbeef", nil, 401)
-	intakeCall(t, ts, "GET", "/api/intake/projects", "", nil, 401)
+	// 成员才谈得上「这个 project 存不存在」之外的判断。
+	intakeCall(t, ts, reporterUser, "POST", "/api/intake/requirements", map[string]any{"context": "x"}, 400)
 }
 
 func TestIntakeRequirementSubmitAndPoll(t *testing.T) {
 	ts, _ := newIntakeServer(t)
-	token := intakeProject(t, ts, "alpha")
+	intakeProject(t, ts, "alpha")
 
-	raw := intakeCall(t, ts, "POST", "/api/intake/requirements", token,
-		map[string]any{"context": "加一个导出按钮", "images": []string{"shot.png"}}, 201)
+	raw := intakeCall(t, ts, reporterUser, "POST", "/api/intake/requirements",
+		map[string]any{"project": "alpha", "context": "加一个导出按钮", "images": []string{"shot.png"}}, 201)
 	var created intakeRequirementView
 	if err := json.Unmarshal(raw, &created); err != nil {
 		t.Fatal(err)
@@ -183,7 +147,7 @@ func TestIntakeRequirementSubmitAndPoll(t *testing.T) {
 	}
 
 	// 拉模式：没有回告地址，提需求的人靠这条接口自己取结论。
-	raw = intakeCall(t, ts, "GET", "/api/intake/requirements/"+created.ID, token, nil, 200)
+	raw = intakeCall(t, ts, reporterUser, "GET", "/api/intake/requirements/"+created.ID, nil, 200)
 	var polled intakeRequirementView
 	if err := json.Unmarshal(raw, &polled); err != nil {
 		t.Fatal(err)
@@ -192,12 +156,12 @@ func TestIntakeRequirementSubmitAndPoll(t *testing.T) {
 		t.Fatalf("拉回来的结论应与刚才那条同一条且未被拒，实际 %+v", polled)
 	}
 
-	// 别人的口令看不到这条需求。
-	other := intakeProject(t, ts, "beta")
-	intakeCall(t, ts, "GET", "/api/intake/requirements/"+created.ID, other, nil, 404)
-	// 空需求与不存在的链条都是 400。
-	intakeCall(t, ts, "POST", "/api/intake/requirements", token, map[string]any{"context": "  "}, 400)
-	intakeCall(t, ts, "POST", "/api/intake/requirements", token, map[string]any{"context": "x", "chain": "nope"}, 400)
+	// 不是成员的人看不到这条需求。
+	intakeCall(t, ts, outsiderUser, "GET", "/api/intake/requirements/"+created.ID, nil, 403)
+	// 空需求、不存在的链条、不存在的 project 各是 400/400/404。
+	intakeCall(t, ts, reporterUser, "POST", "/api/intake/requirements", map[string]any{"project": "alpha", "context": "  "}, 400)
+	intakeCall(t, ts, reporterUser, "POST", "/api/intake/requirements", map[string]any{"project": "alpha", "context": "x", "chain": "nope"}, 400)
+	intakeCall(t, ts, reporterUser, "GET", "/api/intake/requirements/NOPE", nil, 404)
 }
 
 func TestIntakeRejectReportsBackToReporter(t *testing.T) {
@@ -213,8 +177,9 @@ func TestIntakeRejectReportsBackToReporter(t *testing.T) {
 	}))
 	t.Cleanup(cb.Close)
 
-	token := intakeProject(t, ts, "alpha")
-	raw := intakeCall(t, ts, "POST", "/api/intake/requirements", token, map[string]any{
+	intakeProject(t, ts, "alpha")
+	raw := intakeCall(t, ts, reporterUser, "POST", "/api/intake/requirements", map[string]any{
+		"project":  "alpha",
 		"context":  "随手一问",
 		"reporter": map[string]any{"kind": "webhook", "ref": "ticket-7", "callbackURL": cb.URL},
 	}, 201)
@@ -240,7 +205,7 @@ func TestIntakeRejectReportsBackToReporter(t *testing.T) {
 		t.Fatalf("回告里的结论应是整条需求被拒，实际 %s", body.State)
 	}
 
-	raw = intakeCall(t, ts, "GET", "/api/intake/requirements/"+created.ID, token, nil, 200)
+	raw = intakeCall(t, ts, reporterUser, "GET", "/api/intake/requirements/"+created.ID, nil, 200)
 	var polled intakeRequirementView
 	if err := json.Unmarshal(raw, &polled); err != nil {
 		t.Fatal(err)
@@ -280,8 +245,9 @@ func TestIntakeRejectReportsBackToReporter(t *testing.T) {
 
 func TestIntakeCallbackFailureDoesNotChangeState(t *testing.T) {
 	ts, store := newIntakeServer(t)
-	token := intakeProject(t, ts, "alpha")
-	raw := intakeCall(t, ts, "POST", "/api/intake/requirements", token, map[string]any{
+	intakeProject(t, ts, "alpha")
+	raw := intakeCall(t, ts, reporterUser, "POST", "/api/intake/requirements", map[string]any{
+		"project":  "alpha",
 		"context":  "随手一问",
 		"reporter": map[string]any{"kind": "webhook", "ref": "t", "callbackURL": "http://127.0.0.1:1/nope"},
 	}, 201)

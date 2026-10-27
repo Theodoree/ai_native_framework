@@ -1,14 +1,23 @@
 <script setup lang="ts">
-import Icon from './Icon.vue'
-import { fmtType } from '../format'
+/**
+ * 项目列表（左栏）：Arco Menu 一行一个项目——key + 名称 / 仓库 / 链条 / 需求数。
+ * 点一项即切换当前项目；加载、错误、空态都在这块里说清楚，不留白屏。
+ */
+import { IconRefresh } from '@arco-design/web-vue/es/icon'
 import type { Project } from '../types'
 
-defineProps<{
-  projects: Project[]
-  current: string
-  state: 'loading' | 'ready' | 'error'
-  error: string
-}>()
+const props = withDefaults(
+  defineProps<{
+    projects: Project[]
+    state: 'loading' | 'ready' | 'error'
+    error: string
+    current: string
+    counts?: Record<string, number>
+    /** 管理员看到空列表是「还没建」，非管理员是「还没被加进来」——两种空说两句不同的话。 */
+    admin?: boolean
+  }>(),
+  { counts: () => ({}), admin: false },
+)
 
 const emit = defineEmits<{ (e: 'select', key: string): void; (e: 'retry'): void }>()
 
@@ -17,156 +26,65 @@ function chainPath(p: Project): string {
   if (!chain) return '没有链条'
   return chain.nodes.map((n) => n.key).join(' → ')
 }
+
+/** 每条链的 key + 站数：开需求要按 key 选链，光有站点路径看不出该选哪条。 */
+function chainList(p: Project): string {
+  if (!p.chains.length) return ''
+  return p.chains.map((c) => `${c.key} · ${c.nodes.length} 站`).join('　')
+}
+
+function countOf(key: string): number {
+  return props.counts[key] ?? 0
+}
+
+function onClick(key: string) {
+  emit('select', key)
+}
 </script>
 
 <template>
-  <section class="rail">
-    <div class="rail__head">
-      <h2 class="rail__title">项目</h2>
-      <span class="rail__count">{{ projects.length }}</span>
+  <section class="pane sider">
+    <div class="pane__head">
+      <h2 class="pane__title">项目<span class="pane__hint">{{ projects.length }}</span></h2>
+      <a-button size="mini" type="text" aria-label="刷新项目" @click="emit('retry')">
+        <template #icon><IconRefresh /></template>
+      </a-button>
     </div>
 
-    <p v-if="state === 'loading'" class="rail__note">正在加载项目…</p>
-
-    <div v-else-if="state === 'error'" class="rail__note rail__note--error">
-      <span><Icon name="alert" :size="13" /> {{ error }}</span>
-      <button class="btn btn--ghost" type="button" @click="emit('retry')">重试</button>
+    <div v-if="state === 'loading' && !projects.length" class="state">
+      <a-spin :size="20" />
+      <span>正在读项目…</span>
     </div>
 
-    <p v-else-if="projects.length === 0" class="rail__note">
-      还没有项目。用右上角「新建项目」登记第一个仓库。
-    </p>
+    <div v-else-if="state === 'error'" class="state">
+      <a-alert type="error">{{ error || '读不到项目列表。' }}</a-alert>
+      <a-button size="small" @click="emit('retry')">重试</a-button>
+    </div>
 
-    <ul v-else class="rail__list">
-      <li v-for="p in projects" :key="p.key">
-        <button
-          class="proj"
-          type="button"
-          :class="{ 'proj--active': p.key === current }"
-          @click="emit('select', p.key)"
-        >
-          <span class="proj__top">
-            <span class="proj__key mono">{{ p.key }}</span>
-            <span class="proj__branch mono">{{ p.chains[0]?.key ?? '—' }} v{{ p.chains[0]?.version ?? '—' }}</span>
-          </span>
-          <span class="proj__repo mono">{{ p.repo || '未登记仓库' }}</span>
-          <span class="proj__chain">
-            <Icon name="layers" :size="12" />
-            {{ chainPath(p) }}
-          </span>
-          <span class="proj__meta soft">{{ fmtType(p.chains[0]?.type ?? '') }}</span>
-        </button>
-      </li>
-    </ul>
+    <a-empty
+      v-else-if="!projects.length"
+      :description="admin ? '还没有项目。' : '你还没被加进任何项目。'"
+    />
+
+    <a-menu
+      v-else
+      class="sider__menu"
+      :selected-keys="[current]"
+      :default-selected-keys="[current]"
+      @menu-item-click="onClick"
+    >
+      <a-menu-item v-for="p in projects" :key="p.key">
+        <div class="proj">
+          <div class="proj__top">
+            <span class="mono proj__key">{{ p.key }}</span>
+            <span class="proj__name">{{ p.name }}</span>
+          </div>
+          <div class="proj__repo mono">{{ p.repo }}</div>
+          <div class="proj__chain mono">{{ chainPath(p) }}</div>
+          <div v-if="p.chains.length" class="proj__chain mono">链：{{ chainList(p) }}</div>
+          <div class="proj__count">{{ countOf(p.key) }} 条需求</div>
+        </div>
+      </a-menu-item>
+    </a-menu>
   </section>
 </template>
-
-<style scoped>
-.rail {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 14px 12px;
-  border-right: 1px solid var(--border);
-  background: var(--surface);
-  min-height: 100%;
-}
-
-.rail__head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  padding: 0 4px 2px;
-}
-
-.rail__title {
-  font-size: var(--fs-body);
-  font-weight: 700;
-  color: var(--text);
-}
-
-.rail__count {
-  font-size: var(--fs-small);
-  color: var(--text-soft);
-}
-
-.rail__note {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 6px;
-  color: var(--text-muted);
-  font-size: var(--fs-small);
-}
-
-.rail__note--error {
-  color: var(--danger);
-}
-
-.rail__list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.proj {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  width: 100%;
-  padding: 8px 10px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease;
-}
-
-.proj:hover {
-  background: var(--bg);
-}
-
-.proj--active {
-  background: var(--accent-soft);
-  border-color: #c7d2fe;
-}
-
-.proj__top {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.proj__key {
-  font-size: var(--fs-body);
-  font-weight: 700;
-}
-
-.proj__branch {
-  font-size: 11px;
-  color: var(--text-soft);
-}
-
-.proj__repo {
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: var(--fs-small);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.proj__chain {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
-.proj__meta {
-  font-size: 11px;
-}
-</style>

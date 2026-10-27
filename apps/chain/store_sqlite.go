@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   key       TEXT NOT NULL,
   type      TEXT NOT NULL,
   review    TEXT NOT NULL,
+  power     TEXT NOT NULL DEFAULT '',
   idx       INTEGER NOT NULL,
   state     TEXT NOT NULL,
   rules     TEXT NOT NULL,
@@ -93,6 +95,15 @@ CREATE TABLE IF NOT EXISTS comments (
 );
 CREATE INDEX IF NOT EXISTS comments_by_node ON comments(req_id, node_key, seq);
 
+CREATE TABLE IF NOT EXISTS roles (
+  id          TEXT PRIMARY KEY,
+  project_key TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  powers      TEXT NOT NULL,
+  token       TEXT UNIQUE,
+  created_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
   req_id     TEXT NOT NULL,
@@ -104,6 +115,37 @@ CREATE TABLE IF NOT EXISTS events (
   at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_by_req ON events(req_id, seq);
+
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT PRIMARY KEY,
+  username      TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  admin         INTEGER NOT NULL,
+  created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id           TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  key_hash     TEXT NOT NULL UNIQUE,
+  created_at   TEXT NOT NULL,
+  last_used_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS assignments (
+  project_key TEXT NOT NULL,
+  role_id     TEXT NOT NULL,
+  user_id     TEXT NOT NULL,
+  PRIMARY KEY (project_key, role_id, user_id)
+);
 `
 
 func openSQLite(path string) (*sqliteStore, error) {
@@ -136,9 +178,59 @@ func migrate(db *sql.DB) error {
 	for _, stmt := range []string{
 		`ALTER TABLE projects ADD COLUMN intake_token TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE requirements ADD COLUMN reporter TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE nodes ADD COLUMN power TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("补列失败：%w", err)
+		}
+	}
+	if err := relaxRolesToken(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// relaxRolesToken 把老库里 roles.token 的 NOT NULL 去掉。
+// 新的授权模型里角色不再有口令，写角色时不再给这一列；SQLite 改不了列约束，只能重建表。
+// 老角色的口令在新模型里没有任何作用，重建时一并丢掉（授予关系是新表，不受影响）。
+func relaxRolesToken(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(roles)`)
+	if err != nil {
+		return fmt.Errorf("读 roles 表结构失败：%w", err)
+	}
+	notNull := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("读 roles 列失败：%w", err)
+		}
+		if name == "token" && notnull == 1 {
+			notNull = true
+		}
+	}
+	rows.Close()
+	if !notNull {
+		return nil
+	}
+	stmts := []string{
+		`ALTER TABLE roles RENAME TO roles_token_notnull`,
+		`CREATE TABLE roles (
+  id          TEXT PRIMARY KEY,
+  project_key TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  powers      TEXT NOT NULL,
+  token       TEXT UNIQUE,
+  created_at  TEXT NOT NULL
+)`,
+		`INSERT INTO roles (id, project_key, name, powers, created_at) SELECT id, project_key, name, powers, created_at FROM roles_token_notnull`,
+		`DROP TABLE roles_token_notnull`,
+	}
+	for _, q := range stmts {
+		if _, err := db.Exec(q); err != nil {
+			return fmt.Errorf("重建 roles 表失败：%w", err)
 		}
 	}
 	return nil
@@ -151,13 +243,14 @@ func (s *sqliteStore) SaveProject(p *Project) error {
 	if err != nil {
 		return err
 	}
+	// intake_token 是接入口令时代的旧列：留着不写（列默认 ''），代码也不再读它。
 	_, err = s.db.Exec(`
-INSERT INTO projects (key, name, repo, default_branch, chains, intake_token, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO projects (key, name, repo, default_branch, chains, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
   name = excluded.name, repo = excluded.repo, default_branch = excluded.default_branch,
-  chains = excluded.chains, intake_token = excluded.intake_token, created_at = excluded.created_at`,
-		p.Key, p.Name, p.Repo, p.DefaultBranch, chains, p.IntakeToken, formatTime(p.CreatedAt))
+  chains = excluded.chains, created_at = excluded.created_at`,
+		p.Key, p.Name, p.Repo, p.DefaultBranch, chains, formatTime(p.CreatedAt))
 	return err
 }
 
@@ -165,8 +258,8 @@ func (s *sqliteStore) Project(key string) (*Project, error) {
 	p := &Project{}
 	var chains, created string
 	err := s.db.QueryRow(`
-SELECT key, name, repo, default_branch, chains, intake_token, created_at FROM projects WHERE key = ?`, key).
-		Scan(&p.Key, &p.Name, &p.Repo, &p.DefaultBranch, &chains, &p.IntakeToken, &created)
+SELECT key, name, repo, default_branch, chains, created_at FROM projects WHERE key = ?`, key).
+		Scan(&p.Key, &p.Name, &p.Repo, &p.DefaultBranch, &chains, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("没有这个 project：%s", key)
 	}
@@ -265,9 +358,9 @@ ON CONFLICT(id) DO UPDATE SET
 			return err
 		}
 		if _, err := tx.Exec(`
-INSERT INTO nodes (req_id, key, type, review, idx, state, rules, artifacts, rev)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			r.ID, n.Key, n.Type, n.Review, n.Index, n.State, rules, artifacts, n.Rev); err != nil {
+INSERT INTO nodes (req_id, key, type, review, power, idx, state, rules, artifacts, rev)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.ID, n.Key, n.Type, n.Review, n.Power, n.Index, n.State, rules, artifacts, n.Rev); err != nil {
 			return err
 		}
 		for _, a := range n.Attempts {
@@ -331,7 +424,7 @@ FROM requirements WHERE id = ?`, id).
 // loadNodes 一次把节点、执行、评论都取回来再在内存里拼，避免每站一次查询。
 func (s *sqliteStore) loadNodes(reqID string) ([]*Node, error) {
 	rows, err := s.db.Query(`
-SELECT key, type, review, idx, state, rules, artifacts, rev FROM nodes WHERE req_id = ? ORDER BY idx`, reqID)
+SELECT key, type, review, power, idx, state, rules, artifacts, rev FROM nodes WHERE req_id = ? ORDER BY idx`, reqID)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +433,7 @@ SELECT key, type, review, idx, state, rules, artifacts, rev FROM nodes WHERE req
 	for rows.Next() {
 		n := &Node{}
 		var rules, artifacts string
-		if err := rows.Scan(&n.Key, &n.Type, &n.Review, &n.Index, &n.State, &rules, &artifacts, &n.Rev); err != nil {
+		if err := rows.Scan(&n.Key, &n.Type, &n.Review, &n.Power, &n.Index, &n.State, &rules, &artifacts, &n.Rev); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -471,4 +564,323 @@ SELECT at, node, action, from_state, to_state, detail FROM events WHERE req_id =
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// SaveRole 建角色或换口令都走这一句：口令改了就覆盖，旧口令随之失效。
+func (s *sqliteStore) SaveRole(r Role) error {
+	powers, err := encodeList(r.Powers)
+	if err != nil {
+		return err
+	}
+	// 角色不再有口令：token 列是老库留下的，代码不读也不写（SQLite 允许它为空）。
+	_, err = s.db.Exec(`
+INSERT INTO roles (id, project_key, name, powers, created_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  project_key = excluded.project_key, name = excluded.name,
+  powers = excluded.powers, created_at = excluded.created_at`,
+		r.ID, r.ProjectKey, r.Name, powers, formatTime(r.CreatedAt))
+	return err
+}
+
+func (s *sqliteStore) Role(id string) (Role, error) {
+	return s.roleBy("id = ?", id, "没有这个角色："+id)
+}
+
+func (s *sqliteStore) roleBy(where string, arg any, missing string) (Role, error) {
+	r := Role{}
+	var powers, created, legacyToken string
+	err := s.db.QueryRow(`
+SELECT id, project_key, name, powers, COALESCE(token, ''), created_at FROM roles WHERE `+where, arg).
+		Scan(&r.ID, &r.ProjectKey, &r.Name, &powers, &legacyToken, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Role{}, errors.New(missing)
+	}
+	if err != nil {
+		return Role{}, err
+	}
+	r.CreatedAt = parseTime(created)
+	if err := decodeList(powers, &r.Powers); err != nil {
+		return Role{}, err
+	}
+	if r.Powers == nil {
+		r.Powers = []string{}
+	}
+	return r, nil
+}
+
+func (s *sqliteStore) Roles(projectKey string) ([]Role, error) {
+	rows, err := s.db.Query(`SELECT id FROM roles WHERE project_key = ? ORDER BY created_at, id`, projectKey)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := []Role{}
+	for _, id := range ids {
+		r, err := s.Role(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (s *sqliteStore) DeleteRole(id string) error {
+	res, err := s.db.Exec(`DELETE FROM roles WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("没有这个角色：" + id)
+	}
+	return nil
+}
+
+// ---- 账号、会话、API 密钥、授予 ----
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (s *sqliteStore) SaveUser(u User) error {
+	_, err := s.db.Exec(`
+INSERT INTO users (id, username, password_hash, admin, created_at) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  username = excluded.username, password_hash = excluded.password_hash,
+  admin = excluded.admin, created_at = excluded.created_at`,
+		u.ID, u.Username, u.PasswordHash, boolInt(u.Admin), formatTime(u.CreatedAt))
+	return err
+}
+
+// user 是几个查询共用的那一段：列的顺序只在这里写一遍。
+func (s *sqliteStore) user(where string, arg any) (*User, error) {
+	u := &User{}
+	var created string
+	var admin int
+	err := s.db.QueryRow(`SELECT id, username, password_hash, admin, created_at FROM users WHERE `+where,
+		arg).Scan(&u.ID, &u.Username, &u.PasswordHash, &admin, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("没有这个用户：%v", arg)
+	}
+	if err != nil {
+		return nil, err
+	}
+	u.Admin = admin != 0
+	u.CreatedAt = parseTime(created)
+	return u, nil
+}
+
+func (s *sqliteStore) User(id string) (*User, error) { return s.user("id = ?", id) }
+
+func (s *sqliteStore) UserByName(username string) (*User, error) {
+	return s.user("username = ?", username)
+}
+
+func (s *sqliteStore) Users() ([]User, error) {
+	rows, err := s.db.Query(`SELECT id, username, admin, created_at FROM users ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []User{}
+	for rows.Next() {
+		var u User
+		var admin int
+		var created string
+		if err := rows.Scan(&u.ID, &u.Username, &admin, &created); err != nil {
+			return nil, err
+		}
+		u.Admin = admin != 0
+		u.CreatedAt = parseTime(created)
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) CountUsers() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, err
+}
+
+func (s *sqliteStore) SaveSession(session Session) error {
+	_, err := s.db.Exec(`
+INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)
+ON CONFLICT(token_hash) DO UPDATE SET
+  user_id = excluded.user_id, created_at = excluded.created_at, expires_at = excluded.expires_at`,
+		session.TokenHash, session.UserID, formatTime(session.CreatedAt), formatTime(session.ExpiresAt))
+	return err
+}
+
+func (s *sqliteStore) Session(tokenHash string) (*Session, error) {
+	out := &Session{}
+	var created, expires string
+	err := s.db.QueryRow(`
+SELECT token_hash, user_id, created_at, expires_at FROM sessions WHERE token_hash = ?`, tokenHash).
+		Scan(&out.TokenHash, &out.UserID, &created, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("没有这个会话")
+	}
+	if err != nil {
+		return nil, err
+	}
+	out.CreatedAt = parseTime(created)
+	out.ExpiresAt = parseTime(expires)
+	return out, nil
+}
+
+func (s *sqliteStore) DeleteSession(tokenHash string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
+	return err
+}
+
+func (s *sqliteStore) SaveAPIKey(key APIKey) error {
+	_, err := s.db.Exec(`
+INSERT INTO api_keys (id, user_id, name, key_hash, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, '')
+ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, name = excluded.name, key_hash = excluded.key_hash`,
+		key.ID, key.UserID, key.Name, key.KeyHash, formatTime(key.CreatedAt))
+	return err
+}
+
+func (s *sqliteStore) APIKeys(userID string) ([]APIKey, error) {
+	rows, err := s.db.Query(`
+SELECT id, user_id, name, key_hash, created_at, last_used_at FROM api_keys WHERE user_id = ? ORDER BY created_at, id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []APIKey{}
+	for rows.Next() {
+		var k APIKey
+		var created, used string
+		if err := rows.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &created, &used); err != nil {
+			return nil, err
+		}
+		k.CreatedAt = parseTime(created)
+		if used != "" {
+			last := parseTime(used)
+			k.LastUsedAt = &last
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) APIKeyByHash(keyHash string) (*APIKey, error) {
+	k := &APIKey{}
+	var created, used string
+	err := s.db.QueryRow(`
+SELECT id, user_id, name, key_hash, created_at, last_used_at FROM api_keys WHERE key_hash = ?`, keyHash).
+		Scan(&k.ID, &k.UserID, &k.Name, &k.KeyHash, &created, &used)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("这个 API 密钥不认识")
+	}
+	if err != nil {
+		return nil, err
+	}
+	k.CreatedAt = parseTime(created)
+	if used != "" {
+		last := parseTime(used)
+		k.LastUsedAt = &last
+	}
+	return k, nil
+}
+
+func (s *sqliteStore) DeleteAPIKey(id string) error {
+	res, err := s.db.Exec(`DELETE FROM api_keys WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("没有这个密钥：%s", id)
+	}
+	return nil
+}
+
+func (s *sqliteStore) TouchAPIKey(id string, at time.Time) error {
+	_, err := s.db.Exec(`UPDATE api_keys SET last_used_at = ? WHERE id = ?`, formatTime(at), id)
+	return err
+}
+
+func (s *sqliteStore) SaveAssignment(a Assignment) error {
+	_, err := s.db.Exec(`
+INSERT INTO assignments (project_key, role_id, user_id) VALUES (?, ?, ?)
+ON CONFLICT(project_key, role_id, user_id) DO NOTHING`, a.ProjectKey, a.RoleID, a.UserID)
+	return err
+}
+
+func (s *sqliteStore) assignments(query string, args ...any) ([]Assignment, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Assignment{}
+	for rows.Next() {
+		var a Assignment
+		if err := rows.Scan(&a.ProjectKey, &a.RoleID, &a.UserID); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) Assignments(projectKey string) ([]Assignment, error) {
+	return s.assignments(`SELECT project_key, role_id, user_id FROM assignments WHERE project_key = ?`, projectKey)
+}
+
+func (s *sqliteStore) AssignmentsForUser(projectKey, userID string) ([]Assignment, error) {
+	return s.assignments(`
+SELECT project_key, role_id, user_id FROM assignments WHERE project_key = ? AND user_id = ?`, projectKey, userID)
+}
+
+func (s *sqliteStore) AssignmentsOfUser(userID string) ([]Assignment, error) {
+	return s.assignments(`
+SELECT project_key, role_id, user_id FROM assignments WHERE user_id = ? ORDER BY project_key`, userID)
+}
+
+func (s *sqliteStore) DeleteAssignment(projectKey, roleID, userID string) error {
+	res, err := s.db.Exec(`
+DELETE FROM assignments WHERE project_key = ? AND role_id = ? AND user_id = ?`, projectKey, roleID, userID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("这个人没有这个角色：%s", userID)
+	}
+	return nil
+}
+
+func (s *sqliteStore) DeleteAssignmentsOfRole(roleID string) error {
+	_, err := s.db.Exec(`DELETE FROM assignments WHERE role_id = ?`, roleID)
+	return err
 }

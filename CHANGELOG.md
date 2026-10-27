@@ -14,3 +14,70 @@
 ### 修复
 
 ### 移除
+
+## [0.1.0] - 2026-10-28
+
+第一个完整版本：需求进链之后，位置只由节点状态推导；谁按得动哪一站，由账号与项目级角色决定。按能力分组，不复述提交历史。
+
+### 新增
+
+#### 链条与需求
+
+- 节点类型封闭为六类（`create` / `assess` / `dev` / `crosstest` / `merge` / `release`）：链头必须是需求评估，链尾必须是上线，中间任意排。
+- 项目可挂多条链，提需求时选链（不带 `chain` 时用第一条）；链的版本在需求进入那一刻钉住，之后改链条不影响已经在飞的需求。
+- 需求进链即给出分支名 `req/<project>/<id>`（仓库里的分支要人自己建，平台不碰仓库）。
+- 节点状态机 `pending → running → awaiting_review → accepted`，`rejected` 作回滚标记；位置不落库，由「第一个还没通过的节点」推导。
+
+#### 账号与会话
+
+- 用户名 + 口令的账号体系：首次开库时 `POST /api/signup` 可用且注册者即管理员，之后注册通道关闭（409），其余账号由管理员建。
+- `POST /api/login` 发 HttpOnly Cookie `chain_session`（7 天），`POST /api/logout` 删会话，`PUT /api/me/password` 改自己的口令（≥8 位）。
+- `GET /api/me` 返回 `{user, memberships}`：账号本身（含是否管理员）+ 在哪些项目里拿到哪个角色、哪些权力。
+- API 密钥 `ak_…`：`POST /api/keys` 建（secret 只在响应里出现一次）、`DELETE /api/keys/{id}` 吊销，外部系统带 `Authorization: Bearer ak_…` 调用。密钥认人、不分权，权限仍看项目成员资格。
+
+#### 项目级角色与权力
+
+- 四种权力 `review` / `dev` / `test` / `release`；节点不写权力时按类型取默认（create→dev、assess→review、dev→dev、crosstest→test、merge→review、release→release），可逐站覆盖，进链即定死在快照里。
+- 角色 = 名字 + 权力清单，授予给账号（`assignments` 表）；管理员天生四权齐全，普通账号取「在这个项目里被授予的角色并集」，项目外的授予不算。
+- 资格收紧到三处：建项目限管理员；提需求、评论、追加规则、读需求与图片要项目成员（有任一权力即成员，管理员天生成员）；项目列表与需求列表只回「我参与的项目」。
+- 节点动作默认拒绝：`run` / `accept` / `reject` / `restart` 要这一站所要的权力，401（没登录）/ 403（没资格、没权力）的文案是契约，前端与接入层共用同一份。
+
+#### 需求
+
+- 需求带图：`POST /api/requirements/{id}/images`（multipart，字段名 `files`，一次 ≤5 张、每张 ≤5MB，按文件头认 png / jpeg / webp / gif，先全校验再落盘），`GET` 取图、`DELETE` 删图；落盘目录由 `-uploads` 指定（默认 `data/uploads`）。
+- 节点重启：`POST /api/requirements/{id}/nodes/{node}/restart`；已通过的站重启是破坏性的，必须写理由（后面基于它的站都要退）。
+- 容器自审：节点声明 `review: ai` 时，容器在输出里打一行 `CHAIN_VERDICT: pass|reject 原因` 自己定案；标记缺失、取值认不出、reject 没写原因，一律停在待审并留系统留言——判不出来不许当通过。
+
+#### 执行与部署
+
+- `deploy/nodes.yaml`：节点模板表（模板 = 镜像 + 命令 + 超时 + 环境，节点 = 哪一站用哪个模板）。改这里不用改 Go、不用重编译；文件缺失时回落内嵌默认表。
+- `deploy/agent-image/`：三个可自建 agent 镜像（codex / claude / DeepSeek Harness）+ `build-images.sh` + `entrypoint.sh`。执行器优先 clone 项目仓库，只有 `repo` 是本机绝对路径时才挂载；空节点不起容器。
+
+#### 界面（Vue 3 + Vite + TS + Arco Design Vue）
+
+- 登录 / 注册 / 会话态 / 顶栏用户菜单（改密码、登出）；登录态由 `GET /api/me` 探出，任意业务请求 401 时回登录页并提示会话过期。
+- 后台三页：用户管理、项目设置（角色 + 成员）、我的 API 密钥。非管理员看到的入口置灰并给理由——功能真实存在，所以保留入口而不是隐藏。
+- 需求列表可选链、需求详情可上传 / 预览 / 删除图片、横向节点链条、只追加的事件流。
+- 按权力提前禁用按钮：前端默认权力表与后端同口径；前端禁用只是提前让步，后端 403 仍是最终裁决。
+
+#### 接入层
+
+- 两个接口：`POST /api/intake/requirements` 塞需求、`GET /api/intake/requirements/{id}` 拉结论；用 API 密钥认证，按项目成员资格放行。
+- 整条需求被拒时尽力回告一次（`reporter.callbackURL`，5 秒超时），回告结果记成事件；**回告失败不改状态**，结论始终可以用拉模式取到。
+
+### 变更
+
+- HTTP 层从标准库 ServeMux 迁到 gin，对外行为不变。
+- 存储从文件快照换成 SQLite（纯 Go 驱动 `modernc.org/sqlite`，免 cgo）；`Store` 仍是接口，换 MySQL 只加一个实现。
+- 前端组件库从 PrimeVue 换成 Arco Design Vue 2.59.0（MIT，全量注册），代价是整包入库：999 kB JS / 421 kB CSS（gzip 298 / 52）。
+
+### 修复
+
+- 容器输出里的模型密钥会被抹掉再入库；日志分隔符改用真换行，不再把字面量写进评论。
+
+### 移除
+
+- 四类口令全部删除：`-admin-token` 管理口令、`pk_` 项目访问口令、`rl_` 角色口令、建项目送的 `owner` 角色。身份改由账号与会话承担，权限改由项目级角色授予。
+- 上一版的 Node 判据载体（`scripts/*.mjs`）此前已整批删除，判据全部在 Go 里；`scripts/` 现在只剩一页索引。
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

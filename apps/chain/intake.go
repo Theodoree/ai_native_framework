@@ -2,43 +2,22 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
-// 接入层是平台对外的唯一入口：认身份（project key + 访问口令）、把需求塞进链、
-// 让提需求的人拿回结果。它不判定也不改状态——判定与状态仍归状态机。
-
-type intakeNewProject struct {
-	Key           string  `json:"key"`
-	Name          string  `json:"name"`
-	Repo          string  `json:"repo"`
-	DefaultBranch string  `json:"defaultBranch"`
-	Chains        []Chain `json:"chains"`
-}
-
-// intakeCreatedProject 是唯一一次把访问口令交给人的地方：之后列表与需求接口都用它当身份。
-type intakeCreatedProject struct {
-	Key         string  `json:"key"`
-	IntakeToken string  `json:"intakeToken"`
-	Chains      []Chain `json:"chains"`
-}
-
-type intakeProjectView struct {
-	Key           string  `json:"key"`
-	Name          string  `json:"name"`
-	DefaultBranch string  `json:"defaultBranch"`
-	Chains        []Chain `json:"chains"`
-}
+// intake.go —— 接入层：平台外的人把需求塞进链、再回读结论的两个口子。
+// 身份是登录态或 API 密钥（whoIs 认出来的那一个人），权限是「要是这个项目的成员」；
+// 结论只写下、不回改：送不到是网络的事，不是判定的事。
 
 type intakeNewRequirement struct {
+	Project  string
 	Context  string    `json:"context"`
 	Images   []string  `json:"images"`
 	Chain    string    `json:"chain"`
@@ -66,105 +45,97 @@ type intakeCallbackBody struct {
 	Reason      string `json:"reason"`
 }
 
-func (s *Server) intakeCreateProject(w http.ResponseWriter, r *http.Request) {
-	if !s.adminGate(w, r) {
-		return
-	}
-	var in intakeNewProject
-	if err := decode(r, &in); err != nil {
-		fail(w, 400, err.Error())
-		return
-	}
-	key := strings.TrimSpace(in.Key)
-	if key == "" {
-		fail(w, 400, "project key 不能为空：需求接口靠它定位项目")
-		return
-	}
-	if _, err := s.store.Project(key); err == nil {
-		fail(w, 409, "这个 project 已经有了："+key)
-		return
-	}
-	repo := strings.TrimSpace(in.Repo)
-	if repo == "" {
-		fail(w, 400, "repo 不能为空：容器执行要把它挂进容器")
-		return
-	}
-	chains := in.Chains
-	if len(chains) == 0 {
-		chains = []Chain{DefaultChain()}
-	}
-	for _, c := range chains {
-		if err := ValidateChain(c); err != nil {
-			fail(w, 400, fmt.Sprintf("链条不合法（%s）：%s", c.Key, err))
-			return
-		}
-	}
-	token, err := newIntakeToken()
-	if err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	p := &Project{
-		Key: key, Name: or(in.Name, key), Repo: repo,
-		DefaultBranch: or(in.DefaultBranch, "main"), Chains: chains,
-		IntakeToken: token, CreatedAt: s.now(),
-	}
-	if err := s.store.SaveProject(p); err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 201, intakeCreatedProject{Key: p.Key, IntakeToken: token, Chains: p.Chains})
-}
-
-func (s *Server) intakeListProjects(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.projectByToken(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, 200, intakeProjectView{Key: p.Key, Name: p.Name, DefaultBranch: p.DefaultBranch, Chains: p.Chains})
-}
-
-func (s *Server) intakeCreateRequirement(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.projectByToken(w, r)
-	if !ok {
-		return
-	}
+// intakeCreateRequirement 是平台外的人把需求塞进链的那个口子。
+// 身份是登录态或 API 密钥（whoIs 认出来的那一个人），权限是「要是这个项目的成员」。
+func (s *Server) intakeCreateRequirement(c *gin.Context) {
 	var in intakeNewRequirement
-	if err := decode(r, &in); err != nil {
-		fail(w, 400, err.Error())
+	if err := decode(c.Request, &in); err != nil {
+		fail(c, 400, err.Error())
+		return
+	}
+	projectKey := strings.TrimSpace(in.Project)
+	if projectKey == "" {
+		fail(c, 400, "需求必须带 project")
+		return
+	}
+	if _, ok := s.requireMember(c, projectKey, actionPostRequirement); !ok {
+		return
+	}
+	p, err := s.store.Project(projectKey)
+	if err != nil {
+		fail(c, 404, err.Error())
 		return
 	}
 	context := strings.TrimSpace(in.Context)
 	if context == "" {
-		fail(w, 400, "需求内容不能为空")
+		fail(c, 400, "需求内容不能为空")
 		return
 	}
-	c, err := pickChain(p, in.Chain)
+	chain, err := pickChain(p, in.Chain)
 	if err != nil {
-		fail(w, 400, err.Error())
+		fail(c, 400, err.Error())
 		return
 	}
-	req := NewRequirement(newID("REQ"), p, c, context, in.Images, "intake", s.now())
+	req := NewRequirement(newID("REQ"), p, chain, context, in.Images, "intake", s.now())
 	req.Reporter = in.Reporter
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
 	s.logEvent(req, "", "intake", "", req.State, "接入层收到需求")
-	writeJSON(w, 201, s.intakeView(req))
+	writeJSON(c, 201, s.intakeView(req))
 }
 
-func (s *Server) intakeGetRequirement(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.projectByToken(w, r)
-	if !ok {
+// isMember 说这个人算不算这个项目的成员：管理员算，被授予过任一角色也算。
+func (s *Server) isMember(u *User, projectKey string) bool {
+	return len(s.powersFor(u, projectKey)) > 0
+}
+
+// 成员资格这道门在几个地方用到，动词不同但说的是一件事，所以文案只留一处。
+const (
+	actionPostRequirement    = "提不了需求"
+	actionViewRequirement    = "看不到这条需求"
+	actionChangeRequirement  = "改不了这条需求"
+	actionCommentRequirement = "评不了这条需求"
+	actionRuleRequirement    = "改不了这一站的规则"
+)
+
+// requireMember 是「这件事要的不是权力，而是『你在这个项目里』」的唯一门。
+// 顺序是契约：先问身份（401），再问成员资格（403）——把「没登录」说成「没资格」就是撒谎。
+// 返回 false 时响应已经写好了，调用方直接 return。
+func (s *Server) requireMember(c *gin.Context, projectKey, action string) (*User, bool) {
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return nil, false
+	}
+	if !s.isMember(me.User, projectKey) {
+		denyNotMember(c, me.User, projectKey, action)
+		return nil, false
+	}
+	return me.User, true
+}
+
+// denyNotMember 是「认出来了，但不是这个项目的人」的唯一 403：点名是谁、在哪个项目、这次要干什么。
+func denyNotMember(c *gin.Context, u *User, projectKey, action string) {
+	fail(c, 403, fmt.Sprintf("「%s」不是 %s 的成员，%s", u.Username, projectKey, action))
+}
+
+func (s *Server) intakeGetRequirement(c *gin.Context) {
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
 		return
 	}
-	req, err := s.store.Requirement(r.PathValue("id"))
-	if err != nil || req.ProjectKey != p.Key {
-		fail(w, 404, "没有这条需求")
+	req, err := s.store.Requirement(c.Param("id"))
+	if err != nil {
+		fail(c, 404, "没有这条需求")
 		return
 	}
-	writeJSON(w, 200, s.intakeView(req))
+	if _, ok := s.requireMember(c, req.ProjectKey, actionViewRequirement); !ok {
+		return
+	}
+	writeJSON(c, 200, s.intakeView(req))
 }
 
 // intakeView 是给外部看的那一份：只回答「到哪一步了、成没成、为什么」。
@@ -238,61 +209,10 @@ func (s *Server) deliverCallback(req *Requirement, nodeKey, reason string) {
 	}
 }
 
-// adminGate 管「建 project」这一个动作。没配 -admin-token 就整条关掉：
-// 接入层默认不开，开了才意味着有人决定把自己的仓库挂上去。
-func (s *Server) adminGate(w http.ResponseWriter, r *http.Request) bool {
-	if s.adminToken == "" {
-		fail(w, 503, "接入层没有开：服务启动时没有配置 -admin-token")
-		return false
-	}
-	if !sameSecret(bearerToken(r), s.adminToken) {
-		fail(w, 401, "管理口令不对")
-		return false
-	}
-	return true
-}
-
-// projectByToken 用访问口令反查 project：口令就是调接入层那个人的全部身份。
-func (s *Server) projectByToken(w http.ResponseWriter, r *http.Request) (*Project, bool) {
-	token := bearerToken(r)
-	if token == "" {
-		fail(w, 401, "缺少访问口令（Authorization: Bearer <token>）")
-		return nil, false
-	}
-	projects, err := s.store.Projects()
-	if err != nil {
-		fail(w, 500, err.Error())
-		return nil, false
-	}
-	for _, p := range projects {
-		if sameSecret(p.IntakeToken, token) {
-			return p, true
-		}
-	}
-	fail(w, 401, "访问口令不认识")
-	return nil, false
-}
-
 func bearerToken(r *http.Request) string {
 	h := strings.TrimSpace(r.Header.Get("Authorization"))
 	if len(h) < 7 || !strings.EqualFold(h[:7], "bearer ") {
 		return ""
 	}
 	return strings.TrimSpace(h[7:])
-}
-
-// sameSecret 不比到第一个不同的字符就返回：口令比较不该靠时间泄露内容。
-func sameSecret(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
-func newIntakeToken() (string, error) {
-	b := make([]byte, 18)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return "pk_" + hex.EncodeToString(b), nil
 }

@@ -1,0 +1,20 @@
+# @generated-by deploy/agent-image/build-images.sh —— 三个 Dockerfile 只差包名与 AGENT_CMD
+FROM node:22-slim
+
+# git 是硬需求：clone 模式下 entrypoint 要自己把仓库拉下来。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm i -g @deepseek-ai/dsh@0.2.1-rc.2
+
+COPY entrypoint.sh /opt/agent/entrypoint.sh
+RUN chmod +x /opt/agent/entrypoint.sh
+
+# AGENT_CMD 是经过验证的命令形式；换 agent 或换版本时，先跑 <agent> --help 确认，
+# 不要照着猜（见 deploy/agent-image/README.md「已知边界」）。
+ENV AGENT_NAME=deepseek-harness \
+    AGENT_CMD="dsh"
+
+WORKDIR /work
+ENTRYPOINT ["/opt/agent/entrypoint.sh"]

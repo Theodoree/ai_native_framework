@@ -1,24 +1,28 @@
 <script setup lang="ts">
+/**
+ * 选中站（整张链路卡片的下半部分，外框由 NodeChain 提供，所以这里不再套一层卡片边框）。
+ * 标题行：状态点 + 站名（中文）+ 类型/模板 · 审核方 · 状态 · N 条评论 + 右上动作按钮（重启节点 / 拒绝 / 通过，
+ * 当前站处于待开始或被拒时另有「开始执行」）。
+ * 下面依次是：重启理由行（点「重启节点」才出现）、错误与拒绝提示、执行记录、追加规则、评论时间线、产物、输入区。
+ * 所有操作都在卡内输入，错误就地显示——不用 alert / confirm / prompt。
+ */
 import { computed, ref } from 'vue'
-import Icon from './Icon.vue'
-import StatusBadge from './StatusBadge.vue'
-import { fmtAuthorType, fmtTime, fmtType } from '../format'
+import { IconCheck, IconClose, IconPlayArrow, IconRefresh, IconRobot, IconSettings, IconUser } from '@arco-design/web-vue/es/icon'
 import type { Node, NodeAction } from '../types'
+import { fmtAuthorType, fmtMinute, fmtState, fmtTime, powerForNode, powerLabel } from '../format'
 
 const props = defineProps<{
   node: Node
   current: boolean
   requirementState: string
+  /** 当前项目 key：禁用提示要说出「你在哪个项目里没有哪个权力」。 */
+  projectKey: string
+  /** 我在这个项目里的权力并集（管理员四权齐全）；判定照后端 powersFor，跨项目授予不算。 */
+  powers: string[]
   submit: (action: NodeAction, text: string) => Promise<void>
+  restart: (reason: string) => Promise<void>
 }>()
 
-const CONTAINER_TYPES = ['create', 'assess', 'crosstest', 'release']
-
-const draft = ref('')
-const error = ref('')
-const busy = ref<NodeAction | null>(null)
-
-const isContainer = computed(() => CONTAINER_TYPES.includes(props.node.type))
 const active = computed(() => props.requirementState === 'active')
 const reviewable = computed(() => ['running', 'awaiting_review', 'accepted'].includes(props.node.state))
 const canRun = computed(
@@ -26,35 +30,64 @@ const canRun = computed(
 )
 const canReview = computed(() => active.value && props.current && reviewable.value)
 const canAnnotate = computed(() => active.value)
+/** 已通过的站重启是破坏性的（后面基于它的站都要退回），理由必填——和后端 400 的判据一致。 */
+const needsReason = computed(() => props.node.state === 'accepted')
+
+const draft = ref('')
+const reason = ref('')
+const restartOpen = ref(false)
+const busy = ref('')
+const error = ref('')
 
 const rejectComment = computed(() => props.node.comments.find((c) => c.verdict === 'reject'))
 const lastAttempt = computed(() => props.node.attempts[props.node.attempts.length - 1] ?? null)
 
-function actionState(): { key: NodeAction; label: string; needsText: boolean; enabled: boolean }[] {
-  return [
-    { key: 'run', label: '开始执行', needsText: false, enabled: canRun.value },
-    { key: 'accept', label: '通过', needsText: true, enabled: canReview.value },
-    { key: 'reject', label: '拒绝', needsText: true, enabled: canReview.value },
-    { key: 'comment', label: '评论', needsText: true, enabled: canAnnotate.value },
-    { key: 'rules', label: '追加规则', needsText: true, enabled: canAnnotate.value },
-  ]
+/**
+ * 标题行的副信息只留「审核方 · 状态 · N 条评论」。
+ * 站名不进这一行（只由左边圆节点承担），模板也不再回显（它在下面的执行记录里）——
+ * 同一件事在同一个屏幕上只出现一次。
+ */
+const subLine = computed(() => {
+  const parts: string[] = []
+  parts.push(props.node.review === 'ai' ? 'AI 审核' : '人工审核')
+  parts.push(fmtState(props.node.state))
+  parts.push(props.node.comments.length + ' 条评论')
+  return parts.join(' · ')
+})
+
+/** 这一站要的权力，以及我有没有；没有就禁用并说清缺哪个（按钮不隐藏）。 */
+const needPower = computed(() => powerForNode(props.node.type, props.node.power))
+const hasPower = computed(() => needPower.value !== '' && props.powers.includes(needPower.value))
+const denyText = computed(
+  () =>
+    '你在 ' +
+    (props.projectKey || '这个项目') +
+    ' 里没有「' +
+    powerLabel(needPower.value) +
+    '（' +
+    needPower.value +
+    '）」权力，按不动这一站。' +
+    '这是前端提前禁用；真要按，后端也会回 403 并给出原文。',
+)
+
+function whoOf(authorType: string, author: string): string {
+  const name = author && author.trim() !== '' ? author : '匿名'
+  if (authorType === 'human') return name
+  return fmtAuthorType(authorType) + ' · ' + name
 }
 
-const buttons = computed(actionState)
+function emptyTextHint(action: NodeAction): string {
+  if (action === 'accept') return '通过前先在输入框写下结论'
+  if (action === 'reject') return '拒绝必须带理由'
+  if (action === 'comment') return '评论不能为空'
+  return '追加的规则不能为空'
+}
 
 async function act(action: NodeAction) {
   error.value = ''
-  const needsText = action !== 'run'
   const text = draft.value.trim()
-  if (needsText && text === '') {
-    error.value =
-      action === 'accept'
-        ? '通过前先在输入框写下结论'
-        : action === 'reject'
-          ? '拒绝必须带理由'
-          : action === 'comment'
-            ? '评论不能为空'
-            : '追加的规则不能为空'
+  if (action !== 'run' && text === '') {
+    error.value = emptyTextHint(action)
     return
   }
   busy.value = action
@@ -64,399 +97,195 @@ async function act(action: NodeAction) {
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
-    busy.value = null
+    busy.value = ''
+  }
+}
+
+function openRestart() {
+  error.value = ''
+  restartOpen.value = true
+}
+
+async function doRestart() {
+  error.value = ''
+  const text = reason.value.trim()
+  if (needsReason.value && text === '') {
+    error.value = '这一站已通过，重启必须写理由：写清为什么要退回它'
+    return
+  }
+  busy.value = 'restart'
+  try {
+    await props.restart(text)
+    restartOpen.value = false
+    reason.value = ''
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    busy.value = ''
   }
 }
 </script>
 
 <template>
-  <article
-    class="node card"
-    :class="[
-      `node--${node.state}`,
-      { 'node--container': isContainer, 'node--current': current, 'node--rejected': node.state === 'rejected' },
-    ]"
-  >
-    <header class="node__head">
-      <span class="node__index">{{ node.index + 1 }}</span>
-      <div class="node__title">
-        <span class="node__key">{{ node.key }}</span>
-        <span class="node__tag">{{ fmtType(node.type) }}</span>
-        <span class="node__tag node__tag--review">
-          <Icon name="shield" :size="11" />
-          {{ node.review === 'ai' ? 'AI 审核' : '人工审核' }}
-        </span>
-        <span v-if="isContainer" class="node__tag node__tag--box">容器</span>
-        <span v-if="current" class="node__current">当前站</span>
+  <div class="sel">
+    <header class="sel__head">
+      <span class="sel__dot" :class="'sel__dot--' + node.state" aria-hidden="true" />
+      <span class="sel__name">第 {{ node.index + 1 }} 站</span>
+      <span class="sel__sub">{{ subLine }}</span>
+      <div class="sel__acts">
+        <a-tooltip :content="denyText" :disabled="hasPower" position="top">
+          <span class="tipwrap">
+            <a-button size="small" :loading="busy === 'restart'" :disabled="!hasPower || !active || busy !== ''" @click="openRestart">
+              <template #icon><IconRefresh /></template>
+              重启节点
+            </a-button>
+          </span>
+        </a-tooltip>
+        <a-tooltip v-if="canRun" :content="denyText" :disabled="hasPower" position="top">
+          <span class="tipwrap">
+            <a-button
+              size="small"
+              type="outline"
+              :loading="busy === 'run'"
+              :disabled="!hasPower || busy !== ''"
+              @click="act('run')"
+            >
+              <template #icon><IconPlayArrow /></template>
+              开始执行
+            </a-button>
+          </span>
+        </a-tooltip>
+        <a-tooltip :content="denyText" :disabled="hasPower" position="top">
+          <span class="tipwrap">
+            <a-button
+              size="small"
+              status="danger"
+              :loading="busy === 'reject'"
+              :disabled="!hasPower || !canReview || busy !== ''"
+              @click="act('reject')"
+            >
+              <template #icon><IconClose /></template>
+              拒绝
+            </a-button>
+          </span>
+        </a-tooltip>
+        <a-tooltip :content="denyText" :disabled="hasPower" position="top">
+          <span class="tipwrap">
+            <a-button
+              size="small"
+              type="primary"
+              :loading="busy === 'accept'"
+              :disabled="!hasPower || !canReview || busy !== ''"
+              @click="act('accept')"
+            >
+              <template #icon><IconCheck /></template>
+              通过
+            </a-button>
+          </span>
+        </a-tooltip>
       </div>
-      <StatusBadge :state="node.state" />
     </header>
 
-    <div class="node__body">
-      <div v-if="lastAttempt" class="attempt">
-        <span class="attempt__n mono">第 {{ lastAttempt.n }} 次执行</span>
-        <span class="attempt__meta mono">
-          {{ lastAttempt.template || '—' }} · exit {{ lastAttempt.exitCode }}
-        </span>
-        <span class="attempt__meta soft">
-          {{ fmtTime(lastAttempt.startedAt) }} → {{ fmtTime(lastAttempt.endedAt) }}
-        </span>
-        <p v-if="lastAttempt.outcome" class="attempt__outcome">{{ lastAttempt.outcome }}</p>
-      </div>
-
-      <ul v-if="node.rules.length" class="rules">
-        <li v-for="(rule, i) in node.rules" :key="i" class="rule">
-          <span class="rule__tag">规则</span>
-          <span>{{ rule }}</span>
-        </li>
-      </ul>
-
-      <ul v-if="node.comments.length" class="comments">
-        <li
-          v-for="c in node.comments"
-          :key="c.id"
-          class="comment"
-          :class="[`comment--${c.authorType}`, { 'comment--reject': c.verdict === 'reject' }]"
+    <div v-if="restartOpen" class="restart">
+      <span class="restart__label">{{ needsReason ? '重启已通过的站必须写理由' : '重启理由（可选）' }}</span>
+      <div class="restart__row">
+        <a-input
+          v-model="reason"
+          size="small"
+          allow-clear
+          :placeholder="needsReason ? '为什么要退回这一站？例如：评估漏了迁移步骤' : '不写也能重启；写了会记进这一站的历史'"
+        />
+        <a-button
+          size="small"
+          type="primary"
+          status="warning"
+          :loading="busy === 'restart'"
+          :disabled="(needsReason && reason.trim() === '') || busy !== ''"
+          @click="doRestart"
         >
-          <div class="comment__meta">
-            <span class="comment__author">{{ fmtAuthorType(c.authorType) }} · {{ c.author || '匿名' }}</span>
-            <span v-if="c.verdict === 'reject'" class="comment__verdict">拒绝</span>
-            <span v-else-if="c.verdict === 'approve'" class="comment__verdict comment__verdict--ok">通过</span>
-            <time class="comment__time soft">{{ fmtTime(c.at) }}</time>
-          </div>
-          <p class="comment__body">{{ c.body }}</p>
-        </li>
-      </ul>
-
-      <p v-else-if="!lastAttempt" class="node__empty">
-        {{ node.state === 'pending' ? '这一站还没开始。' : '这一站还没有评论。' }}
-      </p>
-
-      <p v-else class="node__empty">这一站还没有评论。</p>
-
-      <ul v-if="node.artifacts.length" class="artifacts">
-        <li v-for="(a, i) in node.artifacts" :key="i" class="artifact mono">{{ a }}</li>
-      </ul>
-
-      <p v-if="rejectComment" class="node__reject-line">
-        <Icon name="alert" :size="12" />
-        这一站被拒：{{ rejectComment.body }}
+          确认重启
+        </a-button>
+        <a-button size="small" type="text" :disabled="busy !== ''" @click="restartOpen = false">取消</a-button>
+      </div>
+      <p class="pane__hint" style="margin: 4px 0 0">
+        {{
+          needsReason
+            ? '空着不能提交（后端 400：重启已通过的站必须说明理由）；重启会把后面基于它的站一起退回待开始'
+            : '其它状态可以直接重启；后端仍可能 409（还没到这一站，或整条需求已被拒）'
+        }}
       </p>
     </div>
 
-    <footer class="node__actions">
-      <label class="node__input">
-        <span class="node__input-label">
-          本卡操作说明（通过 / 拒绝 / 评论 / 规则都需要文字；开始执行可留空）
-        </span>
-        <textarea
-          v-model="draft"
-          class="textarea"
-          rows="2"
-          :disabled="!active"
-          placeholder="写在这一站要做什么、结论是什么；提交后就地显示错误，不弹窗。"
-        />
-      </label>
-      <p v-if="error" class="inline-error">{{ error }}</p>
-      <div class="node__buttons">
-        <button
-          v-for="b in buttons"
-          :key="b.key"
-          class="btn"
-          :class="{ 'btn--primary': b.key === 'accept', 'btn--danger': b.key === 'reject' }"
-          type="button"
-          :disabled="!b.enabled || busy !== null"
-          @click="act(b.key)"
-        >
-          {{ busy === b.key ? '提交中…' : b.label }}
-        </button>
+    <div class="sel__body">
+      <a-alert v-if="error" type="error" class="sel__alert">{{ error }}</a-alert>
+      <a-alert v-if="rejectComment" type="error" class="sel__alert">这一站被拒：{{ rejectComment.body }}</a-alert>
+
+      <div v-if="lastAttempt" class="attempt">
+        <div class="attempt__head">
+          <span class="mono">第 {{ lastAttempt.n }} 次执行</span>
+          <span class="mono">{{ lastAttempt.template || '—' }} · exit {{ lastAttempt.exitCode }}</span>
+          <span>{{ fmtTime(lastAttempt.startedAt) }} → {{ fmtTime(lastAttempt.endedAt) }}</span>
+        </div>
+        <p v-if="lastAttempt.outcome" style="margin: 4px 0 0">{{ lastAttempt.outcome }}</p>
       </div>
-    </footer>
-  </article>
+
+      <div v-if="node.rules.length" class="blk">
+        <span class="blk__title">追加规则</span>
+        <div class="row" style="flex-wrap: wrap; gap: 6px">
+          <span v-for="(rule, i) in node.rules" :key="i" class="rule">{{ rule }}</span>
+        </div>
+      </div>
+
+      <div class="cmts">
+        <div v-for="c in node.comments" :key="c.id" class="cmt" :class="'cmt--' + c.authorType">
+          <span class="ava" :class="'ava--' + c.authorType" aria-hidden="true">
+            <IconSettings v-if="c.authorType === 'container'" />
+            <IconRobot v-else-if="c.authorType === 'system'" />
+            <IconUser v-else />
+          </span>
+          <div class="cmt__main">
+            <div class="cmt__meta">
+              <span class="cmt__who">{{ whoOf(c.authorType, c.author) }}</span>
+              <a-tag v-if="c.verdict === 'reject'" size="small" color="red">拒绝</a-tag>
+              <a-tag v-else-if="c.verdict === 'approve'" size="small" color="green">通过</a-tag>
+              <time class="cmt__time mono">{{ fmtMinute(c.at) }}</time>
+            </div>
+            <p class="cmt__body">{{ c.body }}</p>
+          </div>
+        </div>
+        <p v-if="!node.comments.length" class="pane__hint" style="margin: 0">
+          {{ node.state === 'pending' ? '这一站还没开始。' : '这一站还没有评论。' }}
+        </p>
+      </div>
+
+      <div v-if="node.artifacts.length" class="blk">
+        <span class="blk__title">产物</span>
+        <span v-for="(a, i) in node.artifacts" :key="i" class="mono pane__hint">{{ a }}</span>
+      </div>
+
+      <div class="composer">
+        <a-textarea
+          v-model="draft"
+          :auto-size="{ minRows: 2, maxRows: 8 }"
+          :disabled="!active"
+          placeholder="给这一站留句话：通过 / 拒绝 / 评论 / 追加规则都读这一格（开始执行和重启不用它）。错误就地显示，不弹窗。"
+        />
+        <div class="composer__foot">
+          <a-button size="small" :loading="busy === 'comment'" :disabled="!canAnnotate || busy !== ''" @click="act('comment')">
+            留下评论
+          </a-button>
+          <a-button
+            size="small"
+            type="text"
+            :loading="busy === 'rules'"
+            :disabled="!canAnnotate || busy !== ''"
+            @click="act('rules')"
+          >
+            追加规则
+          </a-button>
+          <span class="pane__hint">评论不改状态；通过 / 拒绝也读这一格</span>
+        </div>
+      </div>
+    </div>
+  </div>
 </template>
-
-<style scoped>
-.node {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  overflow: hidden;
-}
-
-.node--current {
-  border-color: #c7d2fe;
-  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.08), var(--shadow);
-}
-
-.node--rejected {
-  border-color: #fca5a5;
-}
-
-.node__head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.node__index {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  flex: 0 0 24px;
-  border: 1px solid var(--border-strong);
-  border-radius: 50%;
-  background: var(--bg);
-  color: var(--text-muted);
-  font-size: var(--fs-small);
-  font-weight: 700;
-}
-
-.node--current .node__index {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.node--accepted .node__index {
-  border-color: #86efac;
-  background: var(--st-accepted-bg);
-  color: var(--st-accepted-fg);
-}
-
-.node--rejected .node__index {
-  border-color: #fca5a5;
-  background: var(--st-rejected-bg);
-  color: var(--st-rejected-fg);
-}
-
-.node__title {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.node__key {
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.node__tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
-.node__tag--box {
-  border-color: #c7d2fe;
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.node__current {
-  padding: 0 6px;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.node__head > :last-child {
-  margin-left: auto;
-}
-
-.node__body {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px 14px;
-}
-
-.attempt {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  font-size: var(--fs-small);
-}
-
-.attempt__n {
-  font-weight: 700;
-  color: var(--text);
-}
-
-.attempt__meta {
-  color: var(--text-muted);
-}
-
-.attempt__outcome {
-  width: 100%;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
-.rules {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.rule {
-  display: flex;
-  gap: 8px;
-  padding: 5px 10px;
-  border-left: 2px solid #c7d2fe;
-  background: var(--accent-soft);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  font-size: var(--fs-small);
-}
-
-.rule__tag {
-  flex: 0 0 auto;
-  color: var(--accent);
-  font-weight: 700;
-}
-
-.comments {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.comment {
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-}
-
-.comment--container {
-  border-left: 3px solid var(--accent);
-  background: #fafaff;
-}
-
-.comment--human {
-  border-left: 3px solid #94a3b8;
-  background: var(--bg);
-}
-
-.comment--reject {
-  border-color: #fca5a5;
-  border-left-color: var(--danger);
-  background: #fff7f7;
-}
-
-.comment__meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.comment__author {
-  font-weight: 700;
-  color: var(--text);
-}
-
-.comment__verdict {
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--st-rejected-bg);
-  color: var(--st-rejected-fg);
-  font-weight: 600;
-}
-
-.comment__verdict--ok {
-  background: var(--st-accepted-bg);
-  color: var(--st-accepted-fg);
-}
-
-.comment__time {
-  margin-left: auto;
-}
-
-.comment__body {
-  margin-top: 2px;
-  color: var(--text);
-  overflow-wrap: anywhere;
-  /* 容器输出是多行文本：不保留换行会被挤成一整段。 */
-  white-space: pre-wrap;
-}
-
-.node__empty {
-  color: var(--text-soft);
-  font-size: var(--fs-small);
-}
-
-.artifacts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.artifact {
-  padding: 1px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
-.node__reject-line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--danger);
-  font-size: var(--fs-small);
-}
-
-.node__actions {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 14px 12px;
-  border-top: 1px solid var(--border);
-  background: #fcfdff;
-}
-
-.node__input {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.node__input-label {
-  color: var(--text-soft);
-  font-size: 11px;
-}
-
-.node__buttons {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-}
-</style>
