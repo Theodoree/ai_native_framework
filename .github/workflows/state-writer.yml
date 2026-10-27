@@ -155,7 +155,7 @@ jobs:
       # 拒绝与 INFRA 都留痕，位置与 apply 同源：被改动的那个 issue（intent.json 的 issue），
       # 不是事件自身的 PR 号。只有「连 issue 都解不出」时才没有可落的目标 ——
       # 那时改动为零，评论只是报告，落在事件主体上，PR 号在那里是主体而非被冒充的 issue 号。
-      # 正文格式与 job 红绿只由 writer-record.mjs 决定：rejected→0，infra→1（留痕失败也红）。
+      # 正文格式与 job 红绿只由引擎的 writer-record 子命令决定：rejected→0，infra→1（留痕失败也红）。
       # has_intent 必须为 1：没有意图就没有判定结果可留痕，空 intent.json 绝不能进到这里
       # （validate 被跳过时它的 exit 输出为空，单看 exit != '0' 会误命中）。
       - name: record

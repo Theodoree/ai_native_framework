@@ -1,6 +1,6 @@
 # P-31 判据与门搬进 Go
 
-状态：阶段 A–D4 已完成并合入 main（A/B/C 见 §六–§十，D1 §十一、D2 §十二、D3 §十三、D4 §十四）。audit.yml 判定步自 D3 起调编译产物；parity 自 D4 起只跑引擎、与冻结 golden 比对，测试路径不再执行 scripts/*.mjs。scripts/*.mjs 与钉其实现细节的 Node 套件仍在（约 690 例），删除前置已解除但须先把用例移植成 Go 单测（§14.6）；USAGE 文案仍写 Node 载体名。
+状态：阶段 A–D4 已完成并合入 main；E2（按模块把 Node 判据搬进 Go，搬完即删）进行中——第一批 writer-record 已完成（A/B/C 见 §六–§十，D1 §十一、D2 §十二、D3 §十三、D4 §十四）。audit.yml 判定步自 D3 起调编译产物；parity 自 D4 起只跑引擎、与冻结 golden 比对，测试路径不再执行 scripts/*.mjs。scripts/*.mjs 与钉其实现细节的 Node 套件仍在（约 690 例），删除前置已解除但须先把用例移植成 Go 单测（§14.6）；USAGE 文案仍写 Node 载体名。
 
 ## 一、为什么做
 
@@ -522,3 +522,45 @@ PR #95 的 `check` 红在一条只有 CI 能看见的差异上：
 独立性验证：把 `pathVariants` 打回旧行为 → 单元断言立刻红（`expected '/private<ROOT>/a.json' to be '<ROOT>/a.json'`）；把 `TMPDIR` 指到 symlink 目录（`/tmp/tmplink -> /tmp/tmpreal`，与 macOS 上 `/tmp -> /private/tmp` 同形）全量重冻 → 与仓库内 golden `diff -rq` **零差异**。
 
 重冻 diff 只动了 16 个 `d/` 文件，差异只有 `/private<ROOT>` → `<ROOT>` 一类；`a/b/c/e` 与 `index.json` 零变化——说明修的是漏掉的那类形态，不是顺手改期望值。
+
+## 十五、E2 第一批：writer-record 判据搬进 Go，脚本与其 Node 套件同时删除
+
+路线仍按 §14.6 定的顺序：一个模块一批，判据先搬、搬完再删，删除之后闸门不能变松。这一批是第一个样本，因为它最小且 CI 已无调用点。
+
+### 15.1 搬了什么
+
+9 条 Node 用例（`tests/writer-record.test.mjs`，164 行）→ 11 条 Go 单测（`apps/engine/writer_test.go`，272 行）：函数级钉正文逐字与退出码，CLI 级经 `Run(["writer-record", ...])` 走 `cli.go` 的 case 表，并用假 `gh`（`PATH` 前置 + 脚本把 `$*` 追加进 `calls.log`）钉「一次都没被调用」与逐字 argv。
+
+13 条 CLI 形状本来就已由 `tests/goldens/b/b-42…b-54` 冻住，删除参照物不影响默认测试路径——这正是先做 E1 的理由。
+
+### 15.2 两处无法等价表达，如实降级（不是静默）
+
+- 「要留痕却没有 issue 号时不发到 0 号上」：Node 侧注入 `comment` 回调断言「根本不调用」；Go 侧 `postComment` 直接 exec `gh`，没有可注入边界。等价物改成 CLI 边界——假 `gh` + 断言 `calls.log` 零字节 + stderr 原文 + exit 1。断言层从「注入的函数没被调」平移到「gh 进程没被起」，强度不减但不同层。
+- 「认不出的判定结果」：Node 断言抛异常类型；Go 无异常类型，等价物是 `error` + 文案逐字 + 退出码。异常**类型**不可表达（也没有语义），文案与退出码全部保留。
+
+### 15.3 参照物消失后，冻结入口必须会说话
+
+`tests/goldens/freeze.mjs` 新增 `missingReferences`/`assertRefreezePossible`：参照物被删时以可读说明中止（`冻结中止：参照物已删除，这些夹具没有可重冻的来源。` + 逐条列 13 条夹具 + 「要重冻这些夹具，先把被参照的 scripts 恢复回来」），exit 1，不崩溃、不静默跳过。实测去掉这条守卫后，同一条命令不再提「参照物已删除」，而是继续跑到 Go/Node 对账失败并指向某个夹具的差异——操作者会被引去调错的模块，真正的病因（缺参照物）看不见。`parity-cases.mjs` 的 suite b 用 `refreezeLocked: ["writer-record"]` 声明这一点。
+
+### 15.4 变异（我自跑，`/tmp` 副本）
+
+| 变异 | 结果 |
+| --- | --- |
+| 正文前缀 `状态未被修改：` → `状态被修改：` | 5 条红 |
+| `RecordExitCode` 让 `infra` 也归 0 | 3 条红 |
+| issue 守卫 `<= 0` → `< 0` | 1 条红 |
+| 去掉 freeze 的参照物守卫 | 无 vitest 红（冻结不在默认测试路径）+ 直接运行报错指向别处 |
+
+### 15.5 又一次「探针自己坏了」
+
+我第一次把 `RecordExitCode` 改成 `if true {`，编译报 `declared and not used: kind`，脚本又只 grep `^--- FAIL`，于是得到 `fails=0` —— 看起来像「这三条断言不承重」。改成真正会编译的形态（追加 `|| isStringValue(kind, "infra")`）才是 3 条红。**固定动作再补一条：Go 侧变异后先看有没有 `build failed`，再看 `--- FAIL`；`fails=0` 在构建失败时毫无意义。**
+
+### 15.6 数字
+
+`npm run check` exit 0；22 files / **783 tests**（792 − 9，精确等于被删 Node 用例数；新增 11 条 Go 测试不计入 vitest）；gofmt/vet/`go test` 全 0；oxlint 4 warnings 0 errors（都是既有文件里的既有写法，其中 `tests/audit-findings.test.mjs` 那三处 `\*`/`\?` 转义在字符串字面量里是夹具语义，不能动）。
+
+顺带清掉两处陈旧注释：`tests/audit-findings.test.mjs` 里拿已删脚本当例子（换成现存的 `scripts/merge-gate.mjs`）、`.github/workflows/state-writer.yml` 仍写「只由 writer-record.mjs 决定」（改成引擎子命令）。`.agents/notes/implemented/` 里的两条历史决策记录按规矩不动——它们记的是当时的 why。
+
+### 15.7 下一批
+
+按 CI 引用面从易到难：`last-change` / `copy-dist` / `cli` / `kb-export`（CI 已无 Node 调用点）→ `merge-gate` / `build-intent` → `routing` / `ledger` / `state-validate` → `audit-collect`/`audit-findings`/`audit-slot`/`audit-review`（最后一批，要动 `.github/workflows/audit.yml` 的 verifier 边界，单独一次带变异证据的变更）。

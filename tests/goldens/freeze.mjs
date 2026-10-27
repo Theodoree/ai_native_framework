@@ -78,6 +78,42 @@ function nodeInvoke(suite, fixture) {
   return { bin: process.execPath, prefix: [scriptOf(fixture.script)] };
 }
 
+// 参照物（scripts/*.mjs）被删掉的模块不再可重冻：冻结要先跑 Node 侧把它的输出写成 golden，
+// 没有脚本就没有「旧实现重算一遍」这条来源。名单不写死 —— 按 scripts/ 里文件是否存在判定，
+// 免得清单和磁盘各说一套。命中就中止，且在任何写入之前中止：半冻一半的索引比不冻更糟。
+// 目前已有实例：scripts/writer-record.mjs 随 P-31 收尾删除，suite b 的 13 条 writer-record 夹具
+// 因此不可重冻（判据已等价搬进 apps/engine/writer_test.go，golden 不动）。
+function missingReferences(chosen) {
+  const found = [];
+  for (const suite of chosen) {
+    for (const fixture of suite.cases) {
+      if (!fixture.script || fixture.script === "@consult-probe") continue;
+      if (!existsSync(scriptOf(fixture.script))) found.push({ suite, fixture });
+    }
+  }
+  return found;
+}
+
+function assertRefreezePossible(chosen) {
+  const missing = missingReferences(chosen);
+  if (!missing.length) return;
+  const byScript = new Map();
+  for (const { suite, fixture } of missing) {
+    if (!byScript.has(fixture.script)) byScript.set(fixture.script, []);
+    byScript.get(fixture.script).push({ suite, fixture });
+  }
+  const lines = ["冻结中止：参照物已删除，这些夹具没有可重冻的来源。", ""];
+  for (const [script, items] of byScript) {
+    lines.push("  scripts/" + script + " 不存在 —— " + items.length + " 条夹具已不再可重冻：");
+    for (const { suite, fixture } of items) lines.push("    - suite " + suite.id + " · " + fixture.id + " " + fixture.title);
+    lines.push("");
+  }
+  lines.push("为什么：该模块已迁进 Go（apps/engine/），迁移前的 Node 实现被删除；见 tests/goldens/parity-cases.mjs 里对应 suite 的说明。");
+  lines.push("这不影响默认测试路径：tests/engine-parity*.test.mjs 只跑 Go 引擎，与已入库的 golden 逐字节比，参照物不存在也能过。");
+  lines.push("要重冻这些夹具，先把被删的 scripts/*.mjs 参照物恢复回来。");
+  throw new Error(lines.join("\n"));
+}
+
 function patternOf(pattern) {
   const out = { exit: pattern.exit, stdout: pattern.stdout };
   if (pattern.stderrPrefix !== undefined) out.stderrPrefix = pattern.stderrPrefix;
@@ -162,6 +198,7 @@ async function main() {
     return suite;
   }) : Object.values(suites);
 
+  assertRefreezePossible(chosen);
   ensureEngine();
   writeFileSync(probePath, CONSULT_PROBE_SOURCE);
 
