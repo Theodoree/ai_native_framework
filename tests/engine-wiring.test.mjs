@@ -62,6 +62,8 @@ describe("引擎构建入口：谁建、在哪建、建完谁用", () => {
 
   it("扫描面非空，且恰好是三家调用引擎的 workflow（扫描落空也要红）", () => {
     expect([...new Set(engineJobs.map((job) => job.name))].sort()).toEqual([
+      "audit.yml",
+      "kb-sync.yml",
       "last-change.yml",
       "merge-gate.yml",
       "state-writer.yml",

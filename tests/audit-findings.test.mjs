@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -28,10 +28,33 @@ import {
   validateResult,
   workflowExitFor,
 } from "../scripts/audit-findings.mjs";
+import { engineInto, ensureEngine } from "./helpers/engine.mjs";
 
 const ROOT = process.cwd();
 const WORKFLOW = ".github/workflows/audit.yml";
 const SCRIPT = join(ROOT, "scripts/audit-findings.mjs");
+
+// 阶段 D3：判定步执行的是编译产物，沙箱里的产物必须**真构建**出来。beforeAll 跑一次唯一
+// 构建入口（npm run build:engine；新鲜度与并发由 helpers/engine.mjs 一处管），各用例复制同一份。
+// 不把仓库 .cache/bin/engine 当外部产物直接读 —— 那样「构建不出来」永远不会红。
+// 引擎的自证（--explain）：它声明自己读什么 / 写什么 / 退出码语义 / 源码模块是哪一份。
+// 判定步是编译产物、文本层看不见它的写面，所以这份声明就是「写面」这一格的真源；
+// 下面的判据只把它与 workflow 的实际参数、与实现三方对齐，不另抄一份名单。
+let DECLARED = null;
+beforeAll(() => {
+  ensureEngine();
+  const explain = spawnSync(join(ROOT, ".cache/bin/engine"), ["audit-findings", "--explain"], {
+    encoding: "utf8",
+  });
+  expect(explain.status, explain.stderr).toBe(0);
+  DECLARED = JSON.parse(explain.stdout);
+}, 300000);
+
+// 引擎自证声明的源码模块：产物本身读不到文本，它背后那份实现就是**产出者本体**，
+// 字段名豁免必须绑在这条声明上（同一份代码经 import 被别的步带进执行面，仍然是产出者）。
+const sanctionedSourceModules = () =>
+  Array.isArray(DECLARED?.source) ? DECLARED.source.map(String) : [];
+const isSanctionedSource = (rel) => sanctionedSourceModules().includes(String(rel));
 
 const finding = (over = {}) => ({
   path: "scripts/merge-gate.mjs",
@@ -616,8 +639,10 @@ describe("wiring: .github/workflows/audit.yml", () => {
 
   it("判定步骤把结论交给 Check Run，并保留脚本退出码", () => {
     const decide = steps.find((s) => s.id === "decide");
+    // 阶段 D3：判定步执行编译产物。这里钉的**不是文件名**，是那一格调用契约：
+    // 子命令恰为 audit-findings、参数恰为这三个 —— 多一个、少一个、换个路径、换个子命令都红。
     expect(decide.run).toContain(
-      "scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json",
+      "./.cache/bin/engine audit-findings --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json",
     );
     expect(decide.run).toContain("check-run.json");
     const gate = steps.find((s) => s.name === "判定");
@@ -681,8 +706,9 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
   // 装依赖要联网，沙箱里没有 lockfile、跑了只有噪声，所以按 name 跳过；
   // 「跳过」不等于「可以不装」—— 它必须存在这件事由下面的形状断言钉住
   // （真事件 run 40284427925：audit.yml 从不装依赖，routing.mjs 导入 yaml 直接崩）。
-  const NETWORK_STEPS = new Set(["安装依赖"]);
-
+  // 沙箱里跳过的两步：装依赖要联网；构建引擎由 beforeAll 真跑一次（产物由 engineInto 复制，
+  // 每个用例拿到的是同一份）。跳过不等于「可以没有」—— 两步仍在 steps 里，由形状断言钉住。
+  const SANDBOX_SKIPPED_STEPS = new Set(["安装依赖", "构建引擎"]);
   function sandbox() {
     const dir = mkdtempSync(join(tmpdir(), "audit-wf-"));
     cpSync(join(ROOT, "scripts"), join(dir, "scripts"), { recursive: true });
@@ -693,6 +719,10 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
       recursive: true,
     });
     symlinkSync(join(ROOT, "node_modules"), join(dir, "node_modules"));
+    // 阶段 D3：判定步执行编译产物。沙箱里的 .cache/bin/engine 是**真构建**出来的那一份
+    // （engineInto → ensureEngine：npm run build:engine 只跑一次），不是把仓库里现成的二进制
+    // 当外部产物拷进来 —— 否则「构建不出来」永远不会红。
+    engineInto(dir);
     mkdirSync(join(dir, ".audit"), { recursive: true });
     // Actions 为每个 job 准备一个 $RUNNER_TEMP（工作区之外的可写目录）：自动路径的 diff 与
     // 两份 review 记录都落在那里，不落进工作区（它们是中间产物，不是交付物）。
@@ -1095,7 +1125,7 @@ try {
     for (const step of steps) {
       if (!step.run) continue;
       if (skip.has(step.name)) continue;
-      if (NETWORK_STEPS.has(step.name)) continue;
+      if (SANDBOX_SKIPPED_STEPS.has(step.name)) continue;
       if (step.if && !ifMatches(step.if, outputs)) continue;
       writeFileSync(env.GITHUB_OUTPUT, "");
       const stepEnv = { ...env };
@@ -1520,19 +1550,24 @@ try {
       { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
       {},
       (dir) => {
+        // 阶段 D3：判定步执行的是编译产物，桩要钉在**产物**上（不是它的源码模块，
+        // 那份文件现在只作为库被 audit-review import）。桩是 posix sh，按契约参数写 result.json。
+        const bin = join(dir, ".cache/bin/engine");
+        mkdirSync(join(dir, ".cache/bin"), { recursive: true });
         writeFileSync(
-          join(dir, "scripts/audit-findings.mjs"),
+          bin,
           [
-            // scripts/ 是 ESM（package.json type=module）：require 在这里是 ReferenceError。
-            'import fs from "node:fs";',
-            'fs.writeFileSync(".audit/result.json", JSON.stringify({',
-            '  verdict: "INFRA", conclusion: "", executors: [], comparison: null,',
-            "}) + String.fromCharCode(10));",
+            "#!/bin/sh",
+            ": > .audit/stub-ran",
+            "printf '%s\n' '{\"verdict\":\"INFRA\",\"conclusion\":\"\",\"executors\":[],\"comparison\":null}' > .audit/result.json",
             "",
           ].join(String.fromCharCode(10)),
         );
+        chmodSync(bin, 0o755);
       },
     );
+    // 先证明桩真的被执行了：否则「conclusion 是空串」可能只是桩根本没跑到。
+    expect(existsSync(join(out.dir, ".audit/stub-ran"))).toBe(true);
     // 载体确实没有可用 conclusion，而 POST 照常发生了 —— 这正是自证步要拦的形态。
     expect(out.payload).toMatchObject({ name: "audit", status: "completed" });
     expect(out.payload.conclusion).toBe("");
@@ -2559,6 +2594,13 @@ try {
       for (const payload of stepPayloads(step)) {
         for (const line of payload.text.split("\n").map(stripShellComment)) {
           if (!line.includes(RESULT_OUT_FLAG)) continue;
+          // 阶段 D3：判定步由编译产物执行 —— 产出者就是那条被 sanction 的通路本身。
+          // 只有契约那一格算产出者：换个子命令、换个路径，都别想借这条豁免变成「有产出者」。
+          if (sanctionedBinaryUse(SANCTIONED_BINARY, [line])) {
+            if (!writers.includes(SANCTIONED_BINARY))
+              writers.push(SANCTIONED_BINARY);
+            continue;
+          }
           for (const rel of scriptRefs(line, options))
             if (!writers.includes(rel)) writers.push(rel);
         }
@@ -2608,6 +2650,11 @@ try {
       }
       files.push(rel);
       if (depth >= MAX_IMPORT_DEPTH) continue;
+      // 二进制没有 import 可跟：跳过读文件，但必须留一条显式 gap（跳过 ≠ 消失）。
+      if (isBinarySource(abs)) {
+        noteBinarySkip(rel, "二进制：没有可跟随的 import，闭包到此为止");
+        continue;
+      }
       const text = readFileSync(abs, "utf8");
       for (const match of text.matchAll(IMPORT_SPEC)) {
         const next = resolveImport(root, rel, match[1]);
@@ -2678,6 +2725,10 @@ try {
           if (!missing.includes(gone)) missing.push(gone);
         for (const file of tree.files) {
           const abs = scriptPath(root, file);
+          if (abs && existsSync(abs) && isBinarySource(abs)) {
+            noteBinarySkip(file, "二进制：跟不下去的形态读不到，跳过但记账");
+            continue;
+          }
           for (const shape of unfollowableShapes(readFileSync(abs, "utf8")))
             note({ step: source, file, ...shape });
         }
@@ -2733,6 +2784,13 @@ try {
           // 判豁免，等于同一个文件「直连就豁免、隔一层就违规」。产出者集合仍是从 run 文本
           // 推出来的那一个（见下方 resultWriters 断言），不是手写名单。
           if (writers.includes(rel)) continue;
+          if (isSanctionedSource(rel)) continue;
+          const abs = scriptPath(root, rel);
+          // 二进制没有字段名可读：跳过，但必须留一条显式 gap。
+          if (abs && existsSync(abs) && isBinarySource(abs)) {
+            noteBinarySkip(rel, "二进制：字段名判据读不到它的文本，跳过但记账");
+            continue;
+          }
           const text = readFileSync(scriptPath(root, rel), "utf8");
           for (const { field, re } of FIELD_READERS) {
             const hit = text.split("\n").find((line) => re.test(line));
@@ -2748,6 +2806,13 @@ try {
         if (writers.includes(entry)) continue;
         for (const rel of scriptTree(root, entry).files) {
           if (writers.includes(rel)) continue;
+          if (isSanctionedSource(rel)) continue;
+          const abs = scriptPath(root, rel);
+          // 二进制没有字段名可读：跳过，但必须留一条显式 gap。
+          if (abs && existsSync(abs) && isBinarySource(abs)) {
+            noteBinarySkip(rel, "二进制：字段名判据读不到它的文本，跳过但记账");
+            continue;
+          }
           const text = readFileSync(scriptPath(root, rel), "utf8");
           for (const { field, re } of FIELD_READERS) {
             const hit = text.split("\n").find((line) => re.test(line));
@@ -3102,6 +3167,81 @@ try {
     return gaps;
   }
 
+  // ---- 阶段 D3：判定步执行编译产物 ----
+  // 「谁读/写 .audit/*.json」本来是文本判据。编译产物让文本这一层看不见写面，降级不换信任，
+  // 靠四条钉子：
+  // ① 只承认一条通路：工作目录相对的 ./.cache/bin/engine，且**子命令与参数整条钉死**
+  //    （SANCTIONED_CONTRACT）—— 多一个参数、少一个参数、换个路径、换个子命令，都退回默认拒绝；
+  // ② 这条通路的读写面由引擎自证（engine audit-findings --explain），测试拿它与 workflow 的
+  //    实际参数、与实现三方对齐；
+  // ③ 白名单之外的二进制、绝对路径、变量拼出来的路径仍然默认拒绝（反面对照用例钉住）；
+  // ④ 跳过的二进制一律落一条显式 gap（kind + 文件 + 为什么跳），跳过 ≠ 消失。
+  const SANCTIONED_BINARY = ".cache/bin/engine";
+  const SANCTIONED_CONTRACT = Object.freeze({
+    subcommand: "audit-findings",
+    argv: Object.freeze([
+      "--a",
+      ".audit/review-a.json",
+      "--b",
+      ".audit/review-b.json",
+      "--out",
+      ".audit/result.json",
+    ]),
+  });
+  const BINARY_SKIP_WHY_SANCTIONED =
+    "编译产物：按自身自证（--explain）声明读写面，跳过文本扫描";
+  const BINARY_SKIP_WHY_UNSANCTIONED =
+    "二进制：文本层读不到它的读写面，按默认拒绝";
+
+  const sameArgv = (left, right) =>
+    left.length === right.length && left.every((word, i) => word === right[i]);
+
+  function sanctionedContractHolds(argv) {
+    const words = argv.map((word) => String(word));
+    if (words[0] !== SANCTIONED_CONTRACT.subcommand) return false;
+    return sameArgv(words.slice(1), SANCTIONED_CONTRACT.argv);
+  }
+
+  // 一段载荷文本里「执行 ./.cache/bin/engine」的每一次调用（只看执行，不看提及）。
+  function sanctionedBinaryCalls(payloadTexts) {
+    const calls = [];
+    for (const text of payloadTexts) {
+      for (const words of shellCommands(String(text))) {
+        const at = words.findIndex((word) => word === "./" + SANCTIONED_BINARY);
+        if (at !== -1) calls.push(words.slice(at + 1));
+      }
+    }
+    return calls;
+  }
+
+  // 放行只认「执行了它，且每一次调用都恰好是那一格契约」；
+  // 一次都不执行（只把它当数据拷来拷去）不算 —— 放行的不是文件名，是那一次调用。
+  function sanctionedBinaryUse(rel, payloadTexts) {
+    if (rel !== SANCTIONED_BINARY) return false;
+    const calls = sanctionedBinaryCalls(payloadTexts);
+    if (calls.length === 0) return false;
+    return calls.every(sanctionedContractHolds);
+  }
+
+  // 跳过读二进制时留的账。静默 continue 等于给「把执行体换成二进制」开一条谁都查不到的暗道，
+  // 所以每跳一次记一条 kind + 文件 + 为什么跳，由用例钉住「这条 gap 看得见」。
+  const binarySkips = [];
+  function noteBinarySkip(rel, why) {
+    const key = String(rel) + "\u0000" + String(why);
+    if (binarySkips.some((entry) => entry.key === key)) return;
+    binarySkips.push({
+      key,
+      kind: BINARY_SOURCE_KIND,
+      file: rel,
+      why: String(why),
+    });
+  }
+  function takeBinarySkips() {
+    const taken = binarySkips.map(({ kind, file, why }) => ({ kind, file, why }));
+    binarySkips.length = 0;
+    return taken;
+  }
+
   // 一个 step 的**闭合执行面**：载荷 + 被引用脚本（含 import 闭包）+ 本地 composite 的
   // runs.steps + 本地 node action 的 runs.main|pre|post（递归，深度上限 3）。
   // 三个入口各判各的面时，同一份代码换个入口就换一个结论：
@@ -3126,6 +3266,8 @@ try {
       gaps.push(entry);
     };
     const visit = (one, depth, label) => {
+      // 这一步已经展开的载荷文本（下面判「被执行的二进制是不是被 sanction 的那一格」要用）。
+      const payloadBase = texts.length;
       // 脚本引用按「仓库根 + 生效的 working directory」解析：`run:` 里的相对路径相对这一步的
       // cwd，不是相对仓库根。取不出目录（含变量 / 逃出仓库根）就是跟不下去 —— 不许静默回落
       // 仓库根，回落一次就等于「根上放同名良性诱饵、真文件挪进子目录」换一次全绿。
@@ -3168,11 +3310,22 @@ try {
         for (const file of tree.files) {
           const abs = scriptPath(root, file);
           if (abs && existsSync(abs) && isBinarySource(abs)) {
+            // 放行与否从**载荷文本**读，不按文件名放行：同一个产物被别的子命令调用就还是默认拒绝。
+            const sanctioned = sanctionedBinaryUse(
+              file,
+              texts.slice(payloadBase).map((entry) => entry.text),
+            );
+            const why = sanctioned
+              ? BINARY_SKIP_WHY_SANCTIONED
+              : BINARY_SKIP_WHY_UNSANCTIONED;
+            noteBinarySkip(file, why);
             noteGap({
               step: label,
               where,
               kind: BINARY_SOURCE_KIND,
               detail: file,
+              sanctioned,
+              why,
             });
             continue;
           }
@@ -5393,6 +5546,11 @@ try {
     }
     // 跟不下去就响：脚本解析不到 / 本地 action 读不到 / 嵌套超限 —— 静默跳过等于给分叉留后门。
     for (const gap of gaps) {
+      // 阶段 D3：被 sanction 的那一格不在这里响 —— 它的存在仍由 workflowBinarySourceGaps()
+      // 单独断言（跳过 ≠ 消失），且只限 SANCTIONED_CONTRACT 那一格。
+      if (gap.kind === BINARY_SOURCE_KIND && gap.sanctioned) continue;
+      if (gap.kind === BINARY_SOURCE_KIND)
+        noteBinarySkip(gap.detail, gap.why ?? BINARY_SKIP_WHY_UNSANCTIONED);
       violations.push({
         step: gap.step,
         where: gap.kind,
@@ -5641,9 +5799,19 @@ try {
     expect(scripts.unfollowable, JSON.stringify(scripts.unfollowable)).toEqual(
       [],
     );
-    expect(scripts.files).toContain("scripts/audit-findings.mjs");
-    // 唯一的豁免是 result.json 的生产者，且它必须是从 run 文本里推出来的那一个。
-    expect(resultWriters(steps)).toEqual(["scripts/audit-findings.mjs"]);
+    // 阶段 D3：判定步不再以脚本形态出现（它是编译产物，闭包里没有可跟随的文本），
+    // 所以这里的样本换成仍在执行的另一个脚本 —— 覆盖不靠某一格的具体名字。
+    expect(scripts.files).toContain("scripts/audit-review.mjs");
+    // 判定步本身不再引用任何脚本（它是编译产物）。注意不能断言「脚本闭包里没有
+    // scripts/audit-findings.mjs」：那份模块现在作为库被 audit-review import，
+    // 它仍在闭包里 —— 断言的是**执行面**，不是整个仓库的 import 图。
+    const decide = steps.find((s) => s.id === "decide");
+    expect(stepScriptRefs(decide, { root: ROOT })).toEqual([
+      SANCTIONED_BINARY,
+    ]);
+    // 唯一的豁免是 result.json 的生产者，且它必须是从 run 文本里推出来的那一个：
+    // 现在是那一格被 sanction 的编译产物（契约由 sanctionedBinaryUse 判，不按文件名放行）。
+    expect(resultWriters(steps)).toEqual([".cache/bin/engine"]);
     // 行为判据（不认字段名）：任何碰 result.json 数据的步，都必须是写它的那一步。
     // 只写 Object.entries 枚举、不写任何字段名的读者，在这里没有藏身处。
     const behaviorReaders = resultJsonReaderViolations(steps, {
@@ -5660,6 +5828,143 @@ try {
     expect(fieldDereferences(steps.find((s) => s.id === "decide").run)).toEqual(
       RESULT_FIELDS,
     );
+  });
+
+  // ---- 阶段 D3：判定步是编译产物，读写面靠引擎自证，不靠文本 ----
+  it("阶段 D3 自证：声明里的子命令 / 读取 / 写出与判定步的实际参数逐词一致", () => {
+    const decide = steps.find((s) => s.id === "decide");
+    const words = shellCommands(String(decide.run)).find(
+      (command) => command[0] === "./" + SANCTIONED_BINARY,
+    );
+    expect(words, String(decide.run)).toBeDefined();
+    // 声明说自己是哪个子命令，调用点就必须调那一个 —— 两处不同源等于白声明。
+    expect(words[1]).toBe(DECLARED.subcommand);
+    const argv = words.slice(2);
+    // 参数词与声明逐词对齐：声明漏一条，写面就漏一格；调用点多一条就是越权。
+    expect(argv.filter((word) => word.startsWith("--"))).toEqual([
+      ...DECLARED.args,
+    ]);
+    expect(DECLARED.reads).toEqual(["--a", "--b"]);
+    expect(DECLARED.writes).toEqual(["--out"]);
+    // 读的是两个输入槽，写的只有 result.json —— 这一格就是「谁写结论」。
+    const operand = (flag) => argv[argv.indexOf(flag) + 1];
+    expect(operand("--a")).toBe(".audit/review-a.json");
+    expect(operand("--b")).toBe(".audit/review-b.json");
+    expect(operand("--out")).toBe(".audit/result.json");
+    // 退出码语义也是声明的一部分：三档都在，0 不是「跑完就算通过」。
+    expect(Object.keys(DECLARED.exitCodes).sort()).toEqual(["0", "1", "3"]);
+    // 放行名单不许是手抄的副本：它必须与「调用点实际那一次」逐词一致，
+    // 否则白名单和契约各改各的，谁都不对账。
+    expect([SANCTIONED_CONTRACT.subcommand, ...SANCTIONED_CONTRACT.argv]).toEqual([
+      DECLARED.subcommand,
+      ...argv,
+    ]);
+    // 声明里的 args 也应该就是 argv 里 -- 词的顺序（漏一格写面就漏一格）。
+    expect(DECLARED.args.flatMap((flag) => [flag, operand(flag)])).toEqual(argv);
+  });
+
+  it("阶段 D3 自证 == 实现：按契约跑一遍真产物，写出的就是 --out 那一份", () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-declared-"));
+    const record = (agent, executor, model, requestId) =>
+      JSON.stringify({
+        verdict: "pass",
+        findings: [],
+        evidence: { executor, agent, model, request_id: requestId },
+      });
+    writeFileSync(
+      join(dir, "a.json"),
+      record("review-a", "github", "deepseek-chat", "req-1"),
+    );
+    writeFileSync(
+      join(dir, "b.json"),
+      record("review-b", "sandbox", "deepseek-reasoner", "req-2"),
+    );
+    const ran = spawnSync(
+      join(ROOT, ".cache/bin/engine"),
+      [
+        DECLARED.subcommand,
+        "--a",
+        join(dir, "a.json"),
+        "--b",
+        join(dir, "b.json"),
+        "--out",
+        join(dir, "out.json"),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(ran.status, ran.stderr).toBe(0);
+    // 声明说写 --out：落地的就是它，没有多出来的文件。
+    expect(readdirSync(dir).sort()).toEqual(["a.json", "b.json", "out.json"]);
+    expect(JSON.parse(readFileSync(join(dir, "out.json"), "utf8")).verdict).toBe(
+      "pass",
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("阶段 D3 反面：换子命令 / 多一个参数 / 只复制不执行，白名单都不认", () => {
+    const oneStep = (command) => [
+      { id: "decide", name: "判定", run: command + "\n" },
+    ];
+    // 对照 1：路径对、子命令不对。
+    const wrongSub = auditDirReferenceViolations(
+      oneStep(
+        "./.cache/bin/engine audit-slot --slot review-a --executor github --out .audit/review-a.json",
+      ),
+    );
+    // 这一行还会顺带在 .audit 下写出 review-a.json，所以另有 run 面的违规；
+    // 这里断言的是「编译产物这一格被判成默认拒绝」。
+    expect(
+      wrongSub.filter((violation) => violation.where === "binary-source"),
+    ).toHaveLength(1);
+    // 对照 2：子命令对、多一个参数。
+    const extraArg = auditDirReferenceViolations(
+      oneStep(
+        "./.cache/bin/engine audit-findings --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json --explain",
+      ),
+    );
+    expect(
+      extraArg.filter((violation) => violation.where === "binary-source"),
+    ).toHaveLength(1);
+    // 放行的不是文件名，是那一次调用：只被提及 / 只被复制都不算。
+    const contract =
+      "./.cache/bin/engine audit-findings --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json";
+    expect(sanctionedBinaryUse(SANCTIONED_BINARY, [contract])).toBe(true);
+    // 只在别处被提到（echo 出来）不算执行：一次调用都数不出来。
+    expect(
+      sanctionedBinaryUse(SANCTIONED_BINARY, ["echo ./.cache/bin/engine"]),
+    ).toBe(false);
+    expect(sanctionedBinaryUse(".cache/bin/other", [contract])).toBe(false);
+    // 跳过要留账：上面两格默认拒绝都翻过二进制，账本里必须逐条看得见（文件 + 为什么跳）。
+    // 静默 continue 会让「把执行体换成二进制」成为一条谁都查不到的暗道。
+    const skips = takeBinarySkips().filter(
+      (entry) => entry.file === SANCTIONED_BINARY,
+    );
+    expect(skips.length).toBeGreaterThan(0);
+    // 账本的每一格都要说清为什么跳（空字符串等于「不知道为什么就跳过了」）。
+    expect(skips.every((entry) => String(entry.why).trim() !== "")).toBe(true);
+  });
+
+  it("阶段 D3：跳过二进制要留一条看得见的账（kind + 文件 + 为什么跳）", () => {
+    const decide = steps.find((s) => s.id === "decide");
+    const gaps = [];
+    stepTexts(decide, { root: ROOT, gaps });
+    const gap = gaps.find((entry) => entry.kind === BINARY_SOURCE_KIND);
+    expect(gap).toBeDefined();
+    expect(gap.detail).toBe(SANCTIONED_BINARY);
+    expect(gap.sanctioned).toBe(true);
+    expect(gap.why).toBe(BINARY_SKIP_WHY_SANCTIONED);
+    // 两条 why 必须分得开：放过的是那一格契约，不是「二进制都放过」。
+    expect(BINARY_SKIP_WHY_SANCTIONED).not.toBe(BINARY_SKIP_WHY_UNSANCTIONED);
+    expect(workflowBinarySourceGaps()).toEqual([SANCTIONED_BINARY]);
+  });
+
+  it("阶段 D3 自证：声明的源码模块在仓库里，且它就是本用例 import 的那份判据", () => {
+    const sources = sanctionedSourceModules();
+    expect(sources.length).toBeGreaterThan(0);
+    for (const rel of sources) expect(existsSync(join(ROOT, rel)), rel).toBe(true);
+    // 声明指到错文件会立刻红：这一份导出的 validateResult 就是判定步真正跑的那条判据。
+    expect(SCRIPT).toBe(join(ROOT, sources[0]));
+    expect(typeof validateResult).toBe("function");
   });
 
   it('形状判据认字段名不认拼写：jq 的 .["executors"] 也是读者（逃得过旧正则，逃不过这条）', () => {
@@ -6527,12 +6832,20 @@ try {
     const out = runWorkflow(
       { AUDIT_FINDINGS_A: pass, AUDIT_FINDINGS_B: pass },
       {},
-      (dir) =>
+      (dir) => {
+        // 同上：桩钉在产物上，什么都别写就死 —— 测的是 workflow 在「判定步什么都没留下」时的行为。
+        const bin = join(dir, ".cache/bin/engine");
+        mkdirSync(join(dir, ".cache/bin"), { recursive: true });
         writeFileSync(
-          join(dir, "scripts/audit-findings.mjs"),
-          "process.exit(70);\n",
-        ),
+          bin,
+          ["#!/bin/sh", ": > .audit/stub-ran", "exit 70", ""].join(
+            String.fromCharCode(10),
+          ),
+        );
+        chmodSync(bin, 0o755);
+      },
     );
+    expect(existsSync(join(out.dir, ".audit/stub-ran"))).toBe(true);
     expect(out.payload).toMatchObject({
       name: "audit",
       conclusion: "action_required",
