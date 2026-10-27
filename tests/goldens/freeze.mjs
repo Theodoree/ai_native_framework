@@ -70,7 +70,8 @@ function nodeInvoke(suite, fixture) {
 // 参照物名：夹具的 script 字段就是 scripts/ 下的文件名，两处例外都在 suite 级：
 //   · A 套的 consult 探针（script = "@consult-probe"）没有独立脚本，过去靠临时探针调 state-validate.mjs；
 //   · C 套（merge-gate）的夹具不带 script 字段 —— 它的 Node 侧命令行形状由 nodeInvoke 单独拼。
-// P-31 阶段 D2 删了这两个脚本，映射留着是为了让中止信息点到名，而不是漏成「没有参照物」。
+// P-31 阶段 D2 把这几套的载体都删了，映射留着是为了让中止信息点到名，而不是漏成「没有参照物」：
+// 夹具自带 script 时就按夹具走，只有 C 套（以及将来任何不带 script 的夹具）靠这张表兜底。
 const SUITE_SCRIPT = {
   a: "state-validate.mjs",
   b: "build-intent.mjs",
