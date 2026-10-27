@@ -33,6 +33,24 @@
   --st-accepted-bg: #dcfce7;
   --st-rejected-fg: #b91c1c;
   --st-rejected-bg: #fee2e2;
+
+  /* ---------- 链条站点语义色 ----------
+     语义固定：已通过=灰，当前站=绿，被拒=红，还没到的站=更浅的灰 + 虚线边。
+     绿色只留给「当前」，所以已通过不能复用 --st-accepted-*（那是绿色）。 */
+  --chain-done-fg: #334155;        /* 已通过：站名文字 */
+  --chain-done-bg: #f1f5f9;        /* 已通过：底色 */
+  --chain-done-border: #e2e8f0;    /* 已通过：边框 */
+  --chain-current-fg: #065f46;     /* 当前站：文字 */
+  --chain-current-bg: #dcfce7;     /* 当前站：底色 */
+  --chain-current-border: #34d399; /* 当前站：边框 */
+  --chain-current-ring: rgba(52, 211, 153, 0.28); /* 当前站：外圈高亮 */
+  --chain-failed-fg: #b91c1c;      /* 被拒：文字 */
+  --chain-failed-bg: #fee2e2;      /* 被拒：底色 */
+  --chain-failed-border: #fca5a5;  /* 被拒：边框 */
+  --chain-todo-fg: #94a3b8;        /* 还没到：文字 */
+  --chain-todo-bg: #ffffff;        /* 还没到：底色 */
+  --chain-todo-border: #cbd5e1;    /* 还没到：虚线边框色（dashed） */
+  --chain-line: #cbd5e1;           /* 站点之间的连接线 / 箭头 */
 }
 
 *,

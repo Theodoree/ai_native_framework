@@ -3,8 +3,8 @@ import { ref } from 'vue'
 import EmptyState from './EmptyState.vue'
 import Icon from './Icon.vue'
 import StatusBadge from './StatusBadge.vue'
-import { excerpt, fmtTime } from '../format'
-import type { NewRequirementInput, Requirement } from '../types'
+import { excerpt, fmtTime, fmtType } from '../format'
+import type { NewRequirementInput, Node, Requirement } from '../types'
 
 const props = defineProps<{
   requirements: Requirement[]
@@ -39,9 +39,20 @@ async function submit() {
   }
 }
 
+/** 当前站 = 第一个还没通过的节点；全部通过时返回 null（这一行显示「全部通过」）。 */
+function currentNode(r: Requirement): Node | null {
+  return r.nodes.find((n) => n.state !== 'accepted') ?? null
+}
+
 function progress(r: Requirement): string {
   const done = r.nodes.filter((n) => n.state === 'accepted').length
-  return `${done}/${r.nodes.length} 站已通过`
+  return `${done}/${r.nodes.length} 站`
+}
+
+function sourceLabel(source: string): string {
+  const s = (source || '').trim()
+  if (s === '') return 'api'
+  return s
 }
 </script>
 
@@ -75,26 +86,36 @@ function progress(r: Requirement): string {
 
     <EmptyState
       v-else-if="requirements.length === 0"
-      title="还没有需求"
-      :hint="projectKey ? '在上面写一条需求，它会自动进链、建分支。' : '先在左栏选一个项目，或新建项目。'"
+      title="这个项目还没有需求"
+      hint="在上面写一条需求，它会自动进链、建分支，第一站是需求评估。"
     />
 
-    <ul v-else class="cards">
+    <ul v-else class="rows">
       <li v-for="r in requirements" :key="r.id">
-        <button class="req card" type="button" @click="emit('open', r.id)">
-          <span class="req__head">
-            <span class="req__id mono">{{ r.id }}</span>
+        <button class="row card" type="button" @click="emit('open', r.id)">
+          <span class="row__head">
+            <span class="row__id mono">{{ r.id }}</span>
             <StatusBadge :state="r.state" />
+            <span class="row__time soft">{{ fmtTime(r.updatedAt) }}</span>
           </span>
-          <span class="req__branch mono">
-            <Icon name="branch" :size="12" />
-            {{ r.branch }}
-          </span>
-          <span class="req__body">{{ excerpt(r.context) }}</span>
-          <span class="req__foot">
-            <span class="req__progress">{{ progress(r) }}</span>
-            <span class="soft">{{ r.projectKey }} · {{ r.chainKey }} v{{ r.chainVersion }}</span>
-            <span class="req__time soft">{{ fmtTime(r.updatedAt) }}</span>
+
+          <span class="row__body">{{ excerpt(r.context) }}</span>
+
+          <span class="row__foot">
+            <span class="row__station">
+              <span class="row__station-label soft">当前站</span>
+              <template v-if="currentNode(r)">
+                <span class="row__station-key mono">{{ currentNode(r)?.key }}</span>
+                <span class="row__station-type soft">{{ fmtType(currentNode(r)?.type ?? '') }}</span>
+                <StatusBadge :state="currentNode(r)?.state ?? 'pending'" />
+              </template>
+              <span v-else class="row__station-all">全部通过</span>
+            </span>
+            <span class="row__meta soft">
+              <span class="row__progress">{{ progress(r) }}</span>
+              <span class="row__source" :title="'来源通道'">来源 {{ sourceLabel(r.source) }}</span>
+              <span class="row__chain mono">{{ r.chainKey }} v{{ r.chainVersion }}</span>
+            </span>
           </span>
         </button>
       </li>
@@ -140,48 +161,44 @@ function progress(r: Requirement): string {
   color: var(--danger);
 }
 
-.cards {
+.rows {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.req {
+.row {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
   width: 100%;
   padding: 12px 14px;
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.12s ease, transform 0.12s ease;
+  transition: border-color 0.12s ease;
 }
 
-.req:hover {
-  border-color: #c7d2fe;
+.row:hover {
+  border-color: var(--chain-current-border);
 }
 
-.req__head {
+.row__head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
 }
 
-.req__id {
+.row__id {
   font-size: var(--fs-body);
   font-weight: 700;
 }
 
-.req__branch {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--text-muted);
+.row__time {
+  margin-left: auto;
   font-size: var(--fs-small);
 }
 
-.req__body {
+.row__body {
   display: -webkit-box;
   overflow: hidden;
   color: var(--text);
@@ -191,26 +208,54 @@ function progress(r: Requirement): string {
   line-clamp: 2;
 }
 
-.req__foot {
+.row__foot {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 14px;
   font-size: var(--fs-small);
-  color: var(--text-muted);
 }
 
-.req__progress {
+.row__station {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.row__station-key {
+  font-weight: 700;
+}
+
+.row__station-all {
+  color: var(--chain-done-fg);
+  font-weight: 700;
+}
+
+.row__meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.row__progress,
+.row__source {
   padding: 0 6px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--bg);
-  font-size: 11px;
   font-weight: 600;
-  color: var(--text-muted);
 }
 
-.req__time {
-  margin-left: auto;
+.row__chain {
+  font-weight: 600;
+}
+
+@media (max-width: 720px) {
+  .row__meta {
+    margin-left: 0;
+  }
 }
 </style>

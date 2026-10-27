@@ -3,12 +3,16 @@ import Icon from './Icon.vue'
 import { fmtType } from '../format'
 import type { Project } from '../types'
 
-defineProps<{
-  projects: Project[]
-  current: string
-  state: 'loading' | 'ready' | 'error'
-  error: string
-}>()
+/** 落地页：项目卡片网格。点一个项目进入该项目的需求列表。 */
+const props = withDefaults(
+  defineProps<{
+    projects: Project[]
+    state: 'loading' | 'ready' | 'error'
+    error: string
+    counts?: Record<string, number>
+  }>(),
+  { counts: () => ({}) },
+)
 
 const emit = defineEmits<{ (e: 'select', key: string): void; (e: 'retry'): void }>()
 
@@ -17,44 +21,50 @@ function chainPath(p: Project): string {
   if (!chain) return '没有链条'
   return chain.nodes.map((n) => n.key).join(' → ')
 }
+
+function countOf(key: string): number {
+  return props.counts[key] ?? 0
+}
 </script>
 
 <template>
-  <section class="rail">
-    <div class="rail__head">
-      <h2 class="rail__title">项目</h2>
-      <span class="rail__count">{{ projects.length }}</span>
+  <section class="projects">
+    <div class="projects__head">
+      <h2 class="projects__title">项目</h2>
+      <span class="projects__count soft">{{ projects.length }} 个</span>
     </div>
 
-    <p v-if="state === 'loading'" class="rail__note">正在加载项目…</p>
+    <p v-if="state === 'loading'" class="note">正在加载项目…</p>
 
-    <div v-else-if="state === 'error'" class="rail__note rail__note--error">
+    <div v-else-if="state === 'error'" class="note note--error">
       <span><Icon name="alert" :size="13" /> {{ error }}</span>
       <button class="btn btn--ghost" type="button" @click="emit('retry')">重试</button>
     </div>
 
-    <p v-else-if="projects.length === 0" class="rail__note">
-      还没有项目。用右上角「新建项目」登记第一个仓库。
-    </p>
+    <div v-else-if="projects.length === 0" class="notice">
+      <span class="notice__title">还没有项目</span>
+      <span>用右上角「新建项目」登记第一个仓库；每个项目自带一条需求链。</span>
+    </div>
 
-    <ul v-else class="rail__list">
+    <ul v-else class="projects__grid">
       <li v-for="p in projects" :key="p.key">
-        <button
-          class="proj"
-          type="button"
-          :class="{ 'proj--active': p.key === current }"
-          @click="emit('select', p.key)"
-        >
+        <button class="proj card" type="button" @click="emit('select', p.key)">
           <span class="proj__top">
             <span class="proj__key mono">{{ p.key }}</span>
-            <span class="proj__branch mono">{{ p.chains[0]?.key ?? '—' }} v{{ p.chains[0]?.version ?? '—' }}</span>
+            <span class="proj__count">{{ countOf(p.key) }} 条需求</span>
           </span>
-          <span class="proj__repo mono">{{ p.repo || '未登记仓库' }}</span>
+          <span class="proj__name">{{ p.name }}</span>
+          <span class="proj__repo mono">
+            <Icon name="folder" :size="12" />
+            {{ p.repo || '未登记仓库' }}
+          </span>
           <span class="proj__chain">
             <Icon name="layers" :size="12" />
             {{ chainPath(p) }}
           </span>
-          <span class="proj__meta soft">{{ fmtType(p.chains[0]?.type ?? '') }}</span>
+          <span class="proj__foot soft">
+            {{ fmtType(p.chains[0]?.type ?? '') }} · v{{ p.chains[0]?.version ?? '—' }}
+          </span>
         </button>
       </li>
     </ul>
@@ -62,75 +72,65 @@ function chainPath(p: Project): string {
 </template>
 
 <style scoped>
-.rail {
+.projects {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 14px 12px;
-  border-right: 1px solid var(--border);
-  background: var(--surface);
-  min-height: 100%;
+  gap: 10px;
 }
 
-.rail__head {
+.projects__head {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
-  padding: 0 4px 2px;
+  gap: 8px;
 }
 
-.rail__title {
-  font-size: var(--fs-body);
+.projects__title {
+  font-size: var(--fs-title);
   font-weight: 700;
-  color: var(--text);
 }
 
-.rail__count {
+.projects__count {
   font-size: var(--fs-small);
-  color: var(--text-soft);
 }
 
-.rail__note {
+.note {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  padding: 10px 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
   color: var(--text-muted);
-  font-size: var(--fs-small);
 }
 
-.rail__note--error {
+.note--error {
+  border-color: #fecaca;
   color: var(--danger);
 }
 
-.rail__list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.projects__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
 }
 
 .proj {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   width: 100%;
-  padding: 8px 10px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
+  height: 100%;
+  padding: 13px 14px;
   text-align: left;
   cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  transition: border-color 0.12s ease, transform 0.12s ease;
 }
 
 .proj:hover {
-  background: var(--bg);
-}
-
-.proj--active {
-  background: var(--accent-soft);
-  border-color: #c7d2fe;
+  border-color: var(--chain-current-border);
+  transform: translateY(-1px);
 }
 
 .proj__top {
@@ -145,12 +145,25 @@ function chainPath(p: Project): string {
   font-weight: 700;
 }
 
-.proj__branch {
+.proj__count {
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-muted);
   font-size: 11px;
-  color: var(--text-soft);
+  font-weight: 600;
+}
+
+.proj__name {
+  color: var(--text);
+  font-size: var(--fs-body);
 }
 
 .proj__repo {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   overflow: hidden;
   color: var(--text-muted);
   font-size: var(--fs-small);
@@ -162,11 +175,20 @@ function chainPath(p: Project): string {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  color: var(--text-muted);
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+  font-size: var(--fs-small);
+  font-weight: 600;
+}
+
+.proj__foot {
   font-size: 11px;
 }
 
-.proj__meta {
-  font-size: 11px;
+.note,
+.proj {
+  overflow-wrap: anywhere;
 }
 </style>

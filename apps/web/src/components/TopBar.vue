@@ -49,7 +49,9 @@ async function submit() {
 }
 
 function onSelect(event: Event) {
-  emit('select', (event.target as HTMLSelectElement).value)
+  const value = (event.target as HTMLSelectElement).value
+  if (value === '') return
+  emit('select', value)
 }
 </script>
 
@@ -64,7 +66,7 @@ function onSelect(event: Event) {
       <label class="switcher">
         <Icon name="folder" :size="13" />
         <select class="switcher__select" :value="current" @change="onSelect">
-          <option value="">全部项目</option>
+          <option value="" disabled>{{ projects.length ? '选择项目' : '还没有项目' }}</option>
           <option v-for="p in projects" :key="p.key" :value="p.key">
             {{ p.name }}（{{ p.key }}）
           </option>

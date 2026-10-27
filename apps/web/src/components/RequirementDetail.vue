@@ -4,6 +4,7 @@ import EmptyState from './EmptyState.vue'
 import EventStream from './EventStream.vue'
 import Icon from './Icon.vue'
 import NodeCard from './NodeCard.vue'
+import NodeChain from './NodeChain.vue'
 import StatusBadge from './StatusBadge.vue'
 import { fmtTime } from '../format'
 import type { Node, NodeAction, RequirementDetail } from '../types'
@@ -19,10 +20,11 @@ const emit = defineEmits<{ (e: 'back'): void; (e: 'retry'): void }>()
 
 const requirement = computed(() => props.detail?.requirement ?? null)
 const events = computed(() => props.detail?.events ?? [])
+/** 当前站 = 第一个还没通过的节点；全部通过就没有「当前」（链条全灰），不把最后一站误标成绿。 */
 const currentIndex = computed(() => {
   const r = requirement.value
   if (!r) return -1
-  return r.nodes.length === 0 ? -1 : r.nodes.find((n) => n.state !== 'accepted')?.index ?? -1
+  return r.nodes.find((n) => n.state !== 'accepted')?.index ?? -1
 })
 
 function submitNode(node: Node, action: NodeAction, text: string): Promise<void> {
@@ -84,8 +86,20 @@ function submitNode(node: Node, action: NodeAction, text: string): Promise<void>
         </p>
       </header>
 
+      <NodeChain
+        v-if="requirement.nodes.length"
+        class="detail__chain"
+        :nodes="requirement.nodes"
+        :current-index="currentIndex"
+      />
+
       <ol class="timeline">
-        <li v-for="node in requirement.nodes" :key="node.key" class="timeline__item">
+        <li
+          v-for="node in requirement.nodes"
+          :id="`node-${node.key}`"
+          :key="node.key"
+          class="timeline__item"
+        >
           <span class="timeline__rail" aria-hidden="true" />
           <NodeCard
             :node="node"
@@ -188,10 +202,16 @@ function submitNode(node: Node, action: NodeAction, text: string): Promise<void>
   gap: 10px;
 }
 
+.detail__chain {
+  padding: 2px 4px;
+}
+
 .timeline__item {
   position: relative;
   display: block;
   padding-left: 18px;
+  /* 点链条跳转时给 sticky 顶栏留出空间，卡片标题不会被盖住。 */
+  scroll-margin-top: 76px;
 }
 
 .timeline__rail {

@@ -1,12 +1,19 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import EmptyState from './components/EmptyState.vue'
 import ProjectList from './components/ProjectList.vue'
 import RequirementDetailView from './components/RequirementDetail.vue'
 import RequirementList from './components/RequirementList.vue'
 import TopBar from './components/TopBar.vue'
 import * as api from './api'
-import type { NewProjectInput, NewRequirementInput, Node, NodeAction, Project, Requirement, RequirementDetail } from './types'
+import type {
+  NewProjectInput,
+  NewRequirementInput,
+  Node,
+  NodeAction,
+  Project,
+  Requirement,
+  RequirementDetail,
+} from './types'
 
 type LoadState = 'loading' | 'ready' | 'error'
 
@@ -28,9 +35,24 @@ const currentProject = computed(
   () => projects.value.find((p) => p.key === currentProjectKey.value) ?? null,
 )
 
-const visibleRequirements = computed(() => {
-  if (currentProjectKey.value === '') return requirements.value
-  return requirements.value.filter((r) => r.projectKey === currentProjectKey.value)
+/** 三态视图：项目列表（落地）→ 需求列表（选中项目）→ 需求详情（选中需求）。 */
+const view = computed<'projects' | 'requirements' | 'detail'>(() => {
+  if (selectedId.value) return 'detail'
+  if (currentProjectKey.value) return 'requirements'
+  return 'projects'
+})
+
+/** 只显示当前项目的需求，不和「全部项目」混在一起。 */
+const visibleRequirements = computed(() =>
+  requirements.value.filter((r) => r.projectKey === currentProjectKey.value),
+)
+
+const reqCounts = computed<Record<string, number>>(() => {
+  const counts: Record<string, number> = {}
+  for (const r of requirements.value) {
+    counts[r.projectKey] = (counts[r.projectKey] ?? 0) + 1
+  }
+  return counts
 })
 
 async function loadProjects() {
@@ -78,9 +100,17 @@ onMounted(() => {
 
 function selectProject(key: string) {
   currentProjectKey.value = key
-  selectedId.value = ''
-  detail.value = null
-  detailState.value = 'ready'
+  closeDetail()
+  window.scrollTo({ top: 0 })
+}
+
+function backToProjects() {
+  currentProjectKey.value = ''
+  closeDetail()
+}
+
+function backToList() {
+  closeDetail()
 }
 
 async function openRequirement(id: string) {
@@ -97,13 +127,12 @@ function closeDetail() {
 async function createProject(input: NewProjectInput) {
   const created = await api.createProject(input)
   await loadProjects()
-  currentProjectKey.value = created.key
-  closeDetail()
+  selectProject(created.key)
 }
 
 async function createRequirement(input: NewRequirementInput) {
   if (currentProjectKey.value === '') {
-    throw new Error('先在左栏选一个项目')
+    throw new Error('先选一个项目')
   }
   const created = await api.createRequirement(currentProjectKey.value, input)
   await loadRequirements()
@@ -126,59 +155,69 @@ async function submitNodeAction(node: Node, action: NodeAction, text: string) {
       @select="selectProject"
     />
 
-    <div class="shell__body">
-      <aside class="shell__rail">
-        <ProjectList
-          :projects="projects"
-          :current="currentProjectKey"
-          :state="projectsState"
-          :error="projectsError"
-          @select="selectProject"
-          @retry="loadProjects"
-        />
-      </aside>
+    <main class="shell__main">
+      <nav class="crumbs" aria-label="位置">
+        <button
+          class="crumb"
+          :class="{ 'crumb--on': view === 'projects' }"
+          type="button"
+          @click="backToProjects"
+        >
+          项目
+        </button>
+        <template v-if="currentProject">
+          <span class="crumb__sep" aria-hidden="true">›</span>
+          <button
+            class="crumb"
+            :class="{ 'crumb--on': view === 'requirements' }"
+            type="button"
+            @click="backToList"
+          >
+            {{ currentProject.name }}
+            <span class="crumb__key mono">{{ currentProject.key }}</span>
+          </button>
+        </template>
+        <template v-if="selectedId">
+          <span class="crumb__sep" aria-hidden="true">›</span>
+          <span class="crumb crumb--on mono">{{ selectedId }}</span>
+        </template>
+        <span v-if="currentProject" class="crumbs__repo mono">
+          {{ currentProject.repo || '未登记仓库' }}
+        </span>
+      </nav>
 
-      <main class="shell__main">
-        <div class="pane-head">
-          <h1 class="pane-head__title">
-            {{ currentProject ? currentProject.name : '全部项目' }}
-            <span class="pane-head__sub soft">
-              {{ selectedId ? '需求详情' : '需求列表' }}
-            </span>
-          </h1>
-          <p v-if="currentProject" class="pane-head__repo mono">{{ currentProject.repo || '未登记仓库' }}</p>
-        </div>
+      <ProjectList
+        v-if="view === 'projects'"
+        :projects="projects"
+        :state="projectsState"
+        :error="projectsError"
+        :counts="reqCounts"
+        @select="selectProject"
+        @retry="loadProjects"
+      />
 
-        <RequirementDetailView
-          v-if="selectedId"
-          :detail="detail"
-          :state="detailState"
-          :error="detailError"
-          :submit="submitNodeAction"
-          @back="closeDetail"
-          @retry="loadDetail(selectedId)"
-        />
+      <RequirementDetailView
+        v-else-if="view === 'detail'"
+        :detail="detail"
+        :state="detailState"
+        :error="detailError"
+        :submit="submitNodeAction"
+        @back="backToList"
+        @retry="loadDetail(selectedId)"
+      />
 
-        <RequirementList
-          v-else
-          :requirements="visibleRequirements"
-          :state="requirementsState"
-          :error="requirementsError"
-          :project-key="currentProjectKey"
-          :project-name="currentProject?.name ?? ''"
-          :create="currentProjectKey === '' ? null : createRequirement"
-          @open="openRequirement"
-          @retry="loadRequirements"
-        />
-
-        <EmptyState
-          v-if="!selectedId && requirementsState === 'ready' && projects.length === 0"
-          title="先登记一个项目"
-          hint="链条平台按项目组织需求；右上角「新建项目」填 key、名称与仓库即可开始。"
-          icon="folder"
-        />
-      </main>
-    </div>
+      <RequirementList
+        v-else
+        :requirements="visibleRequirements"
+        :state="requirementsState"
+        :error="requirementsError"
+        :project-key="currentProjectKey"
+        :project-name="currentProject?.name ?? ''"
+        :create="createRequirement"
+        @open="openRequirement"
+        @retry="loadRequirements"
+      />
+    </main>
   </div>
 </template>
 
@@ -189,64 +228,74 @@ async function submitNodeAction(node: Node, action: NodeAction, text: string) {
   min-height: 100vh;
 }
 
-.shell__body {
-  display: grid;
-  grid-template-columns: 268px minmax(0, 1fr);
-  align-items: stretch;
-  flex: 1;
-  min-height: 0;
-}
-
-.shell__rail {
-  border-right: 1px solid var(--border);
-  background: var(--surface);
-}
-
 .shell__main {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-width: 0;
+  width: 100%;
   max-width: 1080px;
-  padding: 16px 20px 40px;
+  margin: 0 auto;
+  padding: 14px 20px 48px;
 }
 
-.pane-head {
+.crumbs {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.pane-head__title {
-  font-size: var(--fs-title);
-  font-weight: 700;
-}
-
-.pane-head__sub {
-  margin-left: 4px;
+  align-items: center;
+  gap: 6px;
   font-size: var(--fs-small);
+}
+
+.crumb {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.crumb:hover {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.crumb--on {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.crumb__sep {
+  color: var(--text-soft);
+}
+
+.crumb__key {
+  color: var(--text-soft);
+  font-size: 11px;
   font-weight: 500;
 }
 
-.pane-head__repo {
+.crumbs__repo {
   margin-left: auto;
-  color: var(--text-muted);
-  font-size: var(--fs-small);
+  color: var(--text-soft);
+  font-size: 11px;
 }
 
-@media (max-width: 900px) {
-  .shell__body {
-    grid-template-columns: 1fr;
-  }
-
-  .shell__rail {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-
+@media (max-width: 720px) {
   .shell__main {
-    padding: 12px 12px 32px;
+    padding: 12px 12px 40px;
+  }
+
+  .crumbs__repo {
+    display: none;
   }
 }
 </style>
