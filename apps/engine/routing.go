@@ -14,6 +14,11 @@ import (
 	"strings"
 )
 
+// 依赖面刻意收窄：这份实现只读文件、解析文本、排序输出，不引入网络与子进程通道
+// （net/http、os/exec、syscall 这一类一个都不许加）。判据在 routing_test.go 里用
+// go/parser 解析 import 集合与调用，**不看注释** —— 所以上面这行写着包名也不会误红；
+// 反过来，真加了 import 就算整个文件都在道歉也照样红。
+
 const (
 	// DefaultRoutingPath 是模型映射真源。
 	DefaultRoutingPath = ".agents/platform/routing.yml"

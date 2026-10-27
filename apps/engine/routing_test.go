@@ -5,10 +5,14 @@ package engine
 
 import (
 	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -402,15 +406,111 @@ func TestRunRoutingCheckFailsOnHardcodedModel(t *testing.T) {
 // 判据本身不许伸手：路由只能来自声明与 workflow 文本。
 // 原来这条读的是 scripts/routing.mjs（脚本已删）；钉的对象换成实现本体，
 // 抓的是同一件事 —— 路由判定没有第二条数据来源（网络 / 子进程 / 环境里的别处）。
+//
+// 判定方式：解析 AST 里的 import 集合与调用，不看源码文本。子串扫全文会把注释当证据 ——
+// 在 routing.go 里写一行「这里不引入 net/http」就会假红，而本仓的立场是假红比真红更坏。
 func TestRoutingHasNoNetworkOrSubprocessChannel(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join(repoRootAbs, "apps", "engine", "routing.go"))
+	file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(repoRootAbs, "apps", "engine", "routing.go"), nil, 0)
 	if err != nil {
-		t.Fatalf("读不到 apps/engine/routing.go: %v", err)
+		t.Fatalf("解析 apps/engine/routing.go 失败: %v", err)
 	}
-	source := string(raw)
-	for _, forbidden := range []string{"net/http", "net\"", "os/exec", "exec.Command", "child_process", "XMLHttpRequest"} {
-		if strings.Contains(source, forbidden) {
-			t.Fatalf("apps/engine/routing.go 不该出现 %q", forbidden)
+
+	// 本地名 -> import 路径：别名 import 也要认出来（ex "os/exec" 仍是子进程通道）。
+	byLocal := map[string]string{}
+	byPath := map[string]bool{}
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("import 路径不是字符串字面量: %v", spec.Path.Value)
+		}
+		local := path
+		if spec.Name != nil {
+			local = spec.Name.Name
+		} else if cut := strings.LastIndex(path, "/"); cut >= 0 {
+			local = path[cut+1:]
+		}
+		byLocal[local] = path
+		byPath[path] = true
+		if reason, forbidden := routingForbiddenImports[path]; forbidden {
+			t.Fatalf("routing.go 不该 import %q：%s", path, reason)
+		}
+		if _, allowed := routingAllowedImports[path]; !allowed {
+			t.Fatalf("routing.go 新增了白名单外的 import %q —— 路由只该读文件、解析文本、排序输出；要放宽先在这里写清它为什么不是第二条数据来源", path)
 		}
 	}
+
+	// 正控：解析真的读到了这份文件。空集合会让上面所有断言恒真。
+	for _, want := range []string{"fmt", "io", "os", "path/filepath", "regexp", "sort", "strings"} {
+		if !byPath[want] {
+			t.Fatalf("解析结果里没有 %q —— 说明这份文件没被读到，判据空转", want)
+		}
+	}
+
+	// 调用面：白名单之后的第二道闸。os 是允许的（读文件要它），但 os.StartProcess 等于自己 fork。
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		holder, ok := selector.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		path, known := byLocal[holder.Name]
+		if !known {
+			return true
+		}
+		for _, forbidden := range routingForbiddenCalls[path] {
+			if selector.Sel.Name == forbidden {
+				t.Fatalf("routing.go 调用了 %s.%s —— 路由判定不许自己伸手（网络 / 子进程）", holder.Name, forbidden)
+			}
+		}
+		return true
+	})
+}
+
+// routingAllowedImports 是完整白名单：只留「读文件 + 解析文本 + 排序输出」需要的东西。
+// 默认拒绝：新增 import 必须同时改这里并写清理由，否则判据红。
+var routingAllowedImports = map[string]struct{}{
+	"fmt":           {},
+	"io":            {},
+	"os":            {},
+	"path/filepath": {},
+	"regexp":        {},
+	"sort":          {},
+	"strings":       {},
+}
+
+// routingForbiddenImports 逐条给理由。白名单已经兜住「任意新增」；这张表是为了让
+// 「网络 / 子进程」被单独想过、让意图可读，而不是靠白名单的沉默去表达。
+var routingForbiddenImports = map[string]string{
+	"net":                   "网络通道：路由只能来自声明与 workflow 文本，不许有第二条数据来源",
+	"net/http":              "HTTP 客户端/服务端：同上，判据不该能访问远端",
+	"net/http/httptest":     "同上（即便只用于测试也不给：routing.go 是生产实现）",
+	"net/http/httputil":     "同上",
+	"net/url":               "URL 解析：路由解析的是 provider/model 名字，没有远端地址要处理；默认禁止，放宽要论证",
+	"net/smtp":              "邮件通道",
+	"net/rpc":               "RPC 通道",
+	"net/mail":              "邮件解析",
+	"net/textproto":         "线协议",
+	"net/netip":             "地址类型：路由里没有 IP 概念",
+	"crypto/tls":            "TLS 只在网络通道里才有意义",
+	"os/exec":               "子进程：路由判定不许启动任何程序",
+	"syscall":               "直接系统调用可以 fork/exec，等价于 os/exec 的后门",
+	"golang.org/x/sys/unix": "同上（第三方 syscall 包）",
+	"plugin":                "运行期加载代码：等于把判据换成别人给的实现",
+}
+
+// routingForbiddenCalls 是调用面：import 白名单挡不住的（os 必须留着读文件），
+// 在这里按「选择子 + 方法名」挡。
+var routingForbiddenCalls = map[string][]string{
+	"os":       {"StartProcess"},
+	"syscall":  {"Exec", "ForkExec", "Execve"},
+	"net":      {"Dial", "DialTimeout", "DialIP", "Listen", "ListenTCP", "ListenUDP"},
+	"net/http": {"Get", "Post", "Head", "Do", "NewRequest", "NewRequestWithContext"},
+	"os/exec":  {"Command", "CommandContext"},
 }
