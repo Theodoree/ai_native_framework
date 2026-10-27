@@ -20,11 +20,29 @@ func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
 	t.Cleanup(func() { store.Close() })
 	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
 	t.Cleanup(ts.Close)
+	seedAllPowers(t, store, "demo")
 	return ts, store, path
 }
 
-// call 发一次请求并解出需求，断言状态码。
+// testRoleToken 是测试里通用的角色口令。
+// 每个起服务的 helper 都会给用到的 project 发一个四权齐全的角色，口令固定成这个值，
+// 省得每条用例都把口令从头传到尾；要测「没带口令」的场景用 callAnon。
+const testRoleToken = "rl_test-all-powers"
+
+// call 发一次请求并解出需求，断言状态码。默认带着通用水口的角色口令。
 func call(t *testing.T, ts *httptest.Server, method, path string, body any, want int) *Requirement {
+	t.Helper()
+	return callAs(t, ts, method, path, testRoleToken, body, want)
+}
+
+// callAnon 是不带角色口令的请求：节点闸门与评论作者都要靠它区分「访客」。
+func callAnon(t *testing.T, ts *httptest.Server, method, path string, body any, want int) *Requirement {
+	t.Helper()
+	return callAs(t, ts, method, path, "", body, want)
+}
+
+// callAs 带指定角色口令发请求，断言状态码。
+func callAs(t *testing.T, ts *httptest.Server, method, path, token string, body any, want int) *Requirement {
 	t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
@@ -35,6 +53,9 @@ func call(t *testing.T, ts *httptest.Server, method, path string, body any, want
 	req, err := http.NewRequest(method, ts.URL+path, &buf)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -132,12 +153,12 @@ func TestFlowRejectAtFirstNodeRejectsRequirement(t *testing.T) {
 	}
 	var human *Comment
 	for i := range got.Node("assess").Comments {
-		if c := got.Node("assess").Comments[i]; c.AuthorType == "human" {
+		if c := got.Node("assess").Comments[i]; c.AuthorType == "role" {
 			human = &c
 		}
 	}
 	if human == nil || human.Verdict != "reject" || human.Body != "这不是需求" {
-		t.Fatalf("拒绝理由应落成人的 reject 评论，实际 %+v", human)
+		t.Fatalf("拒绝理由应落成按角色记的 reject 评论，实际 %+v", human)
 	}
 	last := got.Node("assess").Comments[len(got.Node("assess").Comments)-1]
 	if last.AuthorType != "system" {

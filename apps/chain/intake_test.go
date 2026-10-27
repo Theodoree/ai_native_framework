@@ -26,6 +26,9 @@ func newIntakeServer(t *testing.T) (*httptest.Server, Store) {
 	t.Cleanup(func() { store.Close() })
 	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).WithAdminToken(testAdminToken).Handler())
 	t.Cleanup(ts.Close)
+	// 接入层建的 project 里也会走节点闸门（回告用例要按 accept/reject），
+	// 所以先给 alpha 发一个四权齐全的角色，口令与其余测试共用 testRoleToken。
+	seedAllPowers(t, store, "alpha")
 	return ts, store
 }
 

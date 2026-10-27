@@ -47,6 +47,49 @@ const (
 	VerdictUnknown = "unknown"
 )
 
+// 角色权力是封闭的四个枚举值：一个角色能按哪些站，由它有没有那个权力决定。
+const (
+	PowerReview  = "review"
+	PowerDev     = "dev"
+	PowerTest    = "test"
+	PowerRelease = "release"
+)
+
+var powerNames = map[string]bool{
+	PowerReview: true, PowerDev: true, PowerTest: true, PowerRelease: true,
+}
+
+// ValidPower 说一个权力字符串认不认识。建链与建角色都过这一道：
+// 写进一个认不出的权力，只会造出一站谁也按不动。
+func ValidPower(power string) bool { return powerNames[power] }
+
+// defaultPower 是「不声明就按节点类型给」的那张表。
+// 逐站覆盖是给人的：同一类站在不同链上可能是不同的人把关。
+// create 不在设计给的五行里，按「动手造东西的人」归给 dev——这一条是我的判断。
+var defaultPower = map[string]string{
+	TypeCreate:    PowerDev,
+	TypeAssess:    PowerReview,
+	TypeDev:       PowerDev,
+	TypeCrossTest: PowerTest,
+	TypeMerge:     PowerReview,
+	TypeRelease:   PowerRelease,
+}
+
+// DefaultPower 返回一类节点的默认权力；不认识的类型给空串（调用方按判不了处理）。
+func DefaultPower(nodeType string) string { return defaultPower[nodeType] }
+
+// PowerForNode 说这个节点要哪个权力：节点上声明的优先，否则按类型默认。
+// 改动之前建的库里节点没有 power 列，这里落回类型默认——升级不该把已有需求变成谁也按不动。
+func PowerForNode(n *Node) string {
+	if n == nil {
+		return ""
+	}
+	if n.Power != "" {
+		return n.Power
+	}
+	return DefaultPower(n.Type)
+}
+
 var nodeTypes = map[string]bool{
 	TypeCreate: true, TypeAssess: true, TypeDev: true,
 	TypeCrossTest: true, TypeMerge: true, TypeRelease: true,
@@ -66,6 +109,8 @@ type ChainNode struct {
 	Key    string `json:"key"`
 	Type   string `json:"type"`
 	Review string `json:"review"`
+	// Power 是可选的逐站覆盖：不写就按节点类型的默认权力。
+	Power string `json:"power,omitempty"`
 }
 
 // Chain 是一条链条，版本随定义变化而递增。
@@ -85,6 +130,28 @@ type Project struct {
 	Chains        []Chain   `json:"chains"`
 	IntakeToken   string    `json:"intakeToken,omitempty"`
 	CreatedAt     time.Time `json:"createdAt"`
+}
+
+// Role 是「谁有权按这个 project 的节点」。身份用口令承载，不做账号体系：
+// 拿到口令的人就是这个角色，将来换真账号只改解析口令那一层。
+type Role struct {
+	ID         string   `json:"id"`
+	ProjectKey string   `json:"projectKey"`
+	Name       string   `json:"name"`
+	Powers     []string `json:"powers"`
+	// Token 只在建角色与换口令的响应里出现一次：列表接口不回显。
+	Token     string    `json:"token,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// HasPower 说这个角色有没有某个权力。
+func (r Role) HasPower(power string) bool {
+	for _, p := range r.Powers {
+		if p == power {
+			return true
+		}
+	}
+	return false
 }
 
 // Attempt 是一次执行。重跑会追加新的一条，旧的不覆盖。
@@ -113,9 +180,12 @@ type Comment struct {
 
 // Node 是某条需求站在某一站上的那一份实例。
 type Node struct {
-	Key       string    `json:"key"`
-	Type      string    `json:"type"`
-	Review    string    `json:"review"`
+	Key    string `json:"key"`
+	Type   string `json:"type"`
+	Review string `json:"review"`
+	// Power 是这个节点要的权力。进链时按声明与类型默认定下来存进快照：
+	// 链条后来加了新版本，已经进链的需求不该被改判。
+	Power     string    `json:"power,omitempty"`
 	Index     int       `json:"index"`
 	State     string    `json:"state"`
 	Attempts  []Attempt `json:"attempts"`
@@ -177,6 +247,10 @@ func ValidateChain(c Chain) error {
 		if n.Review == ReviewAI && !IsContainer(n.Type) {
 			return fmt.Errorf("节点 %s 是空节点（%s），没有容器可以自审，审核方只能是 human", n.Key, n.Type)
 		}
+		// 覆盖的权力必须认识：写错一个字母就等于这一站没人按得动。
+		if n.Power != "" && !ValidPower(n.Power) {
+			return fmt.Errorf("节点 %s 的 power 不认识：%s（只能是 review / dev / test / release）", n.Key, n.Power)
+		}
 	}
 	if c.Nodes[0].Type != TypeAssess {
 		return fmt.Errorf("链条的头必须是需求评估，得到 %s", c.Nodes[0].Type)
@@ -210,6 +284,7 @@ func NewRequirement(id string, p *Project, c Chain, context string, images []str
 	for i, n := range c.Nodes {
 		r.Nodes = append(r.Nodes, &Node{
 			Key: n.Key, Type: n.Type, Review: n.Review, Index: i, State: StatePending,
+			Power:    or(n.Power, DefaultPower(n.Type)),
 			Attempts: []Attempt{}, Comments: []Comment{}, Rules: []string{}, Artifacts: []string{},
 		})
 	}
@@ -404,6 +479,12 @@ func lastTemplate(n *Node) string {
 
 // Comment 是给任一节点留一条记录，不改变状态。
 func (r *Requirement) AddComment(key, author, body string, now time.Time) error {
+	return r.AddCommentBy(key, "human", author, body, now)
+}
+
+// AddCommentBy 是评论的落地。评论不校验权力，但作者是谁要如实记下来：
+// 记成 visitor 还是角色名由调用方判定，模型层只负责存。
+func (r *Requirement) AddCommentBy(key, authorType, author, body string, now time.Time) error {
 	n := r.Node(key)
 	if n == nil {
 		return fmt.Errorf("没有这个节点：%s", key)
@@ -411,7 +492,7 @@ func (r *Requirement) AddComment(key, author, body string, now time.Time) error 
 	if body == "" {
 		return errors.New("评论不能为空")
 	}
-	n.Comments = append(n.Comments, Comment{ID: newID("c"), AuthorType: "human", Author: author, Body: body, At: now})
+	n.Comments = append(n.Comments, Comment{ID: newID("c"), AuthorType: authorType, Author: author, Body: body, At: now})
 	n.Rev++
 	r.touch(now)
 	return nil

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -36,7 +39,29 @@ func newReviewServer(t *testing.T, c Chain, exec Executor) (*httptest.Server, St
 	if err := store.SaveProject(&p); err != nil {
 		t.Fatal(err)
 	}
+	seedAllPowers(t, store, "demo")
 	return ts, store
+}
+
+// seedRole 直接往库里落一个角色。这里测的是节点闸门，不是建角色那道门，
+// 所以不走管理口令，省掉一层与判据无关的接线。
+func seedRole(t *testing.T, store Store, projectKey, name, token string, powers ...string) Role {
+	t.Helper()
+	r := Role{
+		ID: newID("r"), ProjectKey: projectKey, Name: name, Powers: powers,
+		Token: token, CreatedAt: time.Now(),
+	}
+	if err := store.SaveRole(r); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// seedAllPowers 发一个四权齐全的角色，口令是 testRoleToken。
+func seedAllPowers(t *testing.T, store Store, projectKey string) Role {
+	t.Helper()
+	return seedRole(t, store, projectKey, "测试角色", testRoleToken,
+		PowerReview, PowerDev, PowerTest, PowerRelease)
 }
 
 func submit(t *testing.T, ts *httptest.Server, context string) *Requirement {
@@ -248,5 +273,348 @@ func TestParseVerdict(t *testing.T) {
 				t.Fatalf("期望 (%s,%q)，实际 (%s,%q)", c.verdict, c.reason, v, r)
 			}
 		})
+	}
+}
+
+// ---- 角色与闸门 ----
+// 这一组用例钉的是设计里那 8 条判据：谁能按、按的人记成谁、口令怎么换、口令怎么不外泄。
+// 文案是被断言的对象，不是提示语——前端靠这三句区分「该去建角色」还是「该换口令」。
+
+// roleChain 是一条三站链：assess 要 review、dev 要 dev、release 要 release。
+func roleChain() Chain {
+	return chainOf(
+		cn("assess", TypeAssess, ReviewHuman),
+		cn("dev", TypeDev, ReviewHuman),
+		cn("release", TypeRelease, ReviewHuman),
+	)
+}
+
+// newRoleServer 起一个开了管理口令的服务，用来测建 / 列 / 删 / 换口令这四条管理接口。
+func newRoleServer(t *testing.T) (*httptest.Server, Store) {
+	t.Helper()
+	store, err := OpenStore("sqlite", filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).WithAdminToken(testAdminToken).Handler())
+	t.Cleanup(ts.Close)
+	p := Project{Key: "demo", Name: "Demo", Repo: "o/r", DefaultBranch: "main",
+		Chains: []Chain{roleChain()}, CreatedAt: time.Now()}
+	if err := store.SaveProject(&p); err != nil {
+		t.Fatal(err)
+	}
+	return ts, store
+}
+
+// callRaw 只断言状态码，不解响应体：删除角色这类 204 是空响应，解 JSON 反而会挡住。
+func callRaw(t *testing.T, ts *httptest.Server, method, path, token string, body any, want int) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, err := http.NewRequest(method, ts.URL+path, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	out, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != want {
+		t.Fatalf("%s %s 期望 %d，实际 %d：%s", method, path, want, res.StatusCode, out)
+	}
+	return string(out)
+}
+
+// runAt 在指定节点上发起一个动作，带指定口令，要求 403 并返回错误文案。
+func runAt(t *testing.T, ts *httptest.Server, id, node, action, token string) string {
+	t.Helper()
+	path := "/api/requirements/" + id + "/nodes/" + node + "/" + action
+	return callRaw(t, ts, "POST", path, token, map[string]any{}, 403)
+}
+
+func TestRoleGateNeedsToken(t *testing.T) {
+	ts, _ := newReviewServer(t, roleChain(), FakeExecutor{})
+	req := submit(t, ts, "加个按钮")
+	errText := runAt(t, ts, req.ID, "assess", "run", "")
+	if !strings.Contains(errText, "这个动作需要一个带 review 权力的角色口令") {
+		t.Fatalf("没带口令应当按这一站的权力说清楚，实际 %s", errText)
+	}
+	// 反向自证：同一个请求带上四权齐全的口令就放行，说明 403 来自闸门而不是别处。
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/run", testRoleToken, map[string]any{}, 200)
+}
+
+func TestRoleGateRejectsRoleFromOtherProject(t *testing.T) {
+	ts, store := newReviewServer(t, roleChain(), FakeExecutor{})
+	seedRole(t, store, "other", "别的项目的角色", "rl_other_project", PowerReview, PowerDev, PowerRelease)
+	req := submit(t, ts, "加个按钮")
+	errText := runAt(t, ts, req.ID, "assess", "run", "rl_other_project")
+	if !strings.Contains(errText, "角色属于 other，这条需求在 demo") {
+		t.Fatalf("跨项目应当点名两个 project，实际 %s", errText)
+	}
+}
+
+func TestRoleGateNeedsMatchingPower(t *testing.T) {
+	ts, store := newReviewServer(t, roleChain(), FakeExecutor{})
+	seedRole(t, store, "demo", "张三", "rl_zhangsan", PowerReview)
+	req := submit(t, ts, "加个按钮")
+	// assess 要 review：张三有 review，放行。
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/run", "rl_zhangsan", map[string]any{}, 200)
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/accept", "rl_zhangsan", map[string]any{"comment": "评估通过"}, 200)
+	errText := runAt(t, ts, req.ID, "dev", "run", "rl_zhangsan")
+	if !strings.Contains(errText, "角色「张三」没有 dev 权力，不能在这个节点上确认/拒绝") {
+		t.Fatalf("缺权力应当点名角色名与权力，实际 %s", errText)
+	}
+}
+
+func TestRoleGateAcceptsAndRecordsRoleAuthor(t *testing.T) {
+	ts, store := newReviewServer(t, roleChain(), FakeExecutor{})
+	seedRole(t, store, "demo", "李四", "rl_lisi", PowerReview, PowerDev, PowerRelease)
+	req := submit(t, ts, "加个按钮")
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/run", "rl_lisi", map[string]any{}, 200)
+	got := callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/accept", "rl_lisi",
+		map[string]any{"comment": "评估通过"}, 200)
+	c := lastComment(nodeOf(t, got, "assess"))
+	if c.AuthorType != "role" || c.Author != "李四" || c.Verdict != "approve" {
+		t.Fatalf("过了闸门就该按角色记作者，实际 %+v", c)
+	}
+}
+
+func TestRoleCommentWithoutTokenIsVisitor(t *testing.T) {
+	ts, _ := newReviewServer(t, roleChain(), FakeExecutor{})
+	req := submit(t, ts, "加个按钮")
+	got := callAnon(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/comment",
+		map[string]any{"body": "我先看看"}, 200)
+	c := lastComment(nodeOf(t, got, "assess"))
+	if c.AuthorType != "visitor" || c.Author != "visitor" || c.Body != "我先看看" {
+		t.Fatalf("不带口令的评论应当记成访客，实际 %+v", c)
+	}
+}
+
+func TestRoleCommentWithTokenRecordsRole(t *testing.T) {
+	ts, store := newReviewServer(t, roleChain(), FakeExecutor{})
+	seedRole(t, store, "demo", "王五", "rl_wangwu", PowerTest)
+	req := submit(t, ts, "加个按钮")
+	got := callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/comment", "rl_wangwu",
+		map[string]any{"body": "测试角度说一句"}, 200)
+	c := lastComment(nodeOf(t, got, "assess"))
+	if c.AuthorType != "role" || c.Author != "王五" {
+		t.Fatalf("带口令的评论应当记成角色，实际 %+v", c)
+	}
+	// 评论不看权力：只有 test 权力的角色也能在 review 站说话，只是不能按。
+	if c.Body != "测试角度说一句" {
+		t.Fatalf("评论正文应当原样留下，实际 %q", c.Body)
+	}
+}
+
+func TestRoleNodePowerOverride(t *testing.T) {
+	// 链条作者把 dev 站要的权力改成 test：这一站就认 test，不认 dev。
+	c := chainOf(
+		cn("assess", TypeAssess, ReviewHuman),
+		ChainNode{Key: "dev", Type: TypeDev, Review: ReviewHuman, Power: PowerTest},
+		cn("release", TypeRelease, ReviewHuman),
+	)
+	ts, store := newReviewServer(t, c, FakeExecutor{})
+	seedRole(t, store, "demo", "只懂测试", "rl_only_test", PowerTest)
+	seedRole(t, store, "demo", "只懂开发", "rl_only_dev", PowerDev)
+	req := submit(t, ts, "加个按钮")
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/run", testRoleToken, map[string]any{}, 200)
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/accept", testRoleToken,
+		map[string]any{"comment": "评估通过"}, 200)
+	// dev 站覆盖成 test：只有 test 权力的人能按，只有 dev 权力的人被挡。
+	if errText := runAt(t, ts, req.ID, "dev", "run", "rl_only_dev"); !strings.Contains(errText, "没有 test 权力") {
+		t.Fatalf("覆盖权力后应当按 test 判，实际 %s", errText)
+	}
+	got := callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/dev/run", "rl_only_test", map[string]any{}, 200)
+	if nodeOf(t, got, "dev").State != StateRunning {
+		t.Fatalf("有 test 权力的人应当能动手，实际 %s", nodeOf(t, got, "dev").State)
+	}
+}
+
+func TestRoleCreateChecksInput(t *testing.T) {
+	ts, _ := newRoleServer(t)
+	path := "/api/p/demo/roles"
+	body := map[string]any{"name": "张三", "powers": []string{"review"}}
+	// 管理接口吃的是 project 管理口令，不是角色口令。
+	callRaw(t, ts, "POST", path, "", body, 401)
+	callRaw(t, ts, "POST", path, testRoleToken, body, 401)
+	callRaw(t, ts, "POST", path, "wrong", body, 401)
+	callRaw(t, ts, "POST", path, testAdminToken, map[string]any{"name": "", "powers": []string{"review"}}, 400)
+	callRaw(t, ts, "POST", path, testAdminToken, map[string]any{"name": "张三", "powers": []string{}}, 400)
+	callRaw(t, ts, "POST", path, testAdminToken, map[string]any{"name": "张三", "powers": []string{"ops"}}, 400)
+	token := createdToken(t, callRaw(t, ts, "POST", path, testAdminToken, body, 201))
+	if !strings.HasPrefix(token, "rl_") {
+		t.Fatalf("建角色应当发一个 rl_ 开头的口令，实际 %q", token)
+	}
+	// 同名再来一个：评论里记的是角色名，重名就分不清是谁按的。
+	callRaw(t, ts, "POST", path, testAdminToken, body, 400)
+	// 不存在的 project 建不了角色。
+	callRaw(t, ts, "POST", "/api/p/nope/roles", testAdminToken, body, 404)
+}
+
+// createdToken 从建角色的响应里取口令。
+func createdToken(t *testing.T, raw string) string {
+	t.Helper()
+	var r Role
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		t.Fatal(err)
+	}
+	return r.Token
+}
+
+func TestRoleListHidesToken(t *testing.T) {
+	ts, _ := newRoleServer(t)
+	callRaw(t, ts, "POST", "/api/p/demo/roles", testAdminToken,
+		map[string]any{"name": "张三", "powers": []string{"review", "dev"}}, 201)
+	raw := callRaw(t, ts, "GET", "/api/p/demo/roles", testAdminToken, nil, 200)
+	if strings.Contains(raw, "rl_") || strings.Contains(raw, "token") {
+		t.Fatalf("列表不该回显口令，实际 %s", raw)
+	}
+	var roles []Role
+	if err := json.Unmarshal([]byte(raw), &roles); err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 1 || roles[0].Name != "张三" || len(roles[0].Powers) != 2 {
+		t.Fatalf("列表应当给出角色名与权力，实际 %+v", roles)
+	}
+	// 没带管理口令看不到角色表。
+	callRaw(t, ts, "GET", "/api/p/demo/roles", "", nil, 401)
+}
+
+func TestRoleRotateInvalidatesOldToken(t *testing.T) {
+	ts, _ := newRoleServer(t)
+	created := callRaw(t, ts, "POST", "/api/p/demo/roles", testAdminToken,
+		map[string]any{"name": "张三", "powers": []string{"review"}}, 201)
+	var role Role
+	if err := json.Unmarshal([]byte(created), &role); err != nil {
+		t.Fatal(err)
+	}
+	rotated := callRaw(t, ts, "POST", "/api/p/demo/roles/"+role.ID+"/rotate", testAdminToken, nil, 200)
+	var fresh Role
+	if err := json.Unmarshal([]byte(rotated), &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Token == role.Token || !strings.HasPrefix(fresh.Token, "rl_") {
+		t.Fatalf("换口令应当发一个新的 rl_ 口令，实际 %q", fresh.Token)
+	}
+	req := submit(t, ts, "加个按钮")
+	// 旧口令立刻失效。
+	if errText := runAt(t, ts, req.ID, "assess", "run", role.Token); !strings.Contains(errText, "这个动作需要一个带 review 权力的角色口令") {
+		t.Fatalf("旧口令应当认不出来，实际 %s", errText)
+	}
+	// 新口令能用。
+	callAs(t, ts, "POST", "/api/requirements/"+req.ID+"/nodes/assess/run", fresh.Token, map[string]any{}, 200)
+}
+
+func TestRoleDeleteRemovesToken(t *testing.T) {
+	ts, _ := newRoleServer(t)
+	created := callRaw(t, ts, "POST", "/api/p/demo/roles", testAdminToken,
+		map[string]any{"name": "张三", "powers": []string{"review"}}, 201)
+	var role Role
+	if err := json.Unmarshal([]byte(created), &role); err != nil {
+		t.Fatal(err)
+	}
+	callRaw(t, ts, "DELETE", "/api/p/demo/roles/"+role.ID, testAdminToken, nil, 204)
+	req := submit(t, ts, "加个按钮")
+	if errText := runAt(t, ts, req.ID, "assess", "run", role.Token); !strings.Contains(errText, "这个动作需要一个带 review 权力的角色口令") {
+		t.Fatalf("删掉的角色不该还能按，实际 %s", errText)
+	}
+	callRaw(t, ts, "DELETE", "/api/p/demo/roles/"+role.ID, testAdminToken, nil, 404)
+	// 别的 project 的管理口令不能删这个 project 的角色。
+	created2 := callRaw(t, ts, "POST", "/api/p/demo/roles", testAdminToken,
+		map[string]any{"name": "李四", "powers": []string{"review"}}, 201)
+	var role2 Role
+	if err := json.Unmarshal([]byte(created2), &role2); err != nil {
+		t.Fatal(err)
+	}
+	callRaw(t, ts, "POST", "/api/intake/projects", testAdminToken, map[string]any{"key": "other", "repo": "/tmp/other"}, 201)
+	callRaw(t, ts, "DELETE", "/api/p/other/roles/"+role2.ID, testAdminToken, nil, 404)
+	callRaw(t, ts, "DELETE", "/api/p/demo/roles/"+role2.ID, testAdminToken, nil, 204)
+}
+
+func TestStoreRolesRoundTrip(t *testing.T) {
+	store, err := OpenStore("sqlite", filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	if err := store.SaveRole(Role{ID: "r-1", ProjectKey: "demo", Name: "张三",
+		Powers: []string{PowerReview, PowerTest}, Token: "rl_one", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.RoleByToken("rl_one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "张三" || len(got.Powers) != 2 || !got.HasPower(PowerTest) || got.HasPower(PowerDev) {
+		t.Fatalf("角色应当原样读回来，实际 %+v", got)
+	}
+	// 口令不认识与口令为空是两种拒绝，都必须报错而不是给一个空角色。
+	if _, err := store.RoleByToken("rl_nope"); err == nil {
+		t.Fatal("不认识的口令应当报错")
+	} else if strings.Contains(err.Error(), "rl_nope") {
+		t.Fatalf("错误文案不该带口令，实际 %q", err)
+	}
+	if _, err := store.RoleByToken(""); err == nil {
+		t.Fatal("没有口令应当报错")
+	}
+	if _, err := store.Role("r-nope"); err == nil {
+		t.Fatal("没有这个角色应当报错")
+	}
+	// 换一个 project 的角色表互不串。
+	if err := store.SaveRole(Role{ID: "r-2", ProjectKey: "other", Name: "李四",
+		Powers: []string{PowerDev}, Token: "rl_two", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	roles, err := store.Roles("demo")
+	if err != nil || len(roles) != 1 || roles[0].ID != "r-1" {
+		t.Fatalf("按 project 列角色只该给这个 project 的，实际 %v %+v", err, roles)
+	}
+}
+
+func TestOpenStoreAddsRolesTableToOldDatabase(t *testing.T) {
+	// 老库只有 projects 表：roles 表靠 CREATE TABLE IF NOT EXISTS 补上，不需要 ALTER。
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE projects (
+  key TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL,
+  default_branch TEXT NOT NULL, chains TEXT NOT NULL, created_at TEXT NOT NULL)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore("sqlite", path)
+	if err != nil {
+		t.Fatalf("老库应当被补表后可用：%v", err)
+	}
+	defer store.Close()
+	if err := store.SaveRole(Role{ID: "r-1", ProjectKey: "old", Name: "张三",
+		Powers: []string{PowerReview}, Token: "rl_old", CreatedAt: time.Now()}); err != nil {
+		t.Fatalf("老库应当能写角色：%v", err)
+	}
+	role, err := store.RoleByToken("rl_old")
+	if err != nil || role.Name != "张三" {
+		t.Fatalf("老库应当能读角色：%v %+v", err, role)
 	}
 }

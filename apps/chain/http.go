@@ -100,6 +100,12 @@ func (s *Server) mount(r *ginRouter) {
 	handle("POST", "/api/requirements/:id/nodes/:node/comment", s.nodeComment)
 	handle("POST", "/api/requirements/:id/nodes/:node/rules", s.nodeRule)
 
+	// 角色管理走 project 管理口令，不走角色权力：否则有权力的人能给自己发角色。
+	handle("POST", "/api/p/:project/roles", s.createRole)
+	handle("GET", "/api/p/:project/roles", s.listRoles)
+	handle("POST", "/api/p/:project/roles/:id/rotate", s.rotateRole)
+	handle("DELETE", "/api/p/:project/roles/:id", s.deleteRole)
+
 	// 接入层：给平台外的人用。只认 project 口令，不认人。
 	handle("POST", "/api/intake/projects", s.intakeCreateProject)
 	handle("GET", "/api/intake/projects", s.intakeListProjects)
@@ -400,7 +406,11 @@ type nodeBody struct {
 }
 
 func (s *Server) nodeRun(c *gin.Context) {
-	req, n, body, ok := s.prepare(c)
+	req, n, _, ok := s.prepare(c)
+	if !ok {
+		return
+	}
+	role, ok := s.requirePower(c, req, n)
 	if !ok {
 		return
 	}
@@ -409,7 +419,7 @@ func (s *Server) nodeRun(c *gin.Context) {
 		fail(c, 409, err.Error())
 		return
 	}
-	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, body.Author)
+	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, role.Name)
 	// 整条需求被拒时才回告：回告写在落库之后。
 	rejectWhole := ""
 	if IsContainer(n.Type) {
@@ -453,8 +463,13 @@ func (s *Server) nodeAccept(c *gin.Context) {
 	if !ok {
 		return
 	}
+	role, ok := s.requirePower(c, req, n)
+	if !ok {
+		return
+	}
 	from := n.State
-	comment := Comment{ID: newID("c"), AuthorType: "human", Author: or(body.Author, "human"), Body: body.Comment, At: s.now()}
+	// 按的人是谁记成角色：过了闸门就一定有角色，不再退回到「human」这种泛称。
+	comment := Comment{ID: newID("c"), AuthorType: "role", Author: role.Name, Body: body.Comment, At: s.now()}
 	if err := req.Accept(n.Key, comment, s.now()); err != nil {
 		fail(c, 409, err.Error())
 		return
@@ -472,9 +487,13 @@ func (s *Server) nodeReject(c *gin.Context) {
 	if !ok {
 		return
 	}
+	role, ok := s.requirePower(c, req, n)
+	if !ok {
+		return
+	}
 	from := n.State
 	reason := or(body.Reason, body.Body)
-	if err := req.Reject(n.Key, reason, or(body.Author, "human"), s.now()); err != nil {
+	if err := req.RejectBy(n.Key, reason, "role", role.Name, s.now()); err != nil {
 		fail(c, 409, err.Error())
 		return
 	}
@@ -499,7 +518,12 @@ func (s *Server) nodeComment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := req.AddComment(n.Key, or(body.Author, "human"), body.Body, s.now()); err != nil {
+	// 评论不校验权力：谁都能说话。带了认得出的角色口令就记成那个角色，没带就是访客。
+	author, authorType := "visitor", "visitor"
+	if role, ok := s.roleFrom(c); ok {
+		author, authorType = role.Name, "role"
+	}
+	if err := req.AddCommentBy(n.Key, authorType, author, body.Body, s.now()); err != nil {
 		fail(c, 409, err.Error())
 		return
 	}

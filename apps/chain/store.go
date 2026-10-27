@@ -27,6 +27,15 @@ type Store interface {
 	Requirement(id string) (*Requirement, error)
 	Requirements() ([]*Requirement, error)
 
+	// 角色是 project 级的：谁有权按这个 project 的节点，由角色的权力决定。
+	// 找不到必须报错，不能返回空 Role + nil——空角色在闸门上会被当成「有角色但没权力」，
+	// 与「这个口令不认识」是两种拒绝，混起来就没人能说清为什么被挡。
+	SaveRole(r Role) error
+	Role(id string) (Role, error)
+	Roles(projectKey string) ([]Role, error)
+	DeleteRole(id string) error
+	RoleByToken(token string) (Role, error)
+
 	// AppendEvent 只追加，不改不删：事件流是历史，不是快照。
 	AppendEvent(Event) error
 	Events(id string) ([]Event, error)

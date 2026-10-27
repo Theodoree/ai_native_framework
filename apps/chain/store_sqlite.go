@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   key       TEXT NOT NULL,
   type      TEXT NOT NULL,
   review    TEXT NOT NULL,
+  power     TEXT NOT NULL DEFAULT '',
   idx       INTEGER NOT NULL,
   state     TEXT NOT NULL,
   rules     TEXT NOT NULL,
@@ -92,6 +93,15 @@ CREATE TABLE IF NOT EXISTS comments (
   at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS comments_by_node ON comments(req_id, node_key, seq);
+
+CREATE TABLE IF NOT EXISTS roles (
+  id          TEXT PRIMARY KEY,
+  project_key TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  powers      TEXT NOT NULL,
+  token       TEXT NOT NULL UNIQUE,
+  created_at  TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS events (
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +146,7 @@ func migrate(db *sql.DB) error {
 	for _, stmt := range []string{
 		`ALTER TABLE projects ADD COLUMN intake_token TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE requirements ADD COLUMN reporter TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE nodes ADD COLUMN power TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("补列失败：%w", err)
@@ -265,9 +276,9 @@ ON CONFLICT(id) DO UPDATE SET
 			return err
 		}
 		if _, err := tx.Exec(`
-INSERT INTO nodes (req_id, key, type, review, idx, state, rules, artifacts, rev)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			r.ID, n.Key, n.Type, n.Review, n.Index, n.State, rules, artifacts, n.Rev); err != nil {
+INSERT INTO nodes (req_id, key, type, review, power, idx, state, rules, artifacts, rev)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.ID, n.Key, n.Type, n.Review, n.Power, n.Index, n.State, rules, artifacts, n.Rev); err != nil {
 			return err
 		}
 		for _, a := range n.Attempts {
@@ -331,7 +342,7 @@ FROM requirements WHERE id = ?`, id).
 // loadNodes 一次把节点、执行、评论都取回来再在内存里拼，避免每站一次查询。
 func (s *sqliteStore) loadNodes(reqID string) ([]*Node, error) {
 	rows, err := s.db.Query(`
-SELECT key, type, review, idx, state, rules, artifacts, rev FROM nodes WHERE req_id = ? ORDER BY idx`, reqID)
+SELECT key, type, review, power, idx, state, rules, artifacts, rev FROM nodes WHERE req_id = ? ORDER BY idx`, reqID)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +351,7 @@ SELECT key, type, review, idx, state, rules, artifacts, rev FROM nodes WHERE req
 	for rows.Next() {
 		n := &Node{}
 		var rules, artifacts string
-		if err := rows.Scan(&n.Key, &n.Type, &n.Review, &n.Index, &n.State, &rules, &artifacts, &n.Rev); err != nil {
+		if err := rows.Scan(&n.Key, &n.Type, &n.Review, &n.Power, &n.Index, &n.State, &rules, &artifacts, &n.Rev); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -471,4 +482,103 @@ SELECT at, node, action, from_state, to_state, detail FROM events WHERE req_id =
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// SaveRole 建角色或换口令都走这一句：口令改了就覆盖，旧口令随之失效。
+func (s *sqliteStore) SaveRole(r Role) error {
+	powers, err := encodeList(r.Powers)
+	if err != nil {
+		return err
+	}
+	if r.Powers == nil {
+		powers = "[]"
+	}
+	_, err = s.db.Exec(`
+INSERT INTO roles (id, project_key, name, powers, token, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  project_key = excluded.project_key, name = excluded.name, powers = excluded.powers,
+  token = excluded.token, created_at = excluded.created_at`,
+		r.ID, r.ProjectKey, r.Name, powers, r.Token, formatTime(r.CreatedAt))
+	return err
+}
+
+func (s *sqliteStore) Role(id string) (Role, error) {
+	return s.roleBy("id = ?", id, "没有这个角色："+id)
+}
+
+// RoleByToken 是闸门唯一的身份入口。找不到就报错，不返回空角色：
+// 「这个口令不认识」与「认识但没有权力」是两种拒绝，混起来就没人能说清为什么被挡。
+func (s *sqliteStore) RoleByToken(token string) (Role, error) {
+	if token == "" {
+		return Role{}, errors.New("没有角色口令")
+	}
+	// 口令不进错误文案：错误会被写进日志与响应，口令不该跟着出去。
+	return s.roleBy("token = ?", token, "角色口令不认识")
+}
+
+func (s *sqliteStore) roleBy(where string, arg any, missing string) (Role, error) {
+	r := Role{}
+	var powers, created string
+	err := s.db.QueryRow(`
+SELECT id, project_key, name, powers, token, created_at FROM roles WHERE `+where, arg).
+		Scan(&r.ID, &r.ProjectKey, &r.Name, &powers, &r.Token, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Role{}, errors.New(missing)
+	}
+	if err != nil {
+		return Role{}, err
+	}
+	r.CreatedAt = parseTime(created)
+	if err := decodeList(powers, &r.Powers); err != nil {
+		return Role{}, err
+	}
+	if r.Powers == nil {
+		r.Powers = []string{}
+	}
+	return r, nil
+}
+
+func (s *sqliteStore) Roles(projectKey string) ([]Role, error) {
+	rows, err := s.db.Query(`SELECT id FROM roles WHERE project_key = ? ORDER BY created_at, id`, projectKey)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := []Role{}
+	for _, id := range ids {
+		r, err := s.Role(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (s *sqliteStore) DeleteRole(id string) error {
+	res, err := s.db.Exec(`DELETE FROM roles WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("没有这个角色：" + id)
+	}
+	return nil
 }

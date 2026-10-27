@@ -1,6 +1,6 @@
 # 角色：权力挂在节点上，身份用口令承载
 
-状态：proposed（2026-10-27，方案已定，实现待 t33）
+状态：implemented（2026-10-27，t33 已实现并通过黑盒复验）
 相关模块：`apps/chain`（model / store / http）
 
 ## 需求原话
@@ -61,3 +61,29 @@ roles(id TEXT PK, project_key TEXT, name TEXT, powers TEXT /* JSON string[] */, 
 - 口令无过期、无审计（谁在什么时候用哪个口令做了什么，只有节点评论这一条痕迹）。
 - 一个请求只能是一个角色，没有"多角色合并"。
 - 没有角色 → 项目所有人按不动，首次配置靠 403 文案指路。
+## 落地记录（t33，2026-10-27）
+
+**代码落点**：`apps/chain/roles.go`（新建：四种管理动作 + `roleFrom` 唯一解析点 + `requirePower` 闸门 + 三条 403 文案常量）、`model.go`（四权力常量、`defaultPower` 表、`PowerForNode`、`Role`/`HasPower`、`Node.Power`/`ChainNode.Power`）、`store.go`/`store_sqlite.go`（`roles` 表 + 五个存储方法 + `nodes.power` 列的 ALTER 迁移）。
+
+**进链时把权力定死**：`NewRequirement` 就把每站的 power 写进快照，之后链条改版不影响已在飞的需求。
+
+**黑盒复验（我自己跑，不是自述）**：起真服务 `-admin-token admin1`，逐条探：
+
+| 动作 | 结果 |
+| --- | --- |
+| 无口令 run | 403 `这个动作需要一个带 review 权力的角色口令` |
+| 只 `test` 权力的角色 run assess | 403 `角色「测试员」没有 review 权力，不能在这个节点上确认/拒绝` |
+| `review` 权力角色 run/accept assess | 200，评论作者 `role/审核员`、verdict `approve` |
+| 拿 beta 的角色操作 alpha 的需求 | 403 `角色属于 beta，这条需求在 alpha` |
+| 列角色 | 200，响应体**不含** `rl_` |
+| 换口令 | 旧口令 403（不再被认作任何角色），新口令过闸门（落到 409 状态冲突，说明权力已通过） |
+| 匿名评论 / 角色评论 | 200 `visitor/visitor` / 200 `role/测试员2` |
+| 非法权力值 | 400 `不认识的权力：bogus（只能是 review / dev / test / release）` |
+
+**已知代价（未解）**：不给 `-admin-token` 的部署里，角色管理接口返 503，于是建不出角色 → 所有动作 403，整条链按不动。这是"建角色必须用管理口令"的直接后果，处置见下一节。
+
+## 待办：没有管理口令时的引导
+
+单机跑起来（`-exec fake` 什么都不配）是最常见的第一次体验，不能让它卡在"建不出角色"。方案：建 project 的响应里带回一个 `owner` 角色口令（四个权力全给），只显示这一次。
+
+理由是它与现有的信任模型一致：`POST /api/projects` 本来就不需要认证，谁能建项目谁就拿到这个项目的钥匙。**不**放宽"角色管理需要管理口令"，否则那一条就成了摆设。
