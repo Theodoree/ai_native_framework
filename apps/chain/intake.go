@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // 接入层是平台对外的唯一入口：认身份（project key + 访问口令）、把需求塞进链、
@@ -66,42 +68,42 @@ type intakeCallbackBody struct {
 	Reason      string `json:"reason"`
 }
 
-func (s *Server) intakeCreateProject(w http.ResponseWriter, r *http.Request) {
-	if !s.adminGate(w, r) {
+func (s *Server) intakeCreateProject(c *gin.Context) {
+	if !s.adminGate(c) {
 		return
 	}
 	var in intakeNewProject
-	if err := decode(r, &in); err != nil {
-		fail(w, 400, err.Error())
+	if err := decode(c.Request, &in); err != nil {
+		fail(c, 400, err.Error())
 		return
 	}
 	key := strings.TrimSpace(in.Key)
 	if key == "" {
-		fail(w, 400, "project key 不能为空：需求接口靠它定位项目")
+		fail(c, 400, "project key 不能为空：需求接口靠它定位项目")
 		return
 	}
 	if _, err := s.store.Project(key); err == nil {
-		fail(w, 409, "这个 project 已经有了："+key)
+		fail(c, 409, "这个 project 已经有了："+key)
 		return
 	}
 	repo := strings.TrimSpace(in.Repo)
 	if repo == "" {
-		fail(w, 400, "repo 不能为空：容器执行要把它挂进容器")
+		fail(c, 400, "repo 不能为空：容器执行要把它挂进容器")
 		return
 	}
 	chains := in.Chains
 	if len(chains) == 0 {
 		chains = []Chain{DefaultChain()}
 	}
-	for _, c := range chains {
-		if err := ValidateChain(c); err != nil {
-			fail(w, 400, fmt.Sprintf("链条不合法（%s）：%s", c.Key, err))
+	for _, ch := range chains {
+		if err := ValidateChain(ch); err != nil {
+			fail(c, 400, fmt.Sprintf("链条不合法（%s）：%s", ch.Key, err))
 			return
 		}
 	}
 	token, err := newIntakeToken()
 	if err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
 	p := &Project{
@@ -110,61 +112,61 @@ func (s *Server) intakeCreateProject(w http.ResponseWriter, r *http.Request) {
 		IntakeToken: token, CreatedAt: s.now(),
 	}
 	if err := s.store.SaveProject(p); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 201, intakeCreatedProject{Key: p.Key, IntakeToken: token, Chains: p.Chains})
+	writeJSON(c, 201, intakeCreatedProject{Key: p.Key, IntakeToken: token, Chains: p.Chains})
 }
 
-func (s *Server) intakeListProjects(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.projectByToken(w, r)
+func (s *Server) intakeListProjects(c *gin.Context) {
+	p, ok := s.projectByToken(c)
 	if !ok {
 		return
 	}
-	writeJSON(w, 200, intakeProjectView{Key: p.Key, Name: p.Name, DefaultBranch: p.DefaultBranch, Chains: p.Chains})
+	writeJSON(c, 200, intakeProjectView{Key: p.Key, Name: p.Name, DefaultBranch: p.DefaultBranch, Chains: p.Chains})
 }
 
-func (s *Server) intakeCreateRequirement(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.projectByToken(w, r)
+func (s *Server) intakeCreateRequirement(c *gin.Context) {
+	p, ok := s.projectByToken(c)
 	if !ok {
 		return
 	}
 	var in intakeNewRequirement
-	if err := decode(r, &in); err != nil {
-		fail(w, 400, err.Error())
+	if err := decode(c.Request, &in); err != nil {
+		fail(c, 400, err.Error())
 		return
 	}
 	context := strings.TrimSpace(in.Context)
 	if context == "" {
-		fail(w, 400, "需求内容不能为空")
+		fail(c, 400, "需求内容不能为空")
 		return
 	}
-	c, err := pickChain(p, in.Chain)
+	chain, err := pickChain(p, in.Chain)
 	if err != nil {
-		fail(w, 400, err.Error())
+		fail(c, 400, err.Error())
 		return
 	}
-	req := NewRequirement(newID("REQ"), p, c, context, in.Images, "intake", s.now())
+	req := NewRequirement(newID("REQ"), p, chain, context, in.Images, "intake", s.now())
 	req.Reporter = in.Reporter
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
 	s.logEvent(req, "", "intake", "", req.State, "接入层收到需求")
-	writeJSON(w, 201, s.intakeView(req))
+	writeJSON(c, 201, s.intakeView(req))
 }
 
-func (s *Server) intakeGetRequirement(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.projectByToken(w, r)
+func (s *Server) intakeGetRequirement(c *gin.Context) {
+	p, ok := s.projectByToken(c)
 	if !ok {
 		return
 	}
-	req, err := s.store.Requirement(r.PathValue("id"))
+	req, err := s.store.Requirement(c.Param("id"))
 	if err != nil || req.ProjectKey != p.Key {
-		fail(w, 404, "没有这条需求")
+		fail(c, 404, "没有这条需求")
 		return
 	}
-	writeJSON(w, 200, s.intakeView(req))
+	writeJSON(c, 200, s.intakeView(req))
 }
 
 // intakeView 是给外部看的那一份：只回答「到哪一步了、成没成、为什么」。
@@ -240,28 +242,28 @@ func (s *Server) deliverCallback(req *Requirement, nodeKey, reason string) {
 
 // adminGate 管「建 project」这一个动作。没配 -admin-token 就整条关掉：
 // 接入层默认不开，开了才意味着有人决定把自己的仓库挂上去。
-func (s *Server) adminGate(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) adminGate(c *gin.Context) bool {
 	if s.adminToken == "" {
-		fail(w, 503, "接入层没有开：服务启动时没有配置 -admin-token")
+		fail(c, 503, "接入层没有开：服务启动时没有配置 -admin-token")
 		return false
 	}
-	if !sameSecret(bearerToken(r), s.adminToken) {
-		fail(w, 401, "管理口令不对")
+	if !sameSecret(bearerToken(c.Request), s.adminToken) {
+		fail(c, 401, "管理口令不对")
 		return false
 	}
 	return true
 }
 
 // projectByToken 用访问口令反查 project：口令就是调接入层那个人的全部身份。
-func (s *Server) projectByToken(w http.ResponseWriter, r *http.Request) (*Project, bool) {
-	token := bearerToken(r)
+func (s *Server) projectByToken(c *gin.Context) (*Project, bool) {
+	token := bearerToken(c.Request)
 	if token == "" {
-		fail(w, 401, "缺少访问口令（Authorization: Bearer <token>）")
+		fail(c, 401, "缺少访问口令（Authorization: Bearer <token>）")
 		return nil, false
 	}
 	projects, err := s.store.Projects()
 	if err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return nil, false
 	}
 	for _, p := range projects {
@@ -269,7 +271,7 @@ func (s *Server) projectByToken(w http.ResponseWriter, r *http.Request) (*Projec
 			return p, true
 		}
 	}
-	fail(w, 401, "访问口令不认识")
+	fail(c, 401, "访问口令不认识")
 	return nil, false
 }
 

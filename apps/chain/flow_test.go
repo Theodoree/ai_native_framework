@@ -18,9 +18,7 @@ func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	mux := http.NewServeMux()
-	NewServer(store, FakeExecutor{}).Routes(mux)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
 	t.Cleanup(ts.Close)
 	return ts, store, path
 }

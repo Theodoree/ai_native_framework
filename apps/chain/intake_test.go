@@ -24,9 +24,7 @@ func newIntakeServer(t *testing.T) (*httptest.Server, Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	mux := http.NewServeMux()
-	NewServer(store, FakeExecutor{}).WithAdminToken(testAdminToken).Routes(mux)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).WithAdminToken(testAdminToken).Handler())
 	t.Cleanup(ts.Close)
 	return ts, store
 }

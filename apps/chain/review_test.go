@@ -27,9 +27,7 @@ func newReviewServer(t *testing.T, c Chain, exec Executor) (*httptest.Server, St
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	mux := http.NewServeMux()
-	NewServer(store, exec).Routes(mux)
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(NewServer(store, exec).Handler())
 	t.Cleanup(ts.Close)
 	p := Project{
 		Key: "demo", Name: "Demo", Repo: "o/r", DefaultBranch: "main",

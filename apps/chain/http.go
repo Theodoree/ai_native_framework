@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // Server 只做三件事：校验输入、调状态机、把结果落盘。它自己不下结论。
@@ -30,58 +34,246 @@ func (s *Server) WithAdminToken(token string) *Server {
 	return s
 }
 
-func (s *Server) Routes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /", s.index)
-	mux.HandleFunc("GET /assets/", s.assets)
-	mux.HandleFunc("GET /api/projects", s.listProjects)
-	mux.HandleFunc("POST /api/projects", s.createProject)
-	mux.HandleFunc("GET /api/requirements", s.listRequirements)
-	mux.HandleFunc("POST /api/p/{project}/requirements", s.createRequirement)
-	mux.HandleFunc("GET /api/requirements/{id}", s.getRequirement)
-	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/run", s.nodeRun)
-	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/accept", s.nodeAccept)
-	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/reject", s.nodeReject)
-	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/comment", s.nodeComment)
-	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/rules", s.nodeRule)
-
-	// 接入层：给平台外的人用。只认 project 口令，不认人。
-	mux.HandleFunc("POST /api/intake/projects", s.intakeCreateProject)
-	mux.HandleFunc("GET /api/intake/projects", s.intakeListProjects)
-	mux.HandleFunc("POST /api/intake/requirements", s.intakeCreateRequirement)
-	mux.HandleFunc("GET /api/intake/requirements/{id}", s.intakeGetRequirement)
+// routeEntry 是路由表里的一行。它既是 gin 的注册，也是 405 的 Allow 头与「子树补斜杠」
+// 唯一的来源：网关行为（能走哪些路径、每条路径允许哪些方法）只有一个家，不另开清单。
+type routeEntry struct {
+	method  string
+	pattern string // gin 形态：:param 是单段参数，*filepath 是尾部通配
+	subtree string // 子树前缀（"/" 或 "/assets/"），空表示精确路由
 }
 
-func (s *Server) index(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+// ginRouter 把 gin engine 和它自己的路由表放在一起，只在 Handler 里用。
+type ginRouter struct {
+	engine *gin.Engine
+	routes []routeEntry
+}
+
+// Handler 交出挂好路由的 http.Handler：路由与 handler 交给 gin，
+// 对外可观测行为（状态码、错误文案、404/405、静态分发的 Content-Type、清路径与补斜杠的
+// 重定向）仍按标准库 ServeMux 的口径给——每一处补法都在下面的函数注记里写明原行为。
+func (s *Server) Handler() http.Handler {
+	gin.SetMode(gin.ReleaseMode)
+	r := &ginRouter{engine: gin.New()}
+	e := r.engine
+	e.HandleMethodNotAllowed = true
+	e.RedirectTrailingSlash = false
+	e.RedirectFixedPath = false
+	// ServeMux 先清洗路径再匹配，gin 不洗（请求路径原样进路由树）：
+	// 这一步把顺序对齐，否则 "//api/projects" 会从 307 退化成 404。
+	e.Use(r.cleanPathRedirect)
+	s.mount(r)
+	e.NoMethod(r.methodNotAllowed)
+	e.NoRoute(r.notFound)
+	return e
+}
+
+// mount 是唯一注册路由的地方：加一条路由只动这里。
+func (s *Server) mount(r *ginRouter) {
+	handle := func(method, pattern string, h gin.HandlerFunc) {
+		entry := routeEntry{method: method, pattern: pattern}
+		switch {
+		case pattern == "/":
+			entry.subtree = "/"
+		case strings.HasSuffix(pattern, "/*filepath"):
+			entry.subtree = strings.TrimSuffix(pattern, "*filepath")
+		}
+		r.engine.Handle(method, pattern, h)
+		r.routes = append(r.routes, entry)
+		// ServeMux 里以 GET 注册的模式同时也命中 HEAD：gin 不自动带，这里补一条。
+		if method == http.MethodGet {
+			r.engine.Handle(http.MethodHead, pattern, h)
+			entry.method = http.MethodHead
+			r.routes = append(r.routes, entry)
+		}
+	}
+
+	handle("GET", "/", s.index)
+	handle("GET", "/assets/*filepath", s.assets)
+	handle("GET", "/api/projects", s.listProjects)
+	handle("POST", "/api/projects", s.createProject)
+	handle("GET", "/api/requirements", s.listRequirements)
+	handle("POST", "/api/p/:project/requirements", s.createRequirement)
+	handle("GET", "/api/requirements/:id", s.getRequirement)
+	handle("POST", "/api/requirements/:id/nodes/:node/run", s.nodeRun)
+	handle("POST", "/api/requirements/:id/nodes/:node/accept", s.nodeAccept)
+	handle("POST", "/api/requirements/:id/nodes/:node/reject", s.nodeReject)
+	handle("POST", "/api/requirements/:id/nodes/:node/comment", s.nodeComment)
+	handle("POST", "/api/requirements/:id/nodes/:node/rules", s.nodeRule)
+
+	// 接入层：给平台外的人用。只认 project 口令，不认人。
+	handle("POST", "/api/intake/projects", s.intakeCreateProject)
+	handle("GET", "/api/intake/projects", s.intakeListProjects)
+	handle("POST", "/api/intake/requirements", s.intakeCreateRequirement)
+	handle("GET", "/api/intake/requirements/:id", s.intakeGetRequirement)
+}
+
+// cleanPathRedirect 复刻 ServeMux 的「先清洗路径」：能洗出更干净的形式就 307 过去，
+// 不再往下路由。与标准库一样，路径是 "/" 时不动手。
+func (r *ginRouter) cleanPathRedirect(c *gin.Context) {
+	p := c.Request.URL.Path
+	if p != "/" {
+		if cleaned := cleanRequestPath(p); cleaned != p {
+			u := *c.Request.URL
+			u.Path, u.RawPath = cleaned, ""
+			http.Redirect(c.Writer, c.Request, u.String(), http.StatusTemporaryRedirect)
+			c.Abort()
+			return
+		}
+	}
+	c.Next()
+}
+
+// methodNotAllowed 复刻 ServeMux 的 405：状态码 + "Method Not Allowed\n" + 排好序的 Allow。
+// gin 自己也会写 Allow，但按路由树的登记顺序给；ServeMux 是字典序，所以这里用自己的表重写。
+//
+// 有一类请求 gin 会送进来而 ServeMux 根本不会判 405：只注册了 POST 的路径收到 GET。
+// 原因是 ServeMux 的 "GET /" 是匹配一切的子树，GET/HEAD 永远能落到 index（再由它 404），
+// 而 gin 的 "/" 只匹配根路径，于是跑来问「是不是方法不对」。判据交回自己的路由表：
+// 这个请求的方法在表里有路可走 → 按那条路给（此时只剩 index 的 404），否则才是 405。
+func (r *ginRouter) methodNotAllowed(c *gin.Context) {
+	p := c.Request.URL.Path
+	if r.dispatches(c.Request.Method, p) {
+		c.Writer.Header().Del("Allow") // ServeMux 在这条路径上不会带 Allow
+		http.NotFound(c.Writer, c.Request)
+		return
+	}
+	if allow := r.allowedMethods(p); len(allow) > 0 {
+		c.Header("Allow", strings.Join(allow, ", "))
+	}
+	http.Error(c.Writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+}
+
+// dispatches 回答「ServeMux 会不会为这个方法在这条路径上找到路由」。
+// GET 与 HEAD 共用一个方法位：以 GET 注册的模式在 ServeMux 下也命中 HEAD。
+func (r *ginRouter) dispatches(method, p string) bool {
+	for _, rt := range r.routes {
+		if rt.method != method && !(method == http.MethodHead && rt.method == http.MethodGet) {
+			continue
+		}
+		if rt.matches(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// notFound 复刻 ServeMux 的兜底：以 / 结尾的子树路由缺尾斜杠时是 307 补上而不是 404；
+// 其余 GET/HEAD 是 404；非 GET/HEAD 在 ServeMux 下会命中「GET /」这条子树，所以是 405。
+func (r *ginRouter) notFound(c *gin.Context) {
+	if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+		if target, ok := r.slashTarget(c.Request.URL.Path); ok {
+			http.Redirect(c.Writer, c.Request, target, http.StatusTemporaryRedirect)
+			return
+		}
+		http.NotFound(c.Writer, c.Request)
+		return
+	}
+	r.methodNotAllowed(c)
+}
+
+// slashTarget 找出「补一个尾斜杠就能命中子树路由」的目标。
+func (r *ginRouter) slashTarget(p string) (string, bool) {
+	for _, rt := range r.routes {
+		if rt.subtree == "" || rt.subtree == "/" {
+			continue
+		}
+		if p == strings.TrimSuffix(rt.subtree, "/") {
+			return rt.subtree, true
+		}
+	}
+	return "", false
+}
+
+// allowedMethods 按 ServeMux 的口径算这条路径允许的方法："/" 是匹配一切的子树，
+// 其余子树按前缀匹配，精确路由按段匹配（:param 段可替任意一段）。
+func (r *ginRouter) allowedMethods(p string) []string {
+	seen := map[string]bool{}
+	for _, rt := range r.routes {
+		if rt.matches(p) {
+			seen[rt.method] = true
+		}
+	}
+	if seen[http.MethodGet] {
+		seen[http.MethodHead] = true
+	}
+	out := make([]string, 0, len(seen))
+	for m := range seen {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (rt routeEntry) matches(p string) bool {
+	switch {
+	case rt.subtree == "/":
+		return true
+	case rt.subtree != "":
+		return strings.HasPrefix(p, rt.subtree)
+	}
+	want := strings.Split(strings.TrimPrefix(rt.pattern, "/"), "/")
+	got := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	if len(want) != len(got) {
+		return false
+	}
+	for i := range want {
+		if strings.HasPrefix(want[i], ":") || strings.HasPrefix(want[i], "*") {
+			continue
+		}
+		if want[i] != got[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// cleanRequestPath 与 net/http 的 cleanPath 同口径：先 path.Clean，再补回被吃掉的尾斜杠。
+func cleanRequestPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	cleaned := path.Clean(p)
+	if p[len(p)-1] == '/' && cleaned != "/" {
+		cleaned += "/"
+	}
+	return cleaned
+}
+
+func (s *Server) index(c *gin.Context) {
+	if c.Request.URL.Path != "/" {
+		http.NotFound(c.Writer, c.Request)
 		return
 	}
 	b, err := webFS.ReadFile("webui/dist/index.html")
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(c.Writer, err.Error(), 500)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(b)
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	_, _ = c.Writer.Write(b)
 }
 
 // assets 只从嵌入的构建产物里取：前端是构建出来的静态文件，不是模板。
-func (s *Server) assets(w http.ResponseWriter, r *http.Request) {
-	name := "webui/dist" + r.URL.Path
+func (s *Server) assets(c *gin.Context) {
+	// 用 gin 解析出来的 *filepath（带前导斜杠），不要再读 URL.Path——同一个值只有一个来源。
+	name := "webui/dist/assets" + c.Param("filepath")
 	b, err := webFS.ReadFile(name)
 	if err != nil {
-		http.NotFound(w, r)
+		http.NotFound(c.Writer, c.Request)
 		return
 	}
 	switch {
 	case strings.HasSuffix(name, ".js"):
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		c.Header("Content-Type", "text/javascript; charset=utf-8")
 	case strings.HasSuffix(name, ".css"):
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		c.Header("Content-Type", "text/css; charset=utf-8")
 	default:
-		w.Header().Set("Content-Type", "application/octet-stream")
+		c.Header("Content-Type", "application/octet-stream")
 	}
-	w.Write(b)
+	_, _ = c.Writer.Write(b)
 }
 
 type createProjectReq struct {
@@ -92,19 +284,19 @@ type createProjectReq struct {
 	Chains        []Chain `json:"chains"`
 }
 
-func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
+func (s *Server) createProject(c *gin.Context) {
 	var in createProjectReq
-	if err := decode(r, &in); err != nil {
-		fail(w, 400, err.Error())
+	if err := decode(c.Request, &in); err != nil {
+		fail(c, 400, err.Error())
 		return
 	}
 	key := strings.TrimSpace(in.Key)
 	if key == "" {
-		fail(w, 400, "project key 不能为空")
+		fail(c, 400, "project key 不能为空")
 		return
 	}
 	if _, err := s.store.Project(key); err == nil {
-		fail(w, 409, "project 已存在："+key)
+		fail(c, 409, "project 已存在："+key)
 		return
 	}
 	p := &Project{
@@ -118,26 +310,26 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		for i := range in.Chains {
 			in.Chains[i].Version = 1
 			if err := ValidateChain(in.Chains[i]); err != nil {
-				fail(w, 400, err.Error())
+				fail(c, 400, err.Error())
 				return
 			}
 		}
 		p.Chains = in.Chains
 	}
 	if err := s.store.SaveProject(p); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 201, p)
+	writeJSON(c, 201, p)
 }
 
-func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
+func (s *Server) listProjects(c *gin.Context) {
 	ps, err := s.store.Projects()
 	if err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, ps)
+	writeJSON(c, 200, ps)
 }
 
 type createReqBody struct {
@@ -147,56 +339,56 @@ type createReqBody struct {
 	Chain   string   `json:"chain"`
 }
 
-func (s *Server) createRequirement(w http.ResponseWriter, r *http.Request) {
-	p, err := s.store.Project(r.PathValue("project"))
+func (s *Server) createRequirement(c *gin.Context) {
+	p, err := s.store.Project(c.Param("project"))
 	if err != nil {
-		fail(w, 404, err.Error())
+		fail(c, 404, err.Error())
 		return
 	}
 	var in createReqBody
-	if err := decode(r, &in); err != nil {
-		fail(w, 400, err.Error())
+	if err := decode(c.Request, &in); err != nil {
+		fail(c, 400, err.Error())
 		return
 	}
 	if strings.TrimSpace(in.Context) == "" {
-		fail(w, 400, "需求必须带 context")
+		fail(c, 400, "需求必须带 context")
 		return
 	}
 	chain, err := pickChain(p, in.Chain)
 	if err != nil {
-		fail(w, 400, err.Error())
+		fail(c, 400, err.Error())
 		return
 	}
 	req := NewRequirement(newID("REQ"), p, chain, in.Context, in.Images, or(in.Source, "api"), s.now())
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
 	s.logEvent(req, "", "create", "", req.Nodes[0].State, "进链即建分支 "+req.Branch)
-	writeJSON(w, 201, req)
+	writeJSON(c, 201, req)
 }
 
-func (s *Server) listRequirements(w http.ResponseWriter, r *http.Request) {
+func (s *Server) listRequirements(c *gin.Context) {
 	rs, err := s.store.Requirements()
 	if err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, rs)
+	writeJSON(c, 200, rs)
 }
 
-func (s *Server) getRequirement(w http.ResponseWriter, r *http.Request) {
-	req, err := s.store.Requirement(r.PathValue("id"))
+func (s *Server) getRequirement(c *gin.Context) {
+	req, err := s.store.Requirement(c.Param("id"))
 	if err != nil {
-		fail(w, 404, err.Error())
+		fail(c, 404, err.Error())
 		return
 	}
 	events, err := s.store.Events(req.ID)
 	if err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"requirement": req, "events": events})
+	writeJSON(c, 200, map[string]any{"requirement": req, "events": events})
 }
 
 type nodeBody struct {
@@ -207,14 +399,14 @@ type nodeBody struct {
 	Comment string `json:"comment"`
 }
 
-func (s *Server) nodeRun(w http.ResponseWriter, r *http.Request) {
-	req, n, body, ok := s.prepare(w, r)
+func (s *Server) nodeRun(c *gin.Context) {
+	req, n, body, ok := s.prepare(c)
 	if !ok {
 		return
 	}
 	from := n.State
 	if err := req.BeginRun(n.Key, s.now()); err != nil {
-		fail(w, 409, err.Error())
+		fail(c, 409, err.Error())
 		return
 	}
 	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, body.Author)
@@ -223,14 +415,14 @@ func (s *Server) nodeRun(w http.ResponseWriter, r *http.Request) {
 	if IsContainer(n.Type) {
 		attempt, comment, artifacts := s.exec.Run(req, n, s.now())
 		if err := req.FinishRun(n.Key, attempt, comment, artifacts, s.now()); err != nil {
-			fail(w, 409, err.Error())
+			fail(c, 409, err.Error())
 			return
 		}
 		s.logEvent(req, n.Key, "finish", StateRunning, StateAwaitingReview, attempt.Template)
 		// 容器自审只有 review=ai 的节点会自动定案；人审节点在这里停住等人按。
 		applied, err := req.ApplyReview(n.Key, attempt.Verdict, attempt.VerdictReason, s.now())
 		if err != nil {
-			fail(w, 409, err.Error())
+			fail(c, 409, err.Error())
 			return
 		}
 		switch applied {
@@ -247,43 +439,43 @@ func (s *Server) nodeRun(w http.ResponseWriter, r *http.Request) {
 		s.recordRejection(req, n.Key, rejectWhole)
 	}
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
 	if rejectWhole != "" {
 		s.deliverCallback(req, n.Key, rejectWhole)
 	}
-	writeJSON(w, 200, req)
+	writeJSON(c, 200, req)
 }
 
-func (s *Server) nodeAccept(w http.ResponseWriter, r *http.Request) {
-	req, n, body, ok := s.prepare(w, r)
+func (s *Server) nodeAccept(c *gin.Context) {
+	req, n, body, ok := s.prepare(c)
 	if !ok {
 		return
 	}
 	from := n.State
 	comment := Comment{ID: newID("c"), AuthorType: "human", Author: or(body.Author, "human"), Body: body.Comment, At: s.now()}
 	if err := req.Accept(n.Key, comment, s.now()); err != nil {
-		fail(w, 409, err.Error())
+		fail(c, 409, err.Error())
 		return
 	}
 	s.logEvent(req, n.Key, "accept", from, StateAccepted, body.Comment)
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, req)
+	writeJSON(c, 200, req)
 }
 
-func (s *Server) nodeReject(w http.ResponseWriter, r *http.Request) {
-	req, n, body, ok := s.prepare(w, r)
+func (s *Server) nodeReject(c *gin.Context) {
+	req, n, body, ok := s.prepare(c)
 	if !ok {
 		return
 	}
 	from := n.State
 	reason := or(body.Reason, body.Body)
 	if err := req.Reject(n.Key, reason, or(body.Author, "human"), s.now()); err != nil {
-		fail(w, 409, err.Error())
+		fail(c, 409, err.Error())
 		return
 	}
 	s.logEvent(req, n.Key, "reject", from, req.Node(n.Key).State, reason)
@@ -292,67 +484,67 @@ func (s *Server) nodeReject(w http.ResponseWriter, r *http.Request) {
 		s.recordRejection(req, n.Key, reason)
 	}
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
 	// 先落库再回告：回告失败不该让一条已经落定的驳回看起来没发生。
 	if whole {
 		s.deliverCallback(req, n.Key, reason)
 	}
-	writeJSON(w, 200, req)
+	writeJSON(c, 200, req)
 }
 
-func (s *Server) nodeComment(w http.ResponseWriter, r *http.Request) {
-	req, n, body, ok := s.prepare(w, r)
+func (s *Server) nodeComment(c *gin.Context) {
+	req, n, body, ok := s.prepare(c)
 	if !ok {
 		return
 	}
 	if err := req.AddComment(n.Key, or(body.Author, "human"), body.Body, s.now()); err != nil {
-		fail(w, 409, err.Error())
+		fail(c, 409, err.Error())
 		return
 	}
 	s.logEvent(req, n.Key, "comment", n.State, n.State, body.Body)
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, req)
+	writeJSON(c, 200, req)
 }
 
-func (s *Server) nodeRule(w http.ResponseWriter, r *http.Request) {
-	req, n, body, ok := s.prepare(w, r)
+func (s *Server) nodeRule(c *gin.Context) {
+	req, n, body, ok := s.prepare(c)
 	if !ok {
 		return
 	}
 	rule := or(body.Rule, body.Body)
 	if err := req.AddRule(n.Key, rule, s.now()); err != nil {
-		fail(w, 409, err.Error())
+		fail(c, 409, err.Error())
 		return
 	}
 	s.logEvent(req, n.Key, "rule", n.State, n.State, rule)
 	if err := s.store.SaveRequirement(req); err != nil {
-		fail(w, 500, err.Error())
+		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, req)
+	writeJSON(c, 200, req)
 }
 
 // prepare 取需求、取节点、读 body；任何一步不成立就直接回错。
-func (s *Server) prepare(w http.ResponseWriter, r *http.Request) (*Requirement, *Node, nodeBody, bool) {
-	req, err := s.store.Requirement(r.PathValue("id"))
+func (s *Server) prepare(c *gin.Context) (*Requirement, *Node, nodeBody, bool) {
+	req, err := s.store.Requirement(c.Param("id"))
 	if err != nil {
-		fail(w, 404, err.Error())
+		fail(c, 404, err.Error())
 		return nil, nil, nodeBody{}, false
 	}
-	n := req.Node(r.PathValue("node"))
+	n := req.Node(c.Param("node"))
 	if n == nil {
-		fail(w, 404, "没有这个节点："+r.PathValue("node"))
+		fail(c, 404, "没有这个节点："+c.Param("node"))
 		return nil, nil, nodeBody{}, false
 	}
 	var body nodeBody
-	if r.ContentLength != 0 {
-		if err := decode(r, &body); err != nil && !errors.Is(err, io.EOF) {
-			fail(w, 400, err.Error())
+	if c.Request.ContentLength != 0 {
+		if err := decode(c.Request, &body); err != nil && !errors.Is(err, io.EOF) {
+			fail(c, 400, err.Error())
 			return nil, nil, nodeBody{}, false
 		}
 	}
@@ -399,14 +591,14 @@ func decode(r *http.Request, v any) error {
 	return nil
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+func writeJSON(c *gin.Context, code int, v any) {
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Writer.WriteHeader(code)
+	_ = json.NewEncoder(c.Writer).Encode(v)
 }
 
-func fail(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+func fail(c *gin.Context, code int, msg string) {
+	writeJSON(c, code, map[string]string{"error": msg})
 }
 
 func or(v, fallback string) string {
