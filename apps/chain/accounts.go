@@ -449,16 +449,24 @@ func (s *Server) listUsers(c *gin.Context) {
 	writeJSON(c, 200, us)
 }
 
+// createUserReq 是建账号的 body。admin 只在「建的时候」能指定：
+// 本期没有「把已有账号升级为管理员」的接口，要换标记只能重开一个号。
+type createUserReq struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Admin    bool   `json:"admin"`
+}
+
 func (s *Server) createUser(c *gin.Context) {
 	if _, ok := s.requireAdmin(c); !ok {
 		return
 	}
-	var in credentials
+	var in createUserReq
 	if err := decode(c.Request, &in); err != nil {
 		fail(c, 400, err.Error())
 		return
 	}
-	u, why := s.newUser(in.Username, in.Password, false)
+	u, why := s.newUser(in.Username, in.Password, in.Admin)
 	if why != "" {
 		fail(c, 400, why)
 		return

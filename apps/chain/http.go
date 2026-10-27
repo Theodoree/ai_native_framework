@@ -325,6 +325,11 @@ type createProjectReq struct {
 }
 
 func (s *Server) createProject(c *gin.Context) {
+	// 项目是权限的边界，而「往项目里加人」是管理员动作：普通账号建出来的项目
+	// 连他自己都进不去（powersFor 只认角色授予），那条路是死路，所以门开在建的这一侧。
+	if _, ok := s.requireAdmin(c); !ok {
+		return
+	}
 	var in createProjectReq
 	if err := decode(c.Request, &in); err != nil {
 		fail(c, 400, err.Error())
@@ -383,6 +388,17 @@ func (s *Server) createRequirement(c *gin.Context) {
 	p, err := s.store.Project(c.Param("project"))
 	if err != nil {
 		fail(c, 404, err.Error())
+		return
+	}
+	// 提需求是成员动作：管理员天生算任何项目的成员，其余人至少要有这个项目里的一个权力。
+	// 这道门排在 404 之后：先回答「有没有这个项目」，再回答「你有没有资格」。
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return
+	}
+	if !s.isMember(me.User, p.Key) {
+		denyNotMember(c, me.User, p.Key, actionPostRequirement)
 		return
 	}
 	var in createReqBody

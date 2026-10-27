@@ -12,7 +12,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// intakeCreatedProject 是唯一一次把访问口令交给人的地方：之后列表与需求接口都用它当身份。
+// intake.go —— 接入层：平台外的人把需求塞进链、再回读结论的两个口子。
+// 身份是登录态或 API 密钥（whoIs 认出来的那一个人），权限是「要是这个项目的成员」；
+// 结论只写下、不回改：送不到是网络的事，不是判定的事。
 
 type intakeNewRequirement struct {
 	Project  string
@@ -62,7 +64,7 @@ func (s *Server) intakeCreateRequirement(c *gin.Context) {
 		return
 	}
 	if !s.isMember(me.User, projectKey) {
-		fail(c, 403, fmt.Sprintf("「%s」不是 %s 的成员，提不了需求", me.User.Username, projectKey))
+		denyNotMember(c, me.User, projectKey, actionPostRequirement)
 		return
 	}
 	p, err := s.store.Project(projectKey)
@@ -95,6 +97,17 @@ func (s *Server) isMember(u *User, projectKey string) bool {
 	return len(s.powersFor(u, projectKey)) > 0
 }
 
+// 成员资格这道门在三个地方用到，动词不同但说的是一件事，所以文案只留一处。
+const (
+	actionPostRequirement = "提不了需求"
+	actionViewRequirement = "看不到这条需求"
+)
+
+// denyNotMember 是「认出来了，但不是这个项目的人」的唯一 403：点名是谁、在哪个项目、这次要干什么。
+func denyNotMember(c *gin.Context, u *User, projectKey, action string) {
+	fail(c, 403, fmt.Sprintf("「%s」不是 %s 的成员，%s", u.Username, projectKey, action))
+}
+
 func (s *Server) intakeGetRequirement(c *gin.Context) {
 	me := s.me(c)
 	if me.User == nil {
@@ -107,7 +120,7 @@ func (s *Server) intakeGetRequirement(c *gin.Context) {
 		return
 	}
 	if !s.isMember(me.User, req.ProjectKey) {
-		fail(c, 403, fmt.Sprintf("「%s」不是 %s 的成员，看不到这条需求", me.User.Username, req.ProjectKey))
+		denyNotMember(c, me.User, req.ProjectKey, actionViewRequirement)
 		return
 	}
 	writeJSON(c, 200, s.intakeView(req))
