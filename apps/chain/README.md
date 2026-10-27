@@ -26,7 +26,7 @@
 | 实体        | 关键字段                                                                                                                                         |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Project     | key、name、repo、defaultBranch、chains、createdAt                                                                                                |
-| Chain       | key、type、version、nodes[]（key、type、review）                                                                                                 |
+| Chain       | key、type、version、nodes[]（key、type、review、power）                                                                                          |
 | Node        | key、type、review、power、index、state、attempts[]、comments[]、rules[]、artifacts[]、rev                                                        |
 | Role        | id、projectKey、name、powers[]、createdAt（**没有口令**：角色是授予给账号的，不是一把钥匙）                                                      |
 | Requirement | id、projectKey、chainKey、chainVersion、context、images、source、branch、state、nodes[]、rev、reporter（谁提的、回告地址；接入层带过来的原样存） |
@@ -83,16 +83,16 @@ go run ./cmd/chain -db chain.db -exec docker -templates /etc/nodes.yaml
 | ---------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | GET        | `/`                                              | 内嵌前端（`webui/dist`）                                                                                                                          |
 | GET        | `/assets/`                                       | 内嵌前端的静态资源                                                                                                                                |
-| GET / POST | `/api/projects`                                  | 列表 / 创建（key 重复 409）。要登录；创建只写 project 本身，不授予任何人角色                                                                      |
-| GET        | `/api/requirements`                              | 全部需求                                                                                                                                          |
-| POST       | `/api/p/{project}/requirements`                  | 提需求（body: context、images、source、chain）                                                                                                    |
-| GET        | `/api/requirements/{id}`                         | `{ requirement, events }`                                                                                                                         |
+| GET / POST | `/api/projects`                                  | 列表只回我参与的项目（管理员回全部）/ 创建（key 重复 409）。**管理员**；只写 project 本身，不授予任何人角色                                       |
+| GET        | `/api/requirements`                              | 只回我参与的项目下的需求                                                                                                                          |
+| POST       | `/api/p/{project}/requirements`                  | 提需求（body: context、images、source、chain）。**项目成员**：任一权力即成员，管理员天生是                                                        |
+| GET        | `/api/requirements/{id}`                         | `{ requirement, events }`。要成员资格：401 → 404 → 403                                                                                            |
 | POST       | `/api/requirements/{id}/nodes/{node}/run`        | 起容器或开始动手                                                                                                                                  |
 | POST       | `/api/requirements/{id}/nodes/{node}/accept`     | 通过（可带 comment）                                                                                                                              |
 | POST       | `/api/requirements/{id}/nodes/{node}/reject`     | 驳回（reason 必填，409 表示不是当前站）                                                                                                           |
 | POST       | `/api/requirements/{id}/nodes/{node}/restart`    | 从这一站重跑（按不动就 403）                                                                                                                      |
-| POST       | `/api/requirements/{id}/nodes/{node}/comment`    | 评论（不查权力）                                                                                                                                  |
-| POST       | `/api/requirements/{id}/nodes/{node}/rules`      | 往这一站追加规则，默认 AGENTS.md 不改（不查权力）                                                                                                 |
+| POST       | `/api/requirements/{id}/nodes/{node}/comment`    | 评论（**项目成员**，不查权力）                                                                                                                    |
+| POST       | `/api/requirements/{id}/nodes/{node}/rules`      | 往这一站追加规则，默认 AGENTS.md 不改（**项目成员**，不查权力）                                                                                   |
 | POST       | `/api/requirements/{id}/images`                  | 传图：`multipart/form-data`，字段名 `files`（可多个）；一次 ≤5 张、每张 ≤5MB，按文件头认 png / jpeg / webp / gif；有一张不合规就整批 400 且不进盘 |
 | GET        | `/api/requirements/{id}/images/{name}`           | 取图：原样字节 + 正确的 `Content-Type` / `Content-Length`；文件名越界、或不属于这条需求，一律 404                                                 |
 | DELETE     | `/api/requirements/{id}/images/{name}`           | 删图：文件删掉、同时从 `Images` 里摘掉；找不到 404                                                                                                |
@@ -102,7 +102,7 @@ go run ./cmd/chain -db chain.db -exec docker -templates /etc/nodes.yaml
 | POST       | `/api/logout`                                    | 删掉当前会话                                                                                                                                      |
 | GET        | `/api/me`                                        | 我是谁：`{user, memberships}`——账号（含是否管理员）+ 在每个项目里拿到了哪些角色与权力                                                             |
 | PUT        | `/api/me/password`                               | 改自己的口令（≥8 位）                                                                                                                             |
-| GET / POST | `/api/users`                                     | 列表 / 建账号。**管理员**；新建的账号一律是普通账号（管理员只有一个，见「已知边界」）                                                             |
+| GET / POST | `/api/users`                                     | 列表 / 建账号。**管理员**；body 可带 `admin: true` 建一个管理员账号，不带则建成普通账号（已有账号不能升级，见「已知边界」）                       |
 | POST       | `/api/users/{id}/password`                       | 重置别人的口令。**管理员**                                                                                                                        |
 | GET / POST | `/api/keys`                                      | 列 / 建自己的 API 密钥；建的响应里 `secret` 只出现这一次                                                                                          |
 | DELETE     | `/api/keys/{id}`                                 | 吊销自己的密钥（别人的 id 一律 404）                                                                                                              |
@@ -140,14 +140,15 @@ go run ./cmd/chain -db chain.db -exec docker -templates /etc/nodes.yaml
 | 动作                                      | 谁可以                                                                                                              |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | 注册第一个账号                            | 谁先来谁注册：库是空的时候 `POST /api/signup` 开，注册的人就是管理员；之后注册通道关死（409），其余账号只能管理员建 |
-| 建项目                                    | 任何登录的人（`POST /api/projects` 里没有管理员闸门）                                                               |
+| 建项目                                    | 管理员（`POST /api/projects` 的第一道门）                                                                           |
 | 建角色 / 加成员 / 删角色                  | 管理员。把人放进项目只有这一个入口                                                                                  |
-| 提需求（界面）                            | 任何登录的人（`POST /api/p/{project}/requirements` 只查登录）                                                       |
+| 提需求（界面）                            | 该项目的成员：任一权力即成员，管理员天生是                                                                          |
 | 提需求 / 拉结论（接入层）                 | 该项目的成员（管理员天生是；普通账号要有这个项目里任一角色）                                                        |
 | 按节点（run / accept / reject / restart） | 有这个节点所要权力的人                                                                                              |
-| 评论、追加规则                            | 任何登录的人，不查权力                                                                                              |
+| 看需求、看图、看列表                      | 列表只回我参与的项目；单条需求与图片要成员资格（401 → 404 → 403）                                                   |
+| 评论、追加规则                            | 该项目的成员，不查权力                                                                                              |
 
-> 前两条放在一起看有个缝：普通账号能建项目，却没有任何办法把自己或别人加进去——加成员是管理员专属。所以普通账号建完项目，自己并不是成员。这条是现状，不是设计。
+> 建项目限管理员、加成员也是管理员专属，所以「建完项目自己进不去」这个缝不存在：建项目的人一定是管理员，管理员天生算任何项目的成员。普通账号的项目成员资格只有一个来源——管理员在项目设置里授予一个角色。
 
 ### 权力四值
 
@@ -174,17 +175,20 @@ go run ./cmd/chain -db chain.db -exec docker -templates /etc/nodes.yaml
 
 `run` / `accept` / `reject` / `restart` 要求「有这一站所要的权力」，判不了就挡。文案是契约（前端靠它区分「该去登录」还是「该找管理员要角色」）：
 
-| 情形                      | 状态码 | 响应                                                                                    |
-| ------------------------- | ------ | --------------------------------------------------------------------------------------- |
-| 没有登录、也没带 API 密钥 | 401    | `没有登录：请先登录（POST /api/login）或带上 API 密钥（Authorization: Bearer ak_…）`    |
-| 登录了但没有这一站的权力  | 403    | `「%s」在 %s 里没有 %s 权力，不能在这个节点上确认/拒绝`（依次是用户名、项目 key、权力） |
-| 要管理员才行的接口        | 403    | `只有管理员能做这件事`                                                                  |
+| 情形                      | 状态码 | 响应                                                                                                                                           |
+| ------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| 没有登录、也没带 API 密钥 | 401    | `没有登录：请先登录（POST /api/login）或带上 API 密钥（Authorization: Bearer ak_…）`                                                           |
+| 登录了但没有这一站的权力  | 403    | `「%s」在 %s 里没有 %s 权力，不能在这个节点上确认/拒绝`（依次是用户名、项目 key、权力）                                                        |
+| 要管理员才行的接口        | 403    | `只有管理员能做这件事`                                                                                                                         |
+| 不是项目成员              | 403    | `「%s」不是 %s 的成员，%s`（依次是用户名、项目 key、动作：提不了需求 / 看不到这条需求 / 改不了这条需求 / 评不了这条需求 / 改不了这一站的规则） |
 
 没有权力时按钮按不动，只能看。这是刻意的：宽进来一次就会变成常态。
 
-### 评论不受限
+### 评论与规则：要成员，不要权力
 
-`comment` 不校验权力：登录了就能说话，作者记成账号名。`rules`（给这一站追加规则）同样不看权力。
+`comment` 与 `rules`（给这一站追加规则）不校验**权力**，但要校验**成员资格**：是这个项目的人才能说话，作者记成账号名。
+
+评论以前对任何登录的人开放，现在收进项目边界。规则比评论更严——它会被拼进容器的 AGENTS.md，影响容器下一步怎么干，所以走的是同一条成员门，文案是「改不了这一站的规则」。
 
 ## 怎么跑
 
@@ -246,4 +250,4 @@ cd ../web && npm run build      # 输出到 ../chain/webui/dist
 7. API 密钥能吊销，但身份不变：删掉密钥立刻失效，可它认出来的还是同一个人——权限仍看项目成员资格，不按密钥分权。
 8. 角色不能跨 project：一个角色只在一个 project 里有意义。
 9. 角色没有过期时间、也没有审计：授予与收回都不留事件，谁有过什么角色只能查当前表。
-10. 管理员只有一个：第一个注册的人。之后建的账号一律是普通账号——没有「升成管理员」也没有「降回普通」的接口，多一个管理员只能改库。管理员天生四权齐全，不分级。
+10. 已有账号不能升级为管理员，只能新建一个管理员账号：`POST /api/users` 的 body 带 `admin: true` 即可（默认 false）。没有把管理员降回普通账号的接口，也没有分级——管理员天生四权齐全。

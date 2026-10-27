@@ -19,9 +19,11 @@ go test ./...                                    # 状态机 + 存储 + 执行�
 go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 ```
 
-页面可以建 project、提需求、逐站运行 / 通过 / 驳回 / 评论 / 追加规则，并看到只追加的事件流。
+第一次打开先注册：库是空的时候 `POST /api/signup` 开着，注册的人就是管理员；之后注册通通关死，其余账号由管理员在「用户」页建。
 
-平台外面（脚本、另一个系统）走接入层：带 `-admin-token` 启动后，用它建 project 并拿到该 project 的访问口令，之后用口令提需求、用口令拉结论。整条需求被拒时会尽力回告一次，**回告失败不改状态**——所以拉模式永远是可信的那条路。接口表见 `apps/chain/README.md` 的「接入层」一节。
+管理员建 project 并在「项目设置」里建角色、授角色；项目成员提需求，逐站运行 / 通过 / 驳回 / 评论 / 追加规则、重启节点，在需求详情里看图。事件流只追加，不参与任何判定。
+
+平台外面（脚本、另一个系统）走接入层：在「我的密钥」页建一把 API 密钥（`ak_…`，secret 只出现一次），之后带 `Authorization: Bearer ak_…` 提需求、拉结论。密钥只认人、不分权，能不能进某个项目仍看那个账号的项目成员资格。整条需求被拒时会尽力回告一次，**回告失败不改状态**——所以拉模式永远是可信的那条路。接口表见 `apps/chain/README.md` 的「接入层」一节。
 
 - **存储**：SQLite（纯 Go 驱动，免 cgo），库文件默认 `data/chain.db`。`Store` 是接口，换 MySQL 只加一个实现。
 - **执行**：`-exec fake` 只写一条评论并声明自己没连过外部服务；`-exec docker` 会用 `docker run` 起真容器并注入 `BASE_URL` / 模型 / AGENTS.md / 需求正文，密钥只从环境变量取且会从日志里抹掉。
@@ -37,14 +39,16 @@ go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 
 ## 仓库结构
 
-| 路径 | 装什么 |
-| --- | --- |
-| `apps/chain/` | 链条平台：状态机、SQLite 存储、HTTP、容器执行器、嵌入的前端产物 |
-| `apps/web/` | 前端源码：Vue 3 + Vite + TypeScript + Arco Design Vue |
-| `docs/architecture.md` | 架构总览：分层、模块地图、一次需求流过什么 |
-| `.agents/notes/proposed/p32-node-chain-alignment.md` | 需求基线：六类节点、链条规则、状态转换、五条收口假设 |
-| `.agents/notes/proposed/p32-design-minimal.md` | 设计：实体、不变量、九个接口、容器执行五步（其中「文件存储」已被 SQLite 取代，见 `.agents/notes/implemented/p33-sqlite-docker-frontend.md`） |
-| `AGENTS.md` / `docs/` | 工作规则与原则 |
+| 路径                                                 | 装什么                                                                                                                                       |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/chain/`                                        | 链条平台：状态机、SQLite 存储、HTTP、容器执行器、嵌入的前端产物                                                                              |
+| `apps/web/`                                          | 前端源码：Vue 3 + Vite + TypeScript + Arco Design Vue                                                                                        |
+| `deploy/`                                            | 节点模板 `nodes.yaml`（改模板不用重编译）+ 自建 agent 镜像 `agent-image/`                                                                    |
+| `CHANGELOG.md`                                       | 版本变更：按能力分组，不复述提交历史                                                                                                         |
+| `docs/architecture.md`                               | 架构总览：分层、模块地图、一次需求流过什么                                                                                                   |
+| `.agents/notes/proposed/p32-node-chain-alignment.md` | 需求基线：六类节点、链条规则、状态转换、五条收口假设                                                                                         |
+| `.agents/notes/proposed/p32-design-minimal.md`       | 设计：实体、不变量、九个接口、容器执行五步（其中「文件存储」已被 SQLite 取代，见 `.agents/notes/implemented/p33-sqlite-docker-frontend.md`） |
+| `AGENTS.md` / `docs/`                                | 工作规则与原则                                                                                                                               |
 
 ## 关于被丢掉的前一版
 
