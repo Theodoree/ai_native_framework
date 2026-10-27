@@ -50,8 +50,8 @@
 
 #### 执行与部署
 
-- `deploy/nodes.yaml`：节点模板表（模板 = 镜像 + 命令 + 超时 + 环境，节点 = 哪一站用哪个模板）。改这里不用改 Go、不用重编译；文件缺失时回落内嵌默认表。
-- `deploy/agent-image/`：三个可自建 agent 镜像（codex / claude / DeepSeek Harness）+ `build-images.sh` + `entrypoint.sh`。执行器优先 clone 项目仓库，只有 `repo` 是本机绝对路径时才挂载；空节点不起容器。
+- `apps/chain/deploy/nodes.yaml`：节点模板表（模板 = 镜像 + 命令 + 超时 + 版本 + 环境，节点 = 哪一站用哪个模板）。它同时被 `go:embed` 编进二进制，改完要重新编译才会进二进制；仓库里没有、展开目录里也没有时回落内嵌默认表。
+- `apps/chain/deploy/agent-image/`：三个可自建 agent 镜像（codex / claude / DeepSeek Harness）+ `build-images.sh` + `entrypoint.sh`，同样编进二进制，用 `chain assets` 展开到 `$HOME/.<项目名>/` 后在那里烘。执行器优先 clone 项目仓库，只有 `repo` 是本机绝对路径时才挂载；空节点不起容器。
 
 #### 界面（Vue 3 + Vite + TS + Arco Design Vue）
 

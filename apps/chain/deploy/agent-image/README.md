@@ -5,9 +5,9 @@
 
 ## 先有镜像，才有链条
 
-    sh apps/chain/deploy/agent-image/build-images.sh              # 得到 <项目名>/agent-{codex,claude,deepseek-harness}:latest
-    VERSION=0.1.0 sh apps/chain/deploy/agent-image/build-images.sh # 或者自己定 tag
-    APP_NAME=别的名字 sh build-images.sh                          # 或者换镜像前缀
+    cd "$HOME/.<项目名>/agent-image" && sh build-images.sh  # 得到 <项目名>/agent-{codex,claude,deepseek-harness}:latest
+    VERSION=0.1.0 sh build-images.sh                        # 或者自己定 tag
+    APP_NAME=别的名字 sh build-images.sh                    # 或者换镜像前缀
 
 项目名与版本都不写死：`build-images.sh` 用 `APP_NAME`（默认 = 项目名，展开时由
 `chain assets` 把 ${APP} 换成真名）和 `VERSION`（默认 `latest`）；`nodes.yaml` 里的
