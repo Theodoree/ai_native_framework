@@ -27,6 +27,7 @@ go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 
 - **存储**：SQLite（纯 Go 驱动，免 cgo），库文件默认 `data/chain.db`。`Store` 是接口，换 MySQL 只加一个实现。
 - **执行**：`-exec fake` 只写一条评论并声明自己没连过外部服务；`-exec docker` 会用 `docker run` 起真容器并注入 `BASE_URL` / 模型 / AGENTS.md / 需求正文，密钥只从环境变量取且会从日志里抹掉。
+- **镜像**：节点镜像与 `nodes.yaml` 都编在二进制里；第一次用容器节点前先 `go run . assets` 把它们展开到 `$HOME/.<项目名>/`，再 `sh "$HOME/.<项目名>/agent-image/build-images.sh"` 本地烘三个 agent 镜像。来路与字段见 `apps/chain/README.md` 的「节点镜像从哪来」。
 - **前端**：Vue 3 + Vite + TS + Arco Design Vue（MIT，全量注册），构建产物已入库（`apps/chain/webui/dist`），被 `//go:embed` 打进二进制。改了 `apps/web` 要记得 `npm run build`。
 
 ## 铁律
@@ -43,7 +44,7 @@ go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `apps/chain/`                                        | 链条平台：状态机、SQLite 存储、HTTP、容器执行器、嵌入的前端产物                                                                              |
 | `apps/web/`                                          | 前端源码：Vue 3 + Vite + TypeScript + Arco Design Vue                                                                                        |
-| `deploy/`                                            | 节点模板 `nodes.yaml`（改模板不用重编译）+ 自建 agent 镜像 `agent-image/`                                                                    |
+| `apps/chain/deploy/`                                 | 节点模板 `nodes.yaml`（改模板不用重编译）+ 自建 agent 镜像 `agent-image/`；编进二进制，`chain assets` 展开到家目录                           |
 | `CHANGELOG.md`                                       | 版本变更：按能力分组，不复述提交历史                                                                                                         |
 | `docs/architecture.md`                               | 架构总览：分层、模块地图、一次需求流过什么                                                                                                   |
 | `.agents/notes/proposed/p32-node-chain-alignment.md` | 需求基线：六类节点、链条规则、状态转换、五条收口假设                                                                                         |

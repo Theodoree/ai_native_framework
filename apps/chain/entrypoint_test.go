@@ -21,7 +21,8 @@ import (
 // entrypointPath 返回入口脚本的绝对路径（go test 的工作目录是 apps/chain）。
 func entrypointPath(t *testing.T) string {
 	t.Helper()
-	p, err := filepath.Abs(filepath.Join("..", "..", "deploy", "agent-image", "entrypoint.sh"))
+	// 资产在包内（apps/chain/deploy），go test 的工作目录就是 apps/chain。
+	p, err := filepath.Abs(filepath.Join("deploy", "agent-image", "entrypoint.sh"))
 	if err != nil {
 		t.Fatalf("算不出入口脚本路径：%v", err)
 	}

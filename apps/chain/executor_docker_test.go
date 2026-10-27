@@ -72,7 +72,7 @@ func TestDockerExecutorInjectsContextAndReportsSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(b)
-	for _, want := range []string{"run", "--rm", "BASE_URL=https://api.example.com", "CHAIN_MODEL=deepseek-v4", "CHAIN_REQUIREMENT=REQ-1", "CHAIN_BRANCH=req/demo/REQ-1", "先看测试覆盖率", "ai-native/agent-deepseek-harness:dev", "/opt/agent/entrypoint.sh", "CHAIN_WORKSPACE_MODE=clone"} {
+	for _, want := range []string{"run", "--rm", "BASE_URL=https://api.example.com", "CHAIN_MODEL=deepseek-v4", "CHAIN_REQUIREMENT=REQ-1", "CHAIN_BRANCH=req/demo/REQ-1", "先看测试覆盖率", "ai_native_framework/agent-deepseek-harness:latest", "/opt/agent/entrypoint.sh", "CHAIN_WORKSPACE_MODE=clone"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("docker 参数里缺 %q：%s", want, got)
 		}

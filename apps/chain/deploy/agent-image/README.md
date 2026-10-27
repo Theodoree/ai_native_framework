@@ -5,17 +5,25 @@
 
 ## 先有镜像，才有链条
 
-    sh deploy/agent-image/build-images.sh          # 得到 ai-native/agent-{codex,claude,deepseek-harness}:dev
-    sh deploy/agent-image/build-images.sh 0.1.0    # 或者自己定 tag
+    sh apps/chain/deploy/agent-image/build-images.sh              # 得到 <项目名>/agent-{codex,claude,deepseek-harness}:latest
+    VERSION=0.1.0 sh apps/chain/deploy/agent-image/build-images.sh # 或者自己定 tag
+    APP_NAME=别的名字 sh build-images.sh                          # 或者换镜像前缀
+
+项目名与版本都不写死：`build-images.sh` 用 `APP_NAME`（默认 = 项目名，展开时由
+`chain assets` 把 ${APP} 换成真名）和 `VERSION`（默认 `latest`）；`nodes.yaml` 里的
+`image: ${APP}/agent-xxx` + `version: latest` 与它们一一对应。
+
+> 没展开就在仓库里直接跑这份脚本会报「没有项目名」并停下——这是故意的：宁可停下，
+> 也不要烘出一个没人引用的 tag。要么先 `chain assets`，要么 `APP_NAME=名字 sh build-images.sh`。
 
 三个 Dockerfile 只差两行：`npm i -g` 的包名，和 `AGENT_CMD`。想换成自己的 registry，
-改 `deploy/nodes.yaml` 里各模板的 `image` 一行即可，代码不用动。
+改 `nodes.yaml` 里各模板的 `image` 一行即可，代码不用动。
 
 | 镜像 | 装的包（2026-10-28 核实） | 默认 AGENT_CMD |
 | --- | --- | --- |
-| `ai-native/agent-codex:dev` | `@openai/codex@0.164.0` | `codex exec` |
-| `ai-native/agent-claude:dev` | `@anthropic-ai/claude-code@2.1.311` | `claude -p` |
-| `ai-native/agent-deepseek-harness:dev` | `@deepseek-ai/dsh@0.2.1-rc.2` | `dsh` |
+| `<项目名>/agent-codex:latest` | `@openai/codex@0.164.0` | `codex exec` |
+| `<项目名>/agent-claude:latest` | `@anthropic-ai/claude-code@2.1.311` | `claude -p` |
+| `<项目名>/agent-deepseek-harness:latest` | `@deepseek-ai/dsh@0.2.1-rc.2` | `dsh` |
 
 > `deepseek-harness@0.0.1` 是占位包，别装。真正的包名是 `@deepseek-ai/dsh`。
 
@@ -67,4 +75,4 @@
       -e CHAIN_NODE=crosstest -e CHAIN_BRANCH=main \
       -e CHAIN_REPO=https://example.com/org/repo.git -e CHAIN_WORKSPACE_MODE=clone \
       -e CHAIN_REQUIREMENT=REQ-1 -e CHAIN_CONTEXT="跑测试并给出结论" \
-      ai-native/agent-codex:dev
+      ai_native_framework/agent-codex:latest   # <项目名>/agent-codex:<version>

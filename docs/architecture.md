@@ -21,6 +21,7 @@ HTTP 层   apps/chain/http.go    只做校验与搬运，不下结论，不写�
                                                     │
 执行器    apps/chain/executor.go        FakeExecutor：不连外部服务
           apps/chain/executor_docker.go DockerExecutor：docker run，注入环境变量
+          apps/chain/assets.go       部署资产（模板表 + agent 镜像的 Dockerfile 与入口脚本）编进二进制，`chain assets` 展开到 `$HOME/.<项目名>/`
 ```
 
 依赖方向单向向下：HTTP 不认识 SQL，状态机不认识 docker，执行器不认识 HTTP。要换其中一层，只动那一层。
@@ -77,4 +78,5 @@ HTTP 层   apps/chain/http.go    只做校验与搬运，不下结论，不写�
 - **不依赖 GitHub**：仓库只是 project 上的一个字符串，平台不调用任何仓库 API，也不设 status check。
 - **没有独立编排器**：进度不需要调度进程推动，由「第一个还没通过的节点」算出来。
 - **AI 自审只读容器的一句话**：平台不调模型、不看产出对不对，只看容器在输出里打的那行标记；容器想怎么得出这个结论，是镜像自己的事。
+- **展开目录不迁移**：部署资产展开在 `$HOME/.<项目名>/`，项目改名之后是一个新目录，旧目录不搬、不认；要挪位置用 `chain assets -dir`，要副本就再展一次（幂等，只覆盖变化过的文件）。
 - **单机单写者**：没有多租户、没有乐观锁（`rev` 已留但未使用）。有账号体系，但只到「谁是谁 + 项目级角色」这一层：没有组织、没有分组、没有 SSO，管理员也不分级。

@@ -50,18 +50,53 @@
 
 ### 模板从哪来
 
-节点 → 容器模板的映射和模板本身都在仓库里的声明文件 `deploy/nodes.yaml`（`version: 1` + `templates` + `nodes` 两段）。`-templates` 改路径，默认就是它：
+节点 → 容器模板的映射和模板本身都在声明文件 `apps/chain/deploy/nodes.yaml`（`version: 1` + `templates` + `nodes` 两段）。它在包内，因为 `go:embed` 只能嵌本包目录；仓库外没有第二份，二进制里那一份是同一个源。
+
+`-templates` 不给时按三级回落找，日志会说清楚用的是哪一个：① 仓库里的 `apps/chain/deploy/nodes.yaml`（开发态）→ ② `$HOME/.<项目名>/nodes.yaml`（`chain assets` 展开态）→ ③ 内嵌默认表。
 
 ```bash
-go run ./cmd/chain -db chain.db -exec docker                      # 读 deploy/nodes.yaml
-go run ./cmd/chain -db chain.db -exec docker -templates /etc/nodes.yaml
+go run . -db chain.db -exec docker                    # 自动找：仓库 → 家目录 → 内嵌
+go run . -db chain.db -exec docker -templates /etc/nodes.yaml
+go run . assets --dry-run                             # 先看会展开哪些文件（不落盘）
+go run . assets                                       # 展开到 $HOME/.<项目名>/
 ```
+
+`image` 是镜像**仓库路径**，`version` 是 tag：`image: ${APP}/agent-codex` + `version: 0.1.0` 合起来是 `<项目名>/agent-codex:0.1.0`，`version` 不给就是 `latest`。`image` 最后一段自带 tag（如 `registry.example.com:5000/app/agent-codex:1.2.3`）时以 `image` 为准、`version` 不再参与——只看最后一个 `/` 之后那一段，所以 registry 的端口号不会被当成 tag。项目名解析顺序是 `-app` > `CHAIN_APP` > 编译期默认（`-ldflags "-X main.appName=…"` 可改）。
 
 - 扩展名 `.yaml`/`.yml` 按 YAML 读，其余后缀仍走早期版本的扁平 JSON 格式（老配置不用改）。
 - 声明文件**不存在**时打一行日志回落内嵌默认表，服务照常起（部署里还没放这个文件时不至于起不来）。
 - 声明文件**存在但写错**时 fail-closed 并点名字段：版本不是 1、模板缺 image 或 command、timeout 不是合法时长或 ≤0、nodes 里出现不认识的节点类型、节点引用了不存在的模板——这几种都是启动期报错，不猜。
 
 解析在 `templates.go`（YAML 走 `gopkg.in/yaml.v3`，不自己切字符串）。
+
+### 节点镜像从哪来
+
+`apps/chain/deploy/` 整个目录（`nodes.yaml` + `agent-image/` 下的三个 Dockerfile、两个 shell 脚本、一份 README，共 7 个文件）被 `go:embed` 编进二进制。所以二进制离开仓库之后，模板与 Dockerfile 仍然在里面——**不需要先 clone 仓库才能烘镜像**。
+
+要让它们落到磁盘上，跑一次展开：
+
+```bash
+go run . assets --dry-run          # 只列出会写哪 7 个文件，不落盘
+go run . assets                    # 写到 $HOME/.<项目名>/
+go run . assets -dir /tmp/x        # 换个目录（不给就是 $HOME/.<项目名>）
+go run . assets -app demo_app      # 换项目名展开，${APP} 换成 demo_app
+```
+
+展开后的形状固定：`$HOME/.<项目名>/nodes.yaml` + `$HOME/.<项目名>/agent-image/`，两个 `.sh` 是 0755、其余 0644。它幂等：内容没变的文件不重写，复跑一行就是「新写 0 个，覆盖 0 个，跳过 7 个」（某一段模板被改过时只覆盖那一个文件）。
+
+镜像就在展开目录里本地烘（同一套 Dockerfile 搬到 k3s 的构建端也一样跑，脚本不假设仓库在）：
+
+```bash
+cd "$HOME/.<项目名>/agent-image" && sh build-images.sh
+VERSION=0.1.0 sh build-images.sh          # 换 tag
+APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml 的 image 对得上）
+```
+
+三条 `docker build` 得到 `nodes.yaml` 默认引用的那三个 tag。`APP_NAME` 的默认值就是展开时写进去的项目名，烘出来的名字与被引用的名字天然一致；拿仓库里**没展开**的那份直接跑会因缺项目名报错停下（比烘出一个没人引用的 tag 好）。
+
+`${APP}` 是占位符：加载模板时换成当前项目名，`chain assets` 展开时也会把它换成真名写进 `nodes.yaml` 和 `build-images.sh`。所以项目改名之后（`-app` / `CHAIN_APP` / 编译期 `-ldflags`）模板表与脚本都不用动。
+
+镜像里只是 `node:22-slim` + git + 一个 agent CLI + `entrypoint.sh`。容器内的 clone / 写 AGENTS.md / 跑 agent / 报 `CHAIN_VERDICT:` 都归 `entrypoint.sh` 管。
 
 ### 注入什么、代码怎么进容器
 
@@ -71,7 +106,7 @@ go run ./cmd/chain -db chain.db -exec docker -templates /etc/nodes.yaml
 
 `dev` / `merge` 是空节点，本来就不跑容器（人动手）；执行器这一层也会早退，不会因为模板表里查不到就报错。
 
-镜像由 `deploy/agent-image/` 自建（`build-images.sh` 一次烘三个：codex / claude / deepseek-harness），里面只是 `node:22-slim` + git + 一个 agent CLI + `entrypoint.sh`。容器内的 clone / 写 AGENTS.md / 跑 agent / 报 `CHAIN_VERDICT:` 都归 `entrypoint.sh` 管。
+镜像怎么来、为什么要先 `chain assets` 再 `build-images.sh`，见上一节「节点镜像从哪来」。
 
 已知边界：**私有仓库 clone 需要凭证，本期不往容器里注入 token**——私有 repo 上跑容器节点会 clone 失败（entrypoint 打出 reject 并退 73）。
 
@@ -205,8 +240,13 @@ go run . -addr 127.0.0.1:8099 -exec fake     # 打开 http://127.0.0.1:8099
 要接真容器（需要本机 docker daemon）：
 
 ```bash
-go run . -addr 127.0.0.1:8099 -exec docker -templates deploy/nodes.yaml \
+cd apps/chain
+# -templates 不给时先找仓库里的 apps/chain/deploy/nodes.yaml，再找 $HOME/.<项目名>/nodes.yaml
+go run . -addr 127.0.0.1:8099 -exec docker \
   -base-url https://api.deepseek.com -model deepseek-chat
+
+# 要烘镜像（第一次用容器节点）：
+go run . assets && sh "$HOME/.<项目名>/agent-image/build-images.sh"
 ```
 
 需求图片落在 `-uploads`（默认 `data/uploads`，不存在会按需创建；`data/` 已 gitignore）。换目录就 `-uploads /var/lib/chain/uploads`，库里的记录与磁盘上的文件必须一起搬。

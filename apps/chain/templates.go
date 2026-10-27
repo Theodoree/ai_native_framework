@@ -20,8 +20,13 @@ import (
 // 模板文件的版本号。字段语义一变就 +1；读到不认识的版本一律拒绝，不猜。
 const templateFileVersion = 1
 
-// DefaultTemplateFile 是 -templates 的默认值：仓库里的声明文件。
+// DefaultTemplateFile 是开发态（从仓库根起的服务）里的声明文件位置。
+// 展开态（二进制脱离仓库）里它在 $HOME/.<项目名>/nodes.yaml——见 ResolveTemplateFile。
 const DefaultTemplateFile = "deploy/nodes.yaml"
+
+// defaultImageVersion 是模板没写 version 时补在镜像名后面的 tag。
+// 默认 latest：本地 build 出来的就是它，换版本在 nodes.yaml 里改一行。
+const defaultImageVersion = "latest"
 
 // 两类工作区获取方式：clone 是默认（容器自己拉代码），mount 只给本地开发的绝对路径。
 const (
@@ -44,7 +49,9 @@ type templateFileSpec struct {
 }
 
 type templateSpec struct {
-	Image   string            `yaml:"image" json:"image"`
+	Image string `yaml:"image" json:"image"`
+	// Version 是镜像 tag；留空按 latest。image 自己带 tag 时以 image 为准。
+	Version string            `yaml:"version" json:"version"`
 	Command []string          `yaml:"command" json:"command"`
 	Env     map[string]string `yaml:"env" json:"env"`
 	Timeout string            `yaml:"timeout" json:"timeout"`
@@ -135,7 +142,20 @@ func buildTable(spec templateFileSpec, path string) (*TemplateTable, error) {
 			}
 			d = parsed
 		}
-		out.Templates[k] = Template{Key: k, Image: t.Image, Command: t.Command, Env: t.Env, Timeout: d}
+		version := strings.TrimSpace(t.Version)
+		if version == "" {
+			version = defaultImageVersion
+		}
+		// image 里可以写 ${APP}/agent-codex：加载时就把项目名换掉，
+		// 这样运行期拿到的 Template 不再含占位符（改项目名也不必重写资产）。
+		out.Templates[k] = Template{
+			Key:     k,
+			Image:   ExpandPlaceholders(strings.TrimSpace(t.Image)),
+			Version: version,
+			Command: t.Command,
+			Env:     t.Env,
+			Timeout: d,
+		}
 	}
 	for _, nodeType := range sortedKeys(spec.Nodes) {
 		if !isKnownNodeType(nodeType) {
@@ -176,6 +196,31 @@ func LoadTemplatesOrFallback(path string, logf func(string, ...any)) (*TemplateT
 		logf("模板文件 %s 不存在，回落内嵌默认表（%s）", path, strings.Join(sortedKeys(defaultTemplateRegistry()), "、"))
 	}
 	return embeddedTemplateTable(), nil
+}
+
+// ResolveTemplateFile 按三级回落找声明文件，并把找到的是哪一个说清楚：
+//  1. 仓库里的 deploy/nodes.yaml —— 开发态（在仓库里起服务）
+//  2. $HOME/.<项目名>/nodes.yaml —— 展开态（二进制脱离仓库，资产由 chain assets 展开）
+//  3. 都没有 → 返回空串，调用方回落内嵌默认表
+//
+// 三条路径的先后不许调换：仓库里改的那份永远优先，否则开发时改 yaml 会「没反应」。
+func ResolveTemplateFile(logf func(string, ...any)) string {
+	candidates := []string{DefaultTemplateFile}
+	if home := AppHome(); home != "" {
+		candidates = append(candidates, filepath.Join(home, assetsNodesFile))
+	}
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			if logf != nil {
+				logf("模板文件：%s", p)
+			}
+			return p
+		}
+	}
+	if logf != nil {
+		logf("没找到模板文件（试过 %s），回落内嵌默认表", strings.Join(candidates, "、"))
+	}
+	return ""
 }
 
 func isKnownNodeType(t string) bool {

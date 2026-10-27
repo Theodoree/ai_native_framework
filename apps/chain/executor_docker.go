@@ -16,11 +16,38 @@ import (
 // Template 是一个容器模板：用哪个镜像、镜像里执行什么、跑多久、额外环境变量。
 // 六类节点的默认模板只是默认值——声明文件 deploy/nodes.yaml 里的才是准的。
 type Template struct {
-	Key     string            `json:"key"`
-	Image   string            `json:"image"`
+	Key string `json:"key"`
+	// Image 是镜像仓库地址，可以不带 tag（如 ${APP}/agent-codex）；tag 由 Version 补。
+	Image string `json:"image"`
+	// Version 是镜像 tag，默认 latest；image 自己带 tag 时以 image 为准。
+	Version string            `json:"version,omitempty"`
 	Command []string          `json:"command"`
 	Env     map[string]string `json:"env,omitempty"`
 	Timeout time.Duration     `json:"timeout,omitempty"`
+}
+
+// ImageRef 给出真正传给 docker 的镜像引用。
+// 规则只有一条：最后一段已经带 tag（含 `:`）就原样用，否则补 :<Version>；
+// Version 为空补 latest。${APP} 占位符在这里再展开一次——加载时已经展开过，
+// 这里是给直接构造 Template 的调用方（测试、内嵌表）兜底。
+func (t Template) ImageRef() string {
+	img := ExpandPlaceholders(strings.TrimSpace(t.Image))
+	if img == "" {
+		return ""
+	}
+	version := strings.TrimSpace(t.Version)
+	if version == "" {
+		version = defaultImageVersion
+	}
+	// 只看最后一段：registry.example.com:5000/agent 里的端口号不算 tag。
+	last := img
+	if i := strings.LastIndex(img, "/"); i >= 0 {
+		last = img[i+1:]
+	}
+	if strings.Contains(last, ":") {
+		return img
+	}
+	return img + ":" + version
 }
 
 // defaultTemplateRegistry 是内嵌兜底表（没有任何声明文件时用它）。
@@ -28,9 +55,9 @@ type Template struct {
 // 「容器没跑起来」落一条评论，而不是静默成功。
 func defaultTemplateRegistry() map[string]Template {
 	return map[string]Template{
-		"deepseek-harness": {Key: "deepseek-harness", Image: "ai-native/agent-deepseek-harness:dev", Command: []string{"/opt/agent/entrypoint.sh"}},
-		"codex":            {Key: "codex", Image: "ai-native/agent-codex:dev", Command: []string{"/opt/agent/entrypoint.sh"}},
-		"claude":           {Key: "claude", Image: "ai-native/agent-claude:dev", Command: []string{"/opt/agent/entrypoint.sh"}},
+		"deepseek-harness": {Key: "deepseek-harness", Image: appPlaceholder + "/agent-deepseek-harness", Version: defaultImageVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
+		"codex":            {Key: "codex", Image: appPlaceholder + "/agent-codex", Version: defaultImageVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
+		"claude":           {Key: "claude", Image: appPlaceholder + "/agent-claude", Version: defaultImageVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
 	}
 }
 
@@ -55,6 +82,10 @@ func LoadTemplates(path string) (map[string]Template, error) {
 		}
 		if t.Image == "" || len(t.Command) == 0 {
 			return nil, fmt.Errorf("模板 %s 缺少 image 或 command", k)
+		}
+		t.Image = ExpandPlaceholders(t.Image)
+		if t.Version == "" {
+			t.Version = defaultImageVersion
 		}
 		out[k] = t
 	}
@@ -175,7 +206,7 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 	if key != "" {
 		args = append(args, "-e", d.apiKeyEnv()+"="+key)
 	}
-	args = append(args, tmpl.Image)
+	args = append(args, tmpl.ImageRef())
 	args = append(args, tmpl.Command...)
 
 	// 模板里声明的 timeout 优先；没声明才用执行器自己的默认（10 分钟）。
@@ -218,7 +249,7 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 		workspaceLine = fmt.Sprintf("工作区 mount：%s（开发捷径：挂本机目录，不 clone）", mountDir)
 	}
 	body := strings.Join([]string{
-		fmt.Sprintf("【容器执行】模板 %s（镜像 %s），节点 %s（%s）", tmpl.Key, tmpl.Image, n.Key, n.Type),
+		fmt.Sprintf("【容器执行】模板 %s（镜像 %s），节点 %s（%s）", tmpl.Key, tmpl.ImageRef(), n.Key, n.Type),
 		fmt.Sprintf("分支 %s，退出码 %d，结论 %s", r.Branch, exit, outcome),
 		workspaceLine,
 		verdictLine(n, verdict, reason),

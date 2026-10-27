@@ -13,10 +13,10 @@ import (
 	"time"
 )
 
-// repoNodesYAML 是仓库里那份声明文件；测试从包目录往上两级找它。
+// repoNodesYAML 是包里那份声明文件（资产在 apps/chain/deploy）；go test 的工作目录就是 apps/chain。
 func repoNodesYAML(t *testing.T) string {
 	t.Helper()
-	p := filepath.Join("..", "..", "deploy", "nodes.yaml")
+	p := filepath.Join("deploy", "nodes.yaml")
 	if _, err := os.Stat(p); err != nil {
 		t.Fatalf("仓库里应当有 %s：%v", p, err)
 	}
@@ -42,8 +42,15 @@ func TestTemplateFileReadsRepoDeclaration(t *testing.T) {
 		if !ok {
 			t.Fatalf("声明文件里应当有模板 %s，实际只有 %s", key, strings.Join(sortedKeys(table.Templates), "、"))
 		}
-		if tmpl.Image != "ai-native/agent-"+key+":dev" {
-			t.Fatalf("模板 %s 的镜像应当是本地 build 的 tag，实际 %q", key, tmpl.Image)
+		// 声明文件里写的是 ${APP}/agent-xxx，加载时就把项目名展开掉，运行期不再含占位符。
+		if tmpl.Image != CurrentAppName()+"/agent-"+key {
+			t.Fatalf("模板 %s 的 image 应当展开成 %s/agent-%s，实际 %q", key, CurrentAppName(), key, tmpl.Image)
+		}
+		if tmpl.Version != defaultImageVersion {
+			t.Fatalf("模板 %s 的 version 应当是 %s，实际 %q", key, defaultImageVersion, tmpl.Version)
+		}
+		if want := CurrentAppName() + "/agent-" + key + ":" + defaultImageVersion; tmpl.ImageRef() != want {
+			t.Fatalf("模板 %s 的镜像引用应当是 %s，实际 %q", key, want, tmpl.ImageRef())
 		}
 		if len(tmpl.Command) != 1 || tmpl.Command[0] != "/opt/agent/entrypoint.sh" {
 			t.Fatalf("模板 %s 的命令应当是 entrypoint.sh，实际 %v", key, tmpl.Command)

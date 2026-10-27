@@ -1,30 +1,36 @@
-# 节点模板表 —— 平台起容器时读的就是这个文件（apps/chain -templates 的默认值）。
+# 节点模板表 —— 平台起容器时读的就是这个文件（apps/chain 的模板表）。
 #
 # 三种角色：templates 说「用哪个镜像、跑什么命令、给多少时间」，nodes 说
 # 「链条上哪一站用哪个模板」。改这里不需要改 Go 代码、也不需要重新编译。
 #
-# 镜像怎么来：deploy/agent-image/build-images.sh 三条 docker build 就得到下面
-# 这三个 tag。换成你自己的 registry 地址也只需要改 image 这一行。
+# 项目名不写死：image 里的 ${APP} 在加载时换成当前项目名（-app > CHAIN_APP > 编译期默认）。
+# 换镜像版本有两种写法：改下面的 version（默认 latest），或把 image 写成带 tag 的完整引用
+# （如 registry.example.com/agent-codex:1.2.3）—— 最后一段带 ':' 时 version 就不再生效。
+#
+# 镜像怎么来：agent-image/build-images.sh 三条 docker build 就得到下面这三个 tag；
+# 二进制脱离仓库时先跑 chain assets 把它展开到 $HOME/.<项目名>/。
 version: 1
 
 templates:
   codex:
-    # 本地 build 的 tag，或换你的 registry 地址（如 registry.example.com/agent-codex:1.2）
-    image: ai-native/agent-codex:dev
+    image: ${APP}/agent-codex
+    version: latest
     command: ["/opt/agent/entrypoint.sh"]
     timeout: 30m
     env:
       AGENT_NAME: codex
 
   claude:
-    image: ai-native/agent-claude:dev
+    image: ${APP}/agent-claude
+    version: latest
     command: ["/opt/agent/entrypoint.sh"]
     timeout: 30m
     env:
       AGENT_NAME: claude
 
   deepseek-harness:
-    image: ai-native/agent-deepseek-harness:dev
+    image: ${APP}/agent-deepseek-harness
+    version: latest
     command: ["/opt/agent/entrypoint.sh"]
     timeout: 30m
     env:
