@@ -2,70 +2,21 @@
 .DS_Store
 Thumbs.db
 
-# 依赖
-node_modules/
-.venv/
-venv/
-__pycache__/
-*.pyc
+# 编辑器
+.idea/
+.vscode/
 
-# 构建产物
-dist/
-build/
+# 本机缓存与运行时状态（不进库）
+.cache/
+apps/chain/.cache/
+.agent-teams/
 
-# 运行日志
+# 运行时数据：project / 需求 / 事件流（每台实例各自累积，不入库）
+data/
+
+# 图表工具产物
+.archify/
+
+# 日志
 logs/
 *.log
-*.log.*
-
-# 临时脚本与本地验证落点
-tmp/
-
-# 平台运行态账本（每台实例各自累积，不入库）
-.agents/platform/ledger.jsonl
-
-# 密钥与本地配置
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-
-# 令牌与密钥（常见命名模式）
-*authtoken*
-*api_token*
-*api-token*
-*apikey*
-*api_key*
-*api-key*
-*secret_key*
-*secret-key*
-*credentials*
-*.token
-
-# 测试与覆盖率
-.coverage
-coverage/
-.pytest_cache/
-.agent-teams
-# 工作区内的 Go 构建缓存（门在受限环境下也要能跑）
-.cache/
-
-# Go 单二进制内嵌的前端产物（构建期从 apps/web-vue/dist 复制；只保留占位说明）
-!apps/api-go/dist/
-apps/api-go/dist/*
-!apps/api-go/dist/.gitkeep
-!apps/api-go/dist/README.md
-
-# 平台远端缓存 / 派生索引 / 在途台账（每台实例各自累积，不入库）
-.agents/platform/cache/
-.agents/platform/index.db
-.agents/platform/index.db-journal
-.agents/platform/index.db-wal
-.agents/platform/index.db-shm
-.agents/platform/kb.db
-.agents/platform/kb.db-journal
-.agents/platform/kb.db-wal
-.agents/platform/kb.db-shm
-.agents/platform/outbox.jsonl
-
