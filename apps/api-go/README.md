@@ -22,7 +22,7 @@
 - 不替 label 与账本选边：两者不一致时只标 §divergence: true§ 并同时给出两边，不猜哪个对
 - 默认不写远端：§PLATFORM_WRITE§ 不是 §1§ 时，发起变更只记在途、不联网；没有 token 时也不联网写
 - 不把在途写进 §ledger.jsonl§：折叠器对每行按 §event.to§ 投影状态，非状态事件进去会污染折叠结果
-- 不判定「该不该汇」：白名单在 Go 里是 §scripts/kb-export.mjs§ 的同一口径（见「知识库本体」），不改汇入范围、不做去重、不写知识库
+- 不判定「该不该汇」：白名单是 §apps/api-go/kb.go§ 与 §apps/engine/kbexport.go§ 两处同口径（见「知识库本体」；逐字比对判据在 §tests/kb-allowlist-parity.test.mjs§），不改汇入范围、不做去重、不写知识库
 
 ## 运行
 
@@ -31,18 +31,18 @@ cd apps/api-go
 PLATFORM_ROOT=$(git rev-parse --show-toplevel) PORT=4317 go run .
 ```
 
-| 环境变量                    | 默认                                                     | 含义                                                         |
-| --------------------------- | -------------------------------------------------------- | ------------------------------------------------------------ |
-| §PORT§                      | §4317§                                                   | 只监听 §127.0.0.1§                                           |
-| §PLATFORM_ROOT§             | 从当前目录向上找到带 §.agents/platform/state-machine.yml§ 的目录 | 仓库根；声明、账本、索引都以它为根                     |
-| §PLATFORM_DIST§             | 空（用内嵌）                                             | 开发态指向真实 dist 目录，覆盖内嵌页                         |
-| §GH_TOKEN§ / §GITHUB_TOKEN§ | 空                                                       | 只读同步用的 token；都没有 → 同步回 §E_NO_TOKEN§，不假装成功 |
-| §PLATFORM_REPO§             | 从 §git remote get-url origin§ 解析                      | 同步/投递的目标仓库 §owner/repo§                             |
-| §PLATFORM_WRITE§            | 空（关闭）                                               | §1§/§true§ 才允许真的向远端写 label                          |
-| §PLATFORM_CACHE§            | §.agents/platform/cache/remote.json§                     | 远端快照缓存路径                                             |
-| §PLATFORM_INDEX§            | §.agents/platform/index.db§                              | 派生索引路径                                                 |
-| §PLATFORM_OUTBOX§           | §.agents/platform/outbox.jsonl§                          | 在途台账路径                                                 |
-| §PLATFORM_OUTBOX_DEADLINE§  | §10m§                                                    | 在途超时判 §stalled§ 的时限（Go duration）                   |
+| 环境变量                    | 默认                                                             | 含义                                                         |
+| --------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------ |
+| §PORT§                      | §4317§                                                           | 只监听 §127.0.0.1§                                           |
+| §PLATFORM_ROOT§             | 从当前目录向上找到带 §.agents/platform/state-machine.yml§ 的目录 | 仓库根；声明、账本、索引都以它为根                           |
+| §PLATFORM_DIST§             | 空（用内嵌）                                                     | 开发态指向真实 dist 目录，覆盖内嵌页                         |
+| §GH_TOKEN§ / §GITHUB_TOKEN§ | 空                                                               | 只读同步用的 token；都没有 → 同步回 §E_NO_TOKEN§，不假装成功 |
+| §PLATFORM_REPO§             | 从 §git remote get-url origin§ 解析                              | 同步/投递的目标仓库 §owner/repo§                             |
+| §PLATFORM_WRITE§            | 空（关闭）                                                       | §1§/§true§ 才允许真的向远端写 label                          |
+| §PLATFORM_CACHE§            | §.agents/platform/cache/remote.json§                             | 远端快照缓存路径                                             |
+| §PLATFORM_INDEX§            | §.agents/platform/index.db§                                      | 派生索引路径                                                 |
+| §PLATFORM_OUTBOX§           | §.agents/platform/outbox.jsonl§                                  | 在途台账路径                                                 |
+| §PLATFORM_OUTBOX_DEADLINE§  | §10m§                                                            | 在途超时判 §stalled§ 的时限（Go duration）                   |
 
 ## 单二进制
 
@@ -172,10 +172,10 @@ cd ../.. && npm run check   # 链尾的 check:go = gofmt 干净 + go vet + go te
 }
 ```
 
-- §group§ 只有四个值：§notes§（§.agents/notes/implemented/*.md§）、§module§（任意层级的 §README.md§）、§docs§（§docs/architecture.md§、§docs/permissions.md§、§docs/audit-contract.md§）、§postmortem§（§docs/postmortem/*.md§）
+- §group§ 只有四个值：§notes§（§.agents/notes/implemented/<单层>.md§）、§module§（任意层级的 §README.md§）、§docs§（§docs/architecture.md§、§docs/permissions.md§、§docs/audit-contract.md§）、§postmortem§（§docs/postmortem/<单层>.md§）
 - 排序固定：先按 §notes → module → docs → postmortem§ 的组序，组内按 §path§ 字典序；前端不必再排
 - §title§：文件第一行（跳过开头的空行）以 §"# "§ 开头就去掉 §#§ 与空白；没有标题则用文件名去扩展名
-- §sha256§ 是**工作区文件字节**的摘要（不是 §kb-export.mjs§ 用的 git blob 字节）；§bytes§ 是同一份字节的长度
+- §sha256§ 是**工作区文件字节**的摘要，不是 §apps/engine/kbexport.go§ 那份 CI 清单用的 git blob 字节（§git cat-file blob <ref>:<path>§，见该文件的 §KbSha256Hex§）；§bytes§ 是同一份字节的长度
 - §builtAt§ 只在索引重建时变：现盘没变它就稳定，可用来判断「这份目录是不是新的」
 - 一次请求就把全部白名单文件读一遍并复算 §sha256§：索引是缓存，不是真相源；对几十个小文件，这比「按 mtime 猜」更不可能漏掉漂移
 
@@ -242,7 +242,7 @@ cd ../.. && npm run check   # 链尾的 check:go = gofmt 干净 + go vet + go te
 | kind       | HTTP | 何时                                         |
 | ---------- | ---- | -------------------------------------------- |
 | §rejected§ | 409  | 业务拒绝（判定器拒绝、标题为空、找不到需求） |
-| §infra§    | 500  | 基础设施（配置坏、引擎读不到、请求体坏）      |
+| §infra§    | 500  | 基础设施（配置坏、引擎读不到、请求体坏）     |
 | ——         | 404  | 没有这个路由，§code: E_NO_ROUTE§             |
 
 请求体解析失败 → 500 §E_BODY_UNPARSABLE§（与原型一致）；请求体超过 1MB → 500 §E_BODY_TOO_LARGE§。
@@ -307,16 +307,16 @@ view := cfg.View()                       // board.config 的形状
 
 ## 知识库本体（§/api/kb§ + §.agents/platform/kb.db§）
 
-知识库要「汇什么」由 §docs/knowledge-base.md§ 定义；这里只负责把同一批文件做成可查询的派生索引。**白名单两处同口径，改一处必须改另一处：§scripts/kb-export.mjs§ 的 §ALLOWED§ 与 §apps/api-go/kb.go§ 的 §kbAllowRules§。**
+知识库要「汇什么」由 §docs/knowledge-base.md§ 定义；这里只负责把同一批文件做成可查询的派生索引。**白名单两处同口径，改一处必须改另一处：§apps/api-go/kb.go§ 的 §kbAllowRules§ / §kbDenyDirs§ / §kbDenyNames§ 与 §apps/engine/kbexport.go§ 的 §kbAllowed§ / §kbDenyDirs§ / §kbDenyNames§。** 两份实现写法不同（前者反引号原始串、后者双引号串），规则集必须一致；逐字比对由 §tests/kb-allowlist-parity.test.mjs§ 读两份源码做，归一只有三条（剥 §(?i)§ 行内标志、§(?:…)§ 视为 §(…)§、§\/§ 与 §/§ 归一）。
 
-| 命中路径                                     | group        |
-| -------------------------------------------- | ------------ |
-| §.agents/notes/implemented/<单层>.md§         | §notes§      |
-| 任意层级的 §README.md§                        | §module§     |
-| §docs/architecture.md§ 等三份契约文档         | §docs§       |
-| §docs/postmortem/<单层>.md§                   | §postmortem§ |
+| 命中路径                              | group        |
+| ------------------------------------- | ------------ |
+| §.agents/notes/implemented/<单层>.md§ | §notes§      |
+| 任意层级的 §README.md§                | §module§     |
+| §docs/architecture.md§ 等三份契约文档 | §docs§       |
+| §docs/postmortem/<单层>.md§           | §postmortem§ |
 
-- 判定顺序与导出器一致：**先 deny 再 allow**。deny 目录 §node_modules/dist/build/coverage/.next/out/tmp/vendor§，deny 名字 §.env*§、§*.pem/*.key/*.p12/…§、§*secret*/*credential*/*api_key*/*token*§ 等十条，与导出器的 §DENY_NAMES§ 逐条对应
+- 判定顺序与导出器一致：**先 deny 再 allow**。deny 目录 §node_modules/dist/build/coverage/.next/out/tmp/vendor§，deny 名字 `.env*`、后缀型 `*.pem` / `*.key` / `*.p12` 等，以及含 `secret` / `credential` / `api_key` / `token` 的词，共十条，与导出器的 `DENY_NAMES` 逐条对应
 - 扫描额外跳过 §.git§ 与 §.cache§：前者不是汇入内容，后者是本机的 Go 构建缓存（上万个文件）
 - 索引表 §kb_items(path, title, sha256, bytes, grp)§ + §meta(schema_version, built_at)§；重建在**一个事务**里 §DROP§ 后重写，半途失败不会留下半份结构
 - 重建触发只有三条：索引文件不存在、§schema_version§ 不符、现盘扫描结果与索引记录的集合或 §sha256/bytes§ 有任一不符（增、删、改都算）。命中任一条就**整份重建**，不做增量
@@ -325,10 +325,10 @@ view := cfg.View()                       // board.config 的形状
 
 ## 依赖与许可证
 
-| 依赖                 | 版本      | 许可证       | 为什么                                                                                                   |
-| -------------------- | --------- | ------------ | -------------------------------------------------------------------------------------------------------- |
-| §modernc.org/sqlite§ | §v1.34.5§ | BSD-3-Clause | 纯 Go SQLite（无 cgo，跨平台交叉编译不需要 C 工具链）；索引是 SQL 查询面，手写文件格式会自己造一个数据库 |
-| §ai-native-framework/apps/engine§ | §replace => ../engine§ | 本仓 | 判定器与账本的唯一实现（进程内调用）；它带进来的第三方依赖只有 §gopkg.in/yaml.v3§（MIT） |
+| 依赖                              | 版本                   | 许可证       | 为什么                                                                                                   |
+| --------------------------------- | ---------------------- | ------------ | -------------------------------------------------------------------------------------------------------- |
+| §modernc.org/sqlite§              | §v1.34.5§              | BSD-3-Clause | 纯 Go SQLite（无 cgo，跨平台交叉编译不需要 C 工具链）；索引是 SQL 查询面，手写文件格式会自己造一个数据库 |
+| §ai-native-framework/apps/engine§ | §replace => ../engine§ | 本仓         | 判定器与账本的唯一实现（进程内调用）；它带进来的第三方依赖只有 §gopkg.in/yaml.v3§（MIT）                 |
 
 传递依赖（§go.sum§ 全部已提交，CI 里 §go build§/§go test§ 按需下载）：§modernc.org/libc§、§modernc.org/mathutil§、§modernc.org/memory§、§github.com/remyoudompheng/bigfft§、§golang.org/x/sys§（BSD-3-Clause）；§github.com/dustin/go-humanize§、§github.com/mattn/go-isatty§、§github.com/ncruces/go-strftime§、§github.com/google/uuid§（MIT / BSD-3-Clause）。
 
