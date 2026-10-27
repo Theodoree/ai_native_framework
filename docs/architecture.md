@@ -27,29 +27,29 @@ AI 原生研发交付引擎：需求以 issue 入库，以 PR 交付，交付物
 | 合并                                  | required status checks  | CI                    |
 | 知识库汇入                            | 合并后 job              | CI                    |
 
-### 判据跑在哪（阶段 D2 的事实）
+### 判据跑在哪（Node 载体全部删除后的事实）
 
 - **一个二进制**：`apps/engine` 编译出 `.cache/bin/engine`，16 个子命令 —— `validate` / `check-config` / `consult` / `ledger` / `build-intent` / `last-change` / `writer-record` / `merge-gate` / `audit-findings` / `audit-slot` / `routing` / `audit-collect` / `audit-review` / `copy-dist` / `cli` / `kb-export`；`apps/api-go` 以库的形式在同一进程里调用它，不起子进程。
-- **已切到它的调用点**：`merge-gate.yml` / `state-writer.yml` / `last-change.yml` / `kb-sync.yml` 四个 workflow，以及 `package.json` 的 `check:state` / `check:web` / `web:dist` / `cli`。构建唯一入口是 `npm run build:engine`。
-- **仍然由 Node 执行的**：`.github/workflows/audit.yml` 里 `node scripts/audit-review.mjs`（2 次）/ `audit-slot.mjs`（4 次）/ `audit-findings.mjs`（1 次）；以及 `audit.yml`（4 处）/ `state-writer.yml`（5 处）/ `merge-gate.yml`（1 处）的内联 `node -e/-p`（取 check runs、拼 JSON）；以上计数以 HEAD 为准。六个 workflow（`audit` / `check` / `kb-sync` / `last-change` / `merge-gate` / `state-writer`）都还留着 `setup-node`。
-- `scripts/routing.mjs` 与 `scripts/audit-collect.mjs` 不被任何 workflow 或 npm 脚本调用，只被测试 `import`。
+- **所有判据调用点都在这里**：六个 workflow（`audit` / `check` / `kb-sync` / `last-change` / `merge-gate` / `state-writer`）的判定步，以及 `package.json` 的 `check:state` / `check:web` / `web:dist` / `cli`，跑的都是 `./.cache/bin/engine`。构建唯一入口是 `npm run build:engine`，六个 workflow 都在 `npm ci` 之后各有一份 `actions/setup-go@v5`(1.22) + 一次 `npm run build:engine`——先有二进制，调用点才可能绿。
+- **Node 只剩非判据用途**：workflow 里的内联 `node -e/-p`（`audit.yml` 4 处、`state-writer.yml` 5 处、`merge-gate.yml` 1 处，取 check runs、拼读 JSON 片段；以 HEAD 为准）与测试/工具链（vitest、prettier、oxlint、`tests/goldens/freeze.mjs`）。没有一处 Node 在执行判据，六个 workflow 仍留 `setup-node` 只为这些片段。
+- **`scripts/` 里已没有 `.mjs`**：15 个 Node 载体整批删除，判据实现只在 `apps/engine`。独立参照不是旧脚本，而是 `tests/goldens/` 里 Node 时代冻下来的逐字节期望值（stdout / stderr / 退出码 / 写出文件 / 请求记录）；`freeze.mjs` 按 `scripts/` 下被引用文件是否存在判断能否重冻，a / b / c 三套因此不可重冻，命中即以可读说明中止，不崩溃也不静默跳过。
 
 ## 三、声明真源（一个事实只有一个家）
 
-| 事实                                | 家                                                                                                                                                                                             |
-| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| issue 状态、允许的转换、谁能触发    | `.agents/platform/state-machine.yml`                                                                                                                                                           |
-| 转换合法性的机械判定                | `apps/engine`（Go 库 + `cmd/engine` 单二进制：平台与门在进程内调用，CI 与 npm 脚本调 `.cache/bin/engine`）；`scripts/` 下对应的 `.mjs` 是同口径的 Node **对照物**，只供 parity 测试与 `import` |
-| 权限项与交付节点的对应              | `docs/permissions.md`                                                                                                                                                                          |
-| 审计的输入、输出、判据与 INFRA 口径 | `docs/audit-contract.md`                                                                                                                                                                       |
-| PR 必填字段                         | `.github/PULL_REQUEST_TEMPLATE/proposed.md`、`.github/PULL_REQUEST_TEMPLATE/bugfix.md`                                                                                                         |
-| 汇入什么 / 何时 / 什么格式          | `docs/knowledge-base.md`                                                                                                                                                                       |
-| 每个模块是否强制带测试              | `OWNERS.md` 的模块表                                                                                                                                                                           |
-| 本机平台实例：HTTP 面与账本接口     | `apps/api-go/README.md`（判定与账本经 `apps/engine` 在进程内调用，不起子进程、不自己判状态机）                                                                                                 |
-| 本机平台实例：页面与交互            | `apps/web-vue/README.md`（页面只经 JSON API 说话，不判合法性，409 原样呈现）                                                                                                                   |
-| 远端 issue 列表快照（读缓存）       | `apps/api-go/README.md`（`.agents/platform/cache/remote.json` 是缓存，不是真源；304 不写、失败保留旧快照 + fetchedAt）                                                                         |
-| 派生索引（查询用）                  | `apps/api-go/README.md`（`.agents/platform/index.db` 纯派生，删了自愈；不许反向当作真源）                                                                                                      |
-| 在途投递台账（本地未完成的外发）    | `apps/api-go/README.md`（`.agents/platform/outbox.jsonl`：唯一无法从真源重建的本地事实，不进账本）                                                                                             |
+| 事实                                | 家                                                                                                                                                                                                                |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| issue 状态、允许的转换、谁能触发    | `.agents/platform/state-machine.yml`                                                                                                                                                                              |
+| 转换合法性的机械判定                | `apps/engine`（Go 库 + `cmd/engine` 单二进制：平台与门在进程内调用，CI 与 npm 脚本调 `.cache/bin/engine`）；Node 侧对照物已整批删除，独立的第二意见是 `tests/goldens/` 的冻结 golden（不可重冻，见 `freeze.mjs`） |
+| 权限项与交付节点的对应              | `docs/permissions.md`                                                                                                                                                                                             |
+| 审计的输入、输出、判据与 INFRA 口径 | `docs/audit-contract.md`                                                                                                                                                                                          |
+| PR 必填字段                         | `.github/PULL_REQUEST_TEMPLATE/proposed.md`、`.github/PULL_REQUEST_TEMPLATE/bugfix.md`                                                                                                                            |
+| 汇入什么 / 何时 / 什么格式          | `docs/knowledge-base.md`                                                                                                                                                                                          |
+| 每个模块是否强制带测试              | `OWNERS.md` 的模块表                                                                                                                                                                                              |
+| 本机平台实例：HTTP 面与账本接口     | `apps/api-go/README.md`（判定与账本经 `apps/engine` 在进程内调用，不起子进程、不自己判状态机）                                                                                                                    |
+| 本机平台实例：页面与交互            | `apps/web-vue/README.md`（页面只经 JSON API 说话，不判合法性，409 原样呈现）                                                                                                                                      |
+| 远端 issue 列表快照（读缓存）       | `apps/api-go/README.md`（`.agents/platform/cache/remote.json` 是缓存，不是真源；304 不写、失败保留旧快照 + fetchedAt）                                                                                            |
+| 派生索引（查询用）                  | `apps/api-go/README.md`（`.agents/platform/index.db` 纯派生，删了自愈；不许反向当作真源）                                                                                                                         |
+| 在途投递台账（本地未完成的外发）    | `apps/api-go/README.md`（`.agents/platform/outbox.jsonl`：唯一无法从真源重建的本地事实，不进账本）                                                                                                                |
 
 ## 四、两段式触发（按实例分，不写进规范分支）
 

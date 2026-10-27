@@ -399,17 +399,18 @@ func TestRunRoutingCheckFailsOnHardcodedModel(t *testing.T) {
 	}
 }
 
-// 脚本本身不许自己伸手：路由判据只能来自声明与 workflow 文本。
-// 这条断言随 scripts/routing.mjs 一起死 —— 脚本删掉时它就该删。
-func TestRoutingScriptHasNoNetworkOrSubprocessChannel(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join(repoRootAbs, "scripts/routing.mjs"))
+// 判据本身不许伸手：路由只能来自声明与 workflow 文本。
+// 原来这条读的是 scripts/routing.mjs（脚本已删）；钉的对象换成实现本体，
+// 抓的是同一件事 —— 路由判定没有第二条数据来源（网络 / 子进程 / 环境里的别处）。
+func TestRoutingHasNoNetworkOrSubprocessChannel(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(repoRootAbs, "apps", "engine", "routing.go"))
 	if err != nil {
-		t.Fatalf("读不到 scripts/routing.mjs: %v", err)
+		t.Fatalf("读不到 apps/engine/routing.go: %v", err)
 	}
 	source := string(raw)
-	for _, forbidden := range []string{"fetch(", "node:http", "node:https", "node:net", "node:dns", "node:tls", "child_process", "XMLHttpRequest"} {
+	for _, forbidden := range []string{"net/http", "net\"", "os/exec", "exec.Command", "child_process", "XMLHttpRequest"} {
 		if strings.Contains(source, forbidden) {
-			t.Fatalf("scripts/routing.mjs 不该出现 %q", forbidden)
+			t.Fatalf("apps/engine/routing.go 不该出现 %q", forbidden)
 		}
 	}
 }
