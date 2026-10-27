@@ -51,3 +51,5 @@ npm run check     # 配置自检 + lint + 测试 + Go + 前端构建；退出码
 ```
 
 退出码语义：`0` 通过 · `1` 拒绝（判定为不合法） · `3` INFRA（配置或输入不可判定）。**INFRA 不算通过。**
+
+长会话有一个运行时上限要先知道：上下文压缩只改写「模型看得见的请求」，工具调用前置审查是另一次请求、读未压缩原始会话，因此它会随工具输出单调增长并先撞窗口（`413 side_request_payload_too_large`，连 `compress` 一起被拦）。机制与应对见 `.agents/notes/implemented/dsh-side-request-payload.md`；习惯上大文件只读需要的行区间、日志只读尾部、子代理报告要摘要。
