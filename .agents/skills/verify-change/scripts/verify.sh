@@ -18,6 +18,7 @@ usage() {
 
 自动识别（按优先级取第一个命中；只认项目已有的配置文件，不新增任何格式）：
   package.json -> <包管理器> test（包管理器按 lockfile 判定，没有就用 npm）
+  apps/chain/go.mod -> gofmt + go vet + go test（缓存落到 apps/chain/.cache/）
   go.mod       -> go test ./...
   Cargo.toml   -> cargo test
   pyproject.toml / pytest.ini / tox.ini -> pytest -q
@@ -42,6 +43,11 @@ take_first() {  # 自动识别：按优先级取第一个命中
     if [ -f pnpm-lock.yaml ]; then add "pnpm test" "pnpm test"
     elif [ -f yarn.lock ]; then add "yarn test" "yarn test"
     else add "npm test" "npm test"; fi
+  elif [ -f apps/chain/go.mod ]; then
+    # 本仓：模块在 apps/chain，构建缓存必须落仓库内（沙箱与 CI 都不写家目录）。
+    add "gofmt" 'cd apps/chain && export GOCACHE="$PWD/.cache/go-build" GOPATH="$PWD/.cache/go" && test -z "$(gofmt -l $(find . -name "*.go" -not -path "./.cache/*"))"'
+    add "go vet" 'cd apps/chain && export GOCACHE="$PWD/.cache/go-build" GOPATH="$PWD/.cache/go" && go vet ./...'
+    add "go test" 'cd apps/chain && export GOCACHE="$PWD/.cache/go-build" GOPATH="$PWD/.cache/go" && go test ./...'
   elif [ -f go.mod ]; then add "go test ./..." "go test ./..."
   elif [ -f Cargo.toml ]; then add "cargo test" "cargo test"
   elif [ -f pyproject.toml ] || [ -f pytest.ini ] || [ -f tox.ini ]; then add "pytest -q" "pytest -q"
@@ -85,7 +91,7 @@ fi
 
 PASS=0; FAIL=0; SKIP=0
 if [ "$NSTEP" -eq 0 ]; then
-  echo "SKIP  未识别到可执行的测试命令（看过 package.json 的 test 脚本 / go.mod / Cargo.toml / pyproject.toml / pytest.ini / tox.ini / pom.xml / build.gradle）"
+  echo "SKIP  未识别到可执行的测试命令（看过 package.json 的 test 脚本 / apps/chain/go.mod / go.mod / Cargo.toml / pyproject.toml / pytest.ini / tox.ini / pom.xml / build.gradle）"
   echo "      提示：用 --run \"<命令>\" 显式指定。识别不到技术栈不是失败，但也不等于验证通过。"
   SKIP=1
 fi

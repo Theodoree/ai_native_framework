@@ -16,5 +16,7 @@ description: "Use when finishing a change — run the verification loop: tests, 
 ## 规则
 
 - 验证优先于声称完成：没有测试通过，不算完成
-- 改 `scripts/verify.sh` 必须跑 `tests/verify-script.test.mjs`：它用正/反用例证明脚本抓得住失败（有测试却跑不通时报 FAIL），而不只是会打印 ok
+- 改 `verify.sh` 必须用正反两步自证它抓得住失败（本仓没有 JS 测试套件，反例只能真跑）：
+  `bash .agents/skills/verify-change/scripts/verify.sh --run true` 应 `exit 0` 且汇总 `PASS=1 FAIL=0`；
+  `--run false` 应 `exit 1` 且打印 `FAIL  run-1`。只看到 ok 不算验证过
 - 状态标记与 `docs/AGENTS.md` 同步
