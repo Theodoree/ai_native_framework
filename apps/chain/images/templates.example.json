@@ -1,0 +1,6 @@
+{
+  "deepseek-harness": {
+    "image": "ai-native/assess:latest",
+    "command": ["/usr/local/bin/assess"]
+  }
+}

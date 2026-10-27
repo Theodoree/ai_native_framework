@@ -127,6 +127,8 @@ cd ../web && npm run build      # 输出到 ../chain/webui/dist
 
 容器这边要做的只有一件事：在输出里打一行 `CHAIN_VERDICT`。想接模型就在那一行之前自己问自己，平台不掺和。
 
+仓库里有一个真能跑的镜像：`images/assess/`（alpine + 一段 sh，做机械评估并给结论），构建与接线见 `images/README.md`。
+
 ## 已知边界
 
 1. AI 自审只认容器自己打的那一行标记（见下节），平台不去调模型、也不看容器干得对不对。
