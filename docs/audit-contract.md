@@ -51,8 +51,9 @@ workflow 里只写逻辑名（`review-a` / `review-b` / `impl`），真实模型
 两个来源，二选一，**不混用**：
 
 - **人给**：`workflow_dispatch` 的 `findings_a` / `findings_b`，两条记录自报 `executor: sandbox`。
-- **自动产出**：两个 input 都为空时，`audit.yml` 自己取 `gh pr diff <PR>` 并调
-  `scripts/audit-review.mjs` 跑两个槽（同一个 secret、两个不同模型），记录自报 `executor: github`。
+- **自动产出**：两个 input 都为空时，`audit.yml` 自己取 `gh pr diff <PR>`，再调引擎的 `audit-review` 子命令
+  （`./.cache/bin/engine audit-review --slot review-a|review-b --diff … --out …`，实现在 `apps/engine/auditreview.go`）
+  跑两个槽（同一个 secret、两个不同模型），记录自报 `executor: github`。这段逻辑只在引擎里：一个槽 = 一次模型调用 = 一份 findings JSON，逻辑名到模型的映射读 `.agents/platform/routing.yml`，模型只报缺陷、`verdict` 由 severity 机械推出，判不了就写 INFRA。
 
 自动路径**判不了就是判不了**：没有 key、上游不可达、回的不合 schema 时，执行器写下 INFRA 记录并退出 3，
 那一步不红——结论由口径层算成 `action_required`。只有退出 2（用法错、写不出文件）才让步骤红：
