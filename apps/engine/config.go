@@ -149,6 +149,40 @@ func terminalOf(meta *Value) bool {
 	return meta.Get("terminal").Truthy()
 }
 
+// ClosedTerminalTargets 读出「关单事件可以落到哪些终态」：from → 候选终态（按声明顺序、去重）。
+//
+// 规则一条都不在本函数里另写状态名，全部从声明推出来：
+//   - 只认 by == "ci" 的转换 —— 关单是宿主事实驱动的写入，身份就是 ci（与 PR 事件同一口径）；
+//   - owner 裁决出来的终态（cancelled、rejected）不在这里自动落：放弃要有人的评论，
+//     不能因为「PR 合并顺手关了个单」就替 owner 取消（那会把已合并的 issue 记成取消）；
+//   - 通配（from: "*"）不参与 —— 通配终态不属于任何一个具体状态；
+//   - 目标是终态才算数：非终态只是中间站，关单必须落到终态。
+//
+// 一个 from 有多个 ci 终态后继时把候选全交出去（顺序即文件顺序），由调用方决定
+// 是否可以猜 —— 猜错就是替人写了一条错的状态。
+func (c *Config) ClosedTerminalTargets() map[string][]string {
+	targets := make(map[string][]string)
+	for _, transition := range c.TransitionList() {
+		from, _ := transition.Get("from").StringValue()
+		to, _ := transition.Get("to").StringValue()
+		by, _ := transition.Get("by").StringValue()
+		if from == "*" || from == None || by != "ci" || !c.StateTerminal(to) {
+			continue
+		}
+		seen := false
+		for _, existing := range targets[from] {
+			if existing == to {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			targets[from] = append(targets[from], to)
+		}
+	}
+	return targets
+}
+
 // TransitionList 返回声明里的转换（顺序即文件顺序）。
 func (c *Config) TransitionList() []*Value {
 	items := make([]*Value, 0, c.Transitions.Len())

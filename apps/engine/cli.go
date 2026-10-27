@@ -39,6 +39,14 @@ const EngineUsage = `用法: engine <子命令> [参数]
   last-change  门牌幂等重算（[--in <file>] [--out <file>]）
   writer-record 判定结果 → 留痕（[--verdict <file>] [--issue <n>]）
   merge-gate   合并资格：四道守卫 G1–G4（[--event <file>] [--pr <file>] [--issue <file>] [--checks <file>] [--infra <file>]）
+  audit-findings 审计口径层：schema / 归一 / 比对 / conclusion（[--a <file>] [--b <file>] [--out <file>]；--explain 打印它读什么 / 写什么 / 退出码语义）
+  audit-slot   审计槽位身份校验（--slot review-a|review-b --executor sandbox|github --out <文件>）
+  routing      模型映射真源自洽 + workflow 未硬编码模型名（--check）
+  audit-collect 审计编排：发 run → 等结论 → 读 Check Run（--pr <n> --a <file> --b <file> [--ref <分支>] [--dry-run] [--json] [--timeout <秒>]）
+  audit-review  审计执行器：一个槽 -> 一次模型调用 -> 一份 findings（--slot review-a|review-b --diff <file> --out <file> [--api-base <url>]）
+  copy-dist    把 apps/web-vue/dist 铺进 apps/api-go/dist（占位文件保留）
+  cli          接入层：board|new|verdict|verify|outbox（[--api <url>] [--json]）
+  kb-export    从 commit 区间算出知识库汇入清单（--repo <owner/name> --from A --to B [--existing <清单>] [--out <file>]）
 
 退出码：0 允许 / 0 成功 · 1 拒绝 · 2 用法错 · 3 INFRA`
 
@@ -70,6 +78,22 @@ func Run(argv []string, stdin io.Reader, stdout, stderr io.Writer, root string) 
 		return RunWriterRecord(rest, stdout, stderr)
 	case "merge-gate":
 		return RunMergeGate(rest, stdout, stderr, root)
+	case "audit-findings":
+		return RunAuditFindings(rest, stdout, stderr)
+	case "audit-slot":
+		return RunAuditSlot(rest, stdout, stderr)
+	case "routing":
+		return RunRouting(rest, stdout, stderr, root)
+	case "audit-collect":
+		return RunAuditCollect(rest, stdout, stderr)
+	case "audit-review":
+		return RunAuditReview(rest, stdout, stderr, root)
+	case "copy-dist":
+		return RunCopyDist(rest, stdout, stderr, root)
+	case "cli":
+		return RunCli(rest, stdout, stderr, root)
+	case "kb-export":
+		return RunKbExport(rest, stdout, stderr, root)
 	default:
 		io.WriteString(stderr, EngineUsage+"\n")
 		return 2

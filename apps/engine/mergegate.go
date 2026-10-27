@@ -324,6 +324,12 @@ func mergeGateResolvePrIssue(pr *Value) (float64, error) {
 
 // ---- 四条守卫 ----
 
+// mergeGateIssueClosed 读 issue 是否已经关闭。只认字符串 "closed"：输入里没有 state
+// 或形状不对时不当成已关闭 —— 门不靠猜补输入，缺的部分仍由 ConsultTransition 判。
+func mergeGateIssueClosed(issue *Value) bool {
+	return isStringValue(issue.Get("state"), "closed")
+}
+
 func mergeGateGuardIssueState(ctx *mergeGateContext) (string, error) {
 	cfg, fail := LoadConfig(ctx.configPath)
 	if fail != nil {
@@ -356,6 +362,16 @@ func mergeGateGuardIssueState(ctx *mergeGateContext) (string, error) {
 	))
 	if consultFail != nil {
 		return "", consultFail
+	}
+	// 裁决 A：已关闭的单不能再被判成在途。「x → done 被声明了」只回答了「能不能转」，
+	// 没回答「还该不该转」：issue 已经关闭（由 PR body 的 Fixes #N 自动关单，或人行关单）
+	// 说明这条转换的前提已经不成立，再把标签当在途放过去，就是门给一张已关单的票。
+	// 走到这里说明 ConsultTransition 已经认了这次转换 —— 它拒绝终态起点，所以
+	// 「能走到这一步的 from」必然是非终态：这里不需要再判一次终态。
+	if mergeGateIssueClosed(ctx.issue) {
+		return "", &Fail{Kind: "rejected", Code: "E_ISSUE_CLOSED_IN_FLIGHT", Message: "issue #" +
+			jsDisplay(ctx.issue.Get("number")) + " 已经关闭，但状态标签还停在非终态 " +
+			jsToString(result.Get("from")) + "：已关闭的单不能被判成在途。先让标签落到终态（或重新打开 issue）再合。"}
 	}
 	return "issue #" + jsDisplay(ctx.issue.Get("number")) + " " + jsDisplay(result.Get("from")) +
 		" → " + jsDisplay(result.Get("to")) + "（" + jsDisplay(result.Get("by")) + "）", nil

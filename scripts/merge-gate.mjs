@@ -263,6 +263,17 @@ function guardIssueState(ctx) {
     actor_role: "ci",
     labels,
   });
+  // 裁决 A：已关闭的单不能再被判成在途。「x → done 被声明了」只回答了「能不能转」，
+  // 没回答「还该不该转」：issue 已经关闭（由 PR body 的 Fixes #N 自动关单，或人行关单）
+  // 说明这条转换的前提已经不成立，再把标签当在途放过去，就是门给一张已关单的票。
+  // 只认字符串 "closed"：输入里没有 state 时不当成已关闭 —— 门不靠猜补输入。
+  // 走到这里说明 consultTransition 已经认了这次转换 —— 它拒绝终态起点，
+  // 所以「能走到这一步的 from」必然是非终态，不用再判一次终态。
+  if (ctx.issue.state === "closed")
+    throw reject(
+      "E_ISSUE_CLOSED_IN_FLIGHT",
+      `issue #${ctx.issue.number} 已经关闭，但状态标签还停在非终态 ${result.from}：已关闭的单不能被判成在途。先让标签落到终态（或重新打开 issue）再合。`,
+    );
   return `issue #${ctx.issue.number} ${result.from} → ${result.to}（${result.by}）`;
 }
 

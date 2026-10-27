@@ -44,6 +44,34 @@ export function resolveIssueRefs(text) {
   return [...found];
 }
 
+// 关单事件能落到哪些终态：`{ "in-progress": ["done"] }`。
+// 规则一条都不在这里另写状态名，全部从声明推出来（与 Go 侧 Config.ClosedTerminalTargets 同源）：
+// 只认 by === "ci" 的转换 —— 关单是宿主事实驱动的写入，身份就是 ci；owner 裁决出来的终态
+// （cancelled、rejected）不在这里自动落：放弃要有人的评论，不能因为「PR 合并顺手关了个单」
+// 就替 owner 取消（那会把已合并的 issue 记成取消）；通配（from: "*"）不参与；目标是终态才算数。
+// 读不到声明时返回空映射（= 没有可落的终态）：声明缺失是 check-config 的地盘，这里不另造失败面。
+export function closedTerminalTargets(path = DECLARATION) {
+  let cfg;
+  try {
+    cfg = YAML.parse(readFileSync(path, "utf8"));
+  } catch {
+    return {};
+  }
+  const states = cfg?.states ?? {};
+  const transitions = Array.isArray(cfg?.transitions) ? cfg.transitions : [];
+  const targets = {};
+  for (const t of transitions) {
+    const from = t?.from;
+    const to = t?.to;
+    if (typeof from !== "string" || typeof to !== "string") continue;
+    if (from === "*" || from === "none" || t?.by !== "ci") continue;
+    if (!states?.[to]?.terminal) continue;
+    targets[from] = targets[from] ?? [];
+    if (!targets[from].includes(to)) targets[from].push(to);
+  }
+  return targets;
+}
+
 // 宿主的取数结果：`{"labels":["state:accepted"]}`。
 // 返回 null 表示「拿不到」（没注入 / 读了不是形状 / 空文件），返回 [] 表示
 // 「拿到且确实是零个标签」—— 这两种事实必须分得开：后者是真实的 none 起点，
@@ -121,6 +149,7 @@ export function buildIntent({
   defaultFlow,
   issueLabelsFromHost = null,
   guardEvidence = null,
+  closedTargets = {},
 }) {
   const issue = payload.issue ?? {};
   const pr = payload.pull_request ?? {};
@@ -170,6 +199,32 @@ export function buildIntent({
     if (stateLabels && stateLabels.length === 1 && stateLabels[0] === label)
       return null;
     return make(issue.number ?? null, label.slice("state:".length), actorRole);
+  }
+
+  // 关单：PR 合并时 GitHub 由 PR body 的 Fixes #N 自动关单，这条路径写者拦不住也测不到，
+  // 只能在这里认下来（否则标签会停在 in-progress，而门还当它「能带到 done」）。
+  // 目标问声明，不写死状态名：只接受由 ci 驱动、且唯一的终态后继。
+  // 关单拿不到守卫证据（守卫证据属于 PR 事件的 check run），所以带守卫的终态在这里一定判不成 ——
+  // 那不是漏，是如实交出去，让写者留一条痕（「关单了但状态没动，缺什么」）。
+  if (eventName === "issues" && action === "closed") {
+    // 拿不到标签、或一个 state 标签都没有：机器没管过这个 issue，不能凭空造一个起点。
+    if (!stateLabels || stateLabels.length === 0) return null;
+    // 两个 state 标签是形状坏掉了（判定器会判 E_STATE_LABEL_COUNT），但意图得先选一个起点，
+    // 选哪个都是替人猜：fail-closed，别把一条错的状态写进留痕。
+    if (stateLabels.length > 1)
+      throw new Error(
+        `意图无法归一：关单事件上 issue 有 ${stateLabels.length} 个 state 标签（${JSON.stringify(stateLabels)}），无法确定起点状态`,
+      );
+    const from = String(stateLabels[0]).slice("state:".length);
+    const candidates = closedTargets[from] ?? [];
+    // 这个状态没有「关单即可落到的终态」（例如 triage 只有通向 analyzing 的路）：
+    // 关单在这里不代表任何一次转换 —— 留空，交给「放弃要由 owner 带评论裁决」那条路。
+    if (candidates.length === 0) return null;
+    if (candidates.length > 1)
+      throw new Error(
+        `意图无法归一：关单事件从 ${from} 出发有多个 ci 终态（${JSON.stringify(candidates)}），无法唯一确定目标`,
+      );
+    return make(issue.number ?? null, candidates[0], "ci", {}, hostLabels);
   }
 
   if (eventName === "pull_request") {
@@ -259,6 +314,7 @@ function main() {
     defaultFlow: process.env.DEFAULT_FLOW ?? defaultFlowFromDeclaration(),
     issueLabelsFromHost: readIssueLabels(process.env.ISSUE_STATE_FILE),
     guardEvidence: readGuardEvidence(process.env.GUARD_EVIDENCE_FILE),
+    closedTargets: closedTerminalTargets(),
   });
   if (!intent) {
     publishHasIntent(false);
