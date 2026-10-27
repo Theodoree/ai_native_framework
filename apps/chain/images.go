@@ -133,6 +133,10 @@ func (s *Server) uploadRequirementImages(c *gin.Context) {
 		fail(c, 404, err.Error())
 		return
 	}
+	// 传图是新写：得是这个项目的人，且文案说的是「改不了这条需求」。
+	if _, ok := s.requireMember(c, req.ProjectKey, actionChangeRequirement); !ok {
+		return
+	}
 	form, err := c.MultipartForm()
 	if err != nil {
 		fail(c, 400, "请求不是合法的 multipart/form-data："+err.Error())
@@ -228,6 +232,9 @@ func (s *Server) requirementImage(c *gin.Context) {
 		fail(c, 404, err.Error())
 		return
 	}
+	if _, ok := s.requireMember(c, req.ProjectKey, actionViewRequirement); !ok {
+		return
+	}
 	if !inImages(req, name) {
 		fail(c, 404, "没有这张图片")
 		return
@@ -255,6 +262,10 @@ func (s *Server) deleteRequirementImage(c *gin.Context) {
 	req, err := s.store.Requirement(c.Param("id"))
 	if err != nil {
 		fail(c, 404, err.Error())
+		return
+	}
+	// 删图是改写这条需求（Images 里要摘一条），所以同上传一样按「改不了这条需求」拒。
+	if _, ok := s.requireMember(c, req.ProjectKey, actionChangeRequirement); !ok {
 		return
 	}
 	if !inImages(req, name) {

@@ -48,11 +48,6 @@ type intakeCallbackBody struct {
 // intakeCreateRequirement 是平台外的人把需求塞进链的那个口子。
 // 身份是登录态或 API 密钥（whoIs 认出来的那一个人），权限是「要是这个项目的成员」。
 func (s *Server) intakeCreateRequirement(c *gin.Context) {
-	me := s.me(c)
-	if me.User == nil {
-		fail(c, 401, needLoginText)
-		return
-	}
 	var in intakeNewRequirement
 	if err := decode(c.Request, &in); err != nil {
 		fail(c, 400, err.Error())
@@ -63,8 +58,7 @@ func (s *Server) intakeCreateRequirement(c *gin.Context) {
 		fail(c, 400, "需求必须带 project")
 		return
 	}
-	if !s.isMember(me.User, projectKey) {
-		denyNotMember(c, me.User, projectKey, actionPostRequirement)
+	if _, ok := s.requireMember(c, projectKey, actionPostRequirement); !ok {
 		return
 	}
 	p, err := s.store.Project(projectKey)
@@ -97,11 +91,28 @@ func (s *Server) isMember(u *User, projectKey string) bool {
 	return len(s.powersFor(u, projectKey)) > 0
 }
 
-// 成员资格这道门在三个地方用到，动词不同但说的是一件事，所以文案只留一处。
+// 成员资格这道门在几个地方用到，动词不同但说的是一件事，所以文案只留一处。
 const (
-	actionPostRequirement = "提不了需求"
-	actionViewRequirement = "看不到这条需求"
+	actionPostRequirement   = "提不了需求"
+	actionViewRequirement   = "看不到这条需求"
+	actionChangeRequirement = "改不了这条需求"
 )
+
+// requireMember 是「这件事要的不是权力，而是『你在这个项目里』」的唯一门。
+// 顺序是契约：先问身份（401），再问成员资格（403）——把「没登录」说成「没资格」就是撒谎。
+// 返回 false 时响应已经写好了，调用方直接 return。
+func (s *Server) requireMember(c *gin.Context, projectKey, action string) (*User, bool) {
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return nil, false
+	}
+	if !s.isMember(me.User, projectKey) {
+		denyNotMember(c, me.User, projectKey, action)
+		return nil, false
+	}
+	return me.User, true
+}
 
 // denyNotMember 是「认出来了，但不是这个项目的人」的唯一 403：点名是谁、在哪个项目、这次要干什么。
 func denyNotMember(c *gin.Context, u *User, projectKey, action string) {
@@ -119,8 +130,7 @@ func (s *Server) intakeGetRequirement(c *gin.Context) {
 		fail(c, 404, "没有这条需求")
 		return
 	}
-	if !s.isMember(me.User, req.ProjectKey) {
-		denyNotMember(c, me.User, req.ProjectKey, actionViewRequirement)
+	if _, ok := s.requireMember(c, req.ProjectKey, actionViewRequirement); !ok {
 		return
 	}
 	writeJSON(c, 200, s.intakeView(req))

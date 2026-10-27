@@ -116,7 +116,8 @@ func (s *Server) mount(r *ginRouter) {
 	handle("GET", "/api/requirements", s.listRequirements)
 	handle("POST", "/api/p/:project/requirements", s.createRequirement)
 	handle("GET", "/api/requirements/:id", s.getRequirement)
-	// 需求带图：上传 / 读取 / 删除。读图与删图都只要求登录（能看需求就能看图，不额外查角色）。
+	// 需求带图：上传 / 读取 / 删除。三个都走成员门：图挂在需求上，需求挂在项目上，
+	// 所以「能不能动这张图」= 「你是不是这个项目的人」（传是新写，文案用「改不了这条需求」）。
 	handle("POST", "/api/requirements/:id/images", s.uploadRequirementImages)
 	handle("GET", "/api/requirements/:id/images/:name", s.requirementImage)
 	handle("DELETE", "/api/requirements/:id/images/:name", s.deleteRequirementImage)
@@ -369,12 +370,25 @@ func (s *Server) createProject(c *gin.Context) {
 }
 
 func (s *Server) listProjects(c *gin.Context) {
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return
+	}
 	ps, err := s.store.Projects()
 	if err != nil {
 		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(c, 200, ps)
+	// 项目是权限边界：列表只回「我参与的项目」，管理员回全部。
+	// 空列表要给 []，不能给 null——前端靠它区分「没有权限」和「一条都没有」。
+	visible := make([]*Project, 0, len(ps))
+	for _, p := range ps {
+		if s.isMember(me.User, p.Key) {
+			visible = append(visible, p)
+		}
+	}
+	writeJSON(c, 200, visible)
 }
 
 type createReqBody struct {
@@ -392,13 +406,7 @@ func (s *Server) createRequirement(c *gin.Context) {
 	}
 	// 提需求是成员动作：管理员天生算任何项目的成员，其余人至少要有这个项目里的一个权力。
 	// 这道门排在 404 之后：先回答「有没有这个项目」，再回答「你有没有资格」。
-	me := s.me(c)
-	if me.User == nil {
-		fail(c, 401, needLoginText)
-		return
-	}
-	if !s.isMember(me.User, p.Key) {
-		denyNotMember(c, me.User, p.Key, actionPostRequirement)
+	if _, ok := s.requireMember(c, p.Key, actionPostRequirement); !ok {
 		return
 	}
 	var in createReqBody
@@ -425,18 +433,40 @@ func (s *Server) createRequirement(c *gin.Context) {
 }
 
 func (s *Server) listRequirements(c *gin.Context) {
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return
+	}
 	rs, err := s.store.Requirements()
 	if err != nil {
 		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(c, 200, rs)
+	// 与项目列表同一条边界：需求跟项目走，我没参与的项目下的需求不该出现在我的视野里。
+	visible := make([]*Requirement, 0, len(rs))
+	for _, r := range rs {
+		if s.isMember(me.User, r.ProjectKey) {
+			visible = append(visible, r)
+		}
+	}
+	writeJSON(c, 200, visible)
 }
 
 func (s *Server) getRequirement(c *gin.Context) {
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return
+	}
 	req, err := s.store.Requirement(c.Param("id"))
 	if err != nil {
 		fail(c, 404, err.Error())
+		return
+	}
+	// 顺序是契约：401 → 404（没这条需求）→ 403（有这条需求但不是你的项目）。
+	if !s.isMember(me.User, req.ProjectKey) {
+		denyNotMember(c, me.User, req.ProjectKey, actionViewRequirement)
 		return
 	}
 	events, err := s.store.Events(req.ID)
