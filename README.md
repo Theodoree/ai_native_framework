@@ -25,7 +25,7 @@ go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 
 - **存储**：SQLite（纯 Go 驱动，免 cgo），库文件默认 `data/chain.db`。`Store` 是接口，换 MySQL 只加一个实现。
 - **执行**：`-exec fake` 只写一条评论并声明自己没连过外部服务；`-exec docker` 会用 `docker run` 起真容器并注入 `BASE_URL` / 模型 / AGENTS.md / 需求正文，密钥只从环境变量取且会从日志里抹掉。
-- **前端**：Vue 3 + Vite + TS，构建产物已入库（`apps/chain/webui/dist`），被 `//go:embed` 打进二进制。改了 `apps/web` 要记得 `npm run build`。
+- **前端**：Vue 3 + Vite + TS + Arco Design Vue（MIT，全量注册），构建产物已入库（`apps/chain/webui/dist`），被 `//go:embed` 打进二进制。改了 `apps/web` 要记得 `npm run build`。
 
 ## 铁律
 
@@ -40,7 +40,7 @@ go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
 | 路径 | 装什么 |
 | --- | --- |
 | `apps/chain/` | 链条平台：状态机、SQLite 存储、HTTP、容器执行器、嵌入的前端产物 |
-| `apps/web/` | 前端源码：Vue 3 + Vite + TypeScript，无 UI 库 |
+| `apps/web/` | 前端源码：Vue 3 + Vite + TypeScript + Arco Design Vue |
 | `docs/architecture.md` | 架构总览：分层、模块地图、一次需求流过什么 |
 | `.agents/notes/proposed/p32-node-chain-alignment.md` | 需求基线：六类节点、链条规则、状态转换、五条收口假设 |
 | `.agents/notes/proposed/p32-design-minimal.md` | 设计：实体、不变量、九个接口、容器执行五步（其中「文件存储」已被 SQLite 取代，见 `.agents/notes/implemented/p33-sqlite-docker-frontend.md`） |

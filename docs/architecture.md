@@ -9,7 +9,7 @@
 ## 分层
 
 ```
-前端 apps/web（Vue 3 + Vite + TS）──构建──▶ apps/chain/webui/dist（go:embed，已入库）
+前端 apps/web（Vue 3 + Vite + TS + Arco Design Vue）──构建──▶ apps/chain/webui/dist（go:embed，已入库）
                                                     │
 HTTP 层   apps/chain/http.go    只做校验与搬运，不下结论，不写状态
           apps/chain/intake.go  接入层：给平台外用，认 project 口令、塞需求、回告结论
@@ -30,7 +30,7 @@ HTTP 层   apps/chain/http.go    只做校验与搬运，不下结论，不写�
 | 路径 | 装什么 | 契约在哪 |
 | --- | --- | --- |
 | `apps/chain/` | 平台本体：状态机、存储、HTTP、执行器、入口 | `apps/chain/README.md` |
-| `apps/web/` | 前端源码（Vue 3 + Vite + TS，无 UI 库，样式手写） | `apps/web/README.md` |
+| `apps/web/` | 前端源码（Vue 3 + Vite + TS + Arco Design Vue 2.59.0） | `apps/web/README.md` |
 | `apps/chain/webui/dist/` | 构建产物，被 `//go:embed` 打进二进制 | 生成物，改前端后重跑 `npm run build` |
 | `docs/` | 规则与原则（L1 总览是本文；写作规则见 `docs/AGENTS.md`） | 各文件本身 |
 | `.agents/notes/` | 决策记录：为什么这样做、放弃了什么 | `proposed/` = 讨论中，`implemented/` = 已落地 |
@@ -57,7 +57,7 @@ HTTP 层   apps/chain/http.go    只做校验与搬运，不下结论，不写�
 | --- | --- | --- |
 | 语言 | Go ≥ 1.26（标准库为主） | 单二进制、无运行时依赖、并发与 HTTP 都是标准库 |
 | 存储 | SQLite（`modernc.org/sqlite`，纯 Go 免 cgo） | 零外部服务即可跑；`Store` 接口为 MySQL 留缝 |
-| 前端 | Vue 3 + Vite + TypeScript，无 UI 库 | 构建产物小（148K）、无框架锁定、样式用 design tokens 手写 |
+| 前端 | Vue 3 + Vite + TypeScript，组件库 Arco Design Vue 2.59.0（MIT，全量注册） | 中文文档与示例同源；MIT 长期可用。代价是整包入库：956 kB JS / 415 kB CSS（gzip 287 / 52），Vite 每次构建都会报 >500 kB 警告 |
 | 打包 | `//go:embed webui/dist` | 一个二进制带页面；代价是产物必须入库 |
 | 执行 | 本机 `docker run`，未来换 k3s | 执行器是接口，换运行时不动状态机 |
 | 判据 | 本地 `go test ./...`（`verify-change` 技能） | 平台不依赖任何托管 CI；合并由人按 |
