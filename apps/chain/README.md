@@ -63,6 +63,10 @@
 | POST | `.../reject` | 驳回（reason 必填，409 表示不是当前站） |
 | POST | `.../comment` | 评论 |
 | POST | `.../rules` | 往这一站追加规则，默认 AGENTS.md 不改 |
+| POST | `/api/requirements/{id}/images` | 传图：`multipart/form-data`，字段名 `files`（可多个）；一次 ≤5 张、每张 ≤5MB，按文件头认 png / jpeg / webp / gif；有一张不合规就整批 400 且不进盘 |
+| GET | `/api/requirements/{id}/images/{name}` | 取图：原样字节 + 正确的 `Content-Type` / `Content-Length`；文件名越界、或不属于这条需求，一律 404 |
+| DELETE | `/api/requirements/{id}/images/{name}` | 删图：文件删掉、同时从 `Images` 里摘掉；找不到 404 |
+| GET | `/api/bootstrap` | **免登录**：`{"signupAvailable": true}` 只在库是空的时候（还有没有人可注册） |
 
 请求体用 `DisallowUnknownFields` + 1MiB 上限解码；未知字段返回 400。
 

@@ -20,6 +20,7 @@ func main() {
 	templates := flag.String("templates", "", "容器模板表 JSON（增量覆盖默认模板）")
 	dockerBin := flag.String("docker", "docker", "docker 可执行文件")
 	timeout := flag.Duration("timeout", 10*time.Minute, "单次容器执行上限")
+	uploads := flag.String("uploads", "data/uploads", "需求图片落盘目录（不存在会按需创建）")
 	baseURL := flag.String("base-url", "", "注入容器的 BASE_URL")
 	model := flag.String("model", "", "注入容器的 model")
 	flag.Parse()
@@ -54,7 +55,7 @@ func main() {
 		log.Fatalf("不认识的执行器：%s（只有 fake 与 docker）", *execKind)
 	}
 
-	srv := NewServer(store, exec)
+	srv := NewServer(store, exec).WithUploadDir(*uploads)
 	log.Printf("链条平台已启动：http://%s （数据库 %s:%s，执行器 %s）", *addr, *driver, *dbPath, *execKind)
 	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
 }

@@ -21,10 +21,18 @@ type Server struct {
 	store Store
 	exec  Executor
 	now   func() time.Time
+	// uploads 是需求图片落盘的根目录（-uploads）。空串表示用 defaultUploadDir。
+	uploads string
 }
 
 func NewServer(s Store, e Executor) *Server {
 	return &Server{store: s, exec: e, now: time.Now}
+}
+
+// WithUploadDir 指定图片落盘目录；不调用就落回 data/uploads。
+func (s *Server) WithUploadDir(dir string) *Server {
+	s.uploads = dir
+	return s
 }
 
 // routeEntry 是路由表里的一行。它既是 gin 的注册，也是 405 的 Allow 头与「子树补斜杠」
@@ -87,6 +95,8 @@ func (s *Server) mount(r *ginRouter) {
 	// 账号与会话。signup 与 login 不要求登录（identity 闸门里放行这两条）。
 	handle("POST", "/api/signup", s.signup)
 	handle("POST", "/api/login", s.login)
+	// bootstrap 不要求登录：前端开页第一件事就是问「这里还能不能注册」。
+	handle("GET", "/api/bootstrap", s.bootstrap)
 	handle("POST", "/api/logout", s.logout)
 	handle("GET", "/api/me", s.meHandler)
 	handle("PUT", "/api/me/password", s.changeOwnPassword)
@@ -106,6 +116,10 @@ func (s *Server) mount(r *ginRouter) {
 	handle("GET", "/api/requirements", s.listRequirements)
 	handle("POST", "/api/p/:project/requirements", s.createRequirement)
 	handle("GET", "/api/requirements/:id", s.getRequirement)
+	// 需求带图：上传 / 读取 / 删除。读图与删图都只要求登录（能看需求就能看图，不额外查角色）。
+	handle("POST", "/api/requirements/:id/images", s.uploadRequirementImages)
+	handle("GET", "/api/requirements/:id/images/:name", s.requirementImage)
+	handle("DELETE", "/api/requirements/:id/images/:name", s.deleteRequirementImage)
 	handle("POST", "/api/requirements/:id/nodes/:node/run", s.nodeRun)
 	handle("POST", "/api/requirements/:id/nodes/:node/accept", s.nodeAccept)
 	handle("POST", "/api/requirements/:id/nodes/:node/reject", s.nodeReject)
@@ -131,6 +145,13 @@ func (s *Server) mount(r *ginRouter) {
 func (r *ginRouter) cleanPathRedirect(c *gin.Context) {
 	p := c.Request.URL.Path
 	if p != "/" {
+		// 需求图片的穿越一律 404：cleanRequestPath 会把 ".." 折成上一级资源（ServeMux 的老行为），
+		// 那等于把一次越界请求变成 307 跳转，顺着跳转就看得到另一个资源。图片路径不参与折叠。
+		if strings.Contains(p, "/images/") && hasDotDotSegment(p) {
+			fail(c, 404, "没有这张图片")
+			c.Abort()
+			return
+		}
 		if cleaned := cleanRequestPath(p); cleaned != p {
 			u := *c.Request.URL
 			u.Path, u.RawPath = cleaned, ""

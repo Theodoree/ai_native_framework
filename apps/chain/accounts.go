@@ -221,10 +221,22 @@ func apiNeedsLogin(p string) bool {
 		return false
 	}
 	switch p {
-	case "/api/signup", "/api/login":
+	case "/api/signup", "/api/login", "/api/bootstrap":
+		// 这三条是「还没有身份时也必须能拿到的信息」：注册、登录、以及「这里还能不能注册」。
 		return false
 	}
 	return true
+}
+
+// bootstrap 只回答一件事：这个库还能不能注册（注册只在空库时可用）。
+// 前端开页先问它，才知道该显示「注册」还是「登录」。
+func (s *Server) bootstrap(c *gin.Context) {
+	n, err := s.store.CountUsers()
+	if err != nil {
+		fail(c, 500, err.Error())
+		return
+	}
+	writeJSON(c, 200, map[string]any{"signupAvailable": n == 0})
 }
 
 // requireAdmin 是管理员闸门：不是管理员就 403，不往下走。
