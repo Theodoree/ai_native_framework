@@ -16,13 +16,13 @@
 
 `强制测试 = yes` 的模块，改一行就必须带对应测试，否则 PR 不进审计（判据见 `docs/testing.md`）。
 
-| 模块         | 家                                   | 强制测试 | 说明                       |
-| ------------ | ------------------------------------ | -------- | -------------------------- |
-| 状态机声明   | `.agents/platform/state-machine.yml` | yes      | 改状态或转换即改交付链路   |
-| 状态机校验器 | `scripts/state-validate.mjs`         | yes      | 判定合法性，错了会放行越权 |
-| 审计契约     | `docs/audit-contract.md`             | yes      | 判定「能不能合」的口径来源 |
-| PR 模具      | `.github/PULL_REQUEST_TEMPLATE/`     | yes      | 字段缺失会绕过审计         |
-| 文档         | `docs/`                              | no       | 改错不改交付行为           |
+| 模块         | 家                                                               | 强制测试 | 说明                       |
+| ------------ | ---------------------------------------------------------------- | -------- | -------------------------- |
+| 状态机声明   | `.agents/platform/state-machine.yml`                             | yes      | 改状态或转换即改交付链路   |
+| 状态机校验器 | `apps/engine/validate.go`（`state-validate` / `consult` 子命令） | yes      | 判定合法性，错了会放行越权 |
+| 审计契约     | `docs/audit-contract.md`                                         | yes      | 判定「能不能合」的口径来源 |
+| PR 模具      | `.github/PULL_REQUEST_TEMPLATE/`                                 | yes      | 字段缺失会绕过审计         |
+| 文档         | `docs/`                                                          | no       | 改错不改交付行为           |
 
 ## 三、交叉验证矩阵
 

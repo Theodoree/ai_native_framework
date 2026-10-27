@@ -500,11 +500,14 @@ test("(d) YAML：顺序是「解析 issue → 取标签 → 建意图」，且�
   expect(doc.permissions.issues).toBe("write");
   expect(doc.permissions["pull-requests"]).toBe("write");
 
-  // 脚本自己不联网：取数只在 workflow 里
-  const script = readFileSync(join(ROOT, "scripts/build-intent.mjs"), "utf8");
-  expect(script).not.toMatch(/\bfetch\(/);
-  expect(script).not.toMatch(/node:https?/);
-  expect(script).not.toMatch(/child_process/);
+  // 实现自己不联网、不起子进程：取数只在 workflow 里（载体是引擎的 build-intent）
+  const intentImpl = readFileSync(join(ROOT, "apps/engine/intent.go"), "utf8");
+  expect(intentImpl).not.toMatch(/^\s*"net(\/[\w.]+)?"/m);
+  expect(intentImpl).not.toMatch(/^\s*"os\/exec"/m);
+  expect(intentImpl).not.toMatch(/\bexec\.(Command|CommandContext)\b/);
+  expect(intentImpl).not.toMatch(/\bhttp\.(Get|Post|Head|NewRequest)\b/);
+  // 正反面成对：事实只从 workflow 注入的文件来，不自己取
+  expect(intentImpl).toContain('os.Getenv("ISSUE_STATE_FILE")');
 });
 
 // ---- P-21 回归的真缺口：声明了 merge-gate 的转换必须拿到宿主取来的守卫证据 ----
@@ -578,13 +581,14 @@ test("(d) fetch guard evidence 的位置、if 条件与端点都钉在 YAML 里"
   expect(guard.run).toContain('run.conclusion !== "success"');
   expect(guard.run).not.toMatch(/exit 1/);
 
-  // 证据文件通过环境变量注入 build intent 步骤（脚本不自己去找、也不自己联网）
+  // 证据文件通过环境变量注入 build intent 步骤（实现不自己去找、也不自己联网）
   const intent = named[at("build intent")];
   expect(intent.env.GUARD_EVIDENCE_FILE).toBe("guard-evidence.json");
-  const script = readFileSync(join(ROOT, "scripts/build-intent.mjs"), "utf8");
-  expect(script).not.toMatch(/\bgh\b/);
-  expect(script).not.toMatch(/node:https?/);
-  expect(script).not.toMatch(/child_process/);
+  const intentImpl = readFileSync(join(ROOT, "apps/engine/intent.go"), "utf8");
+  expect(intentImpl).not.toMatch(/\bgh\b/);
+  expect(intentImpl).not.toMatch(/^\s*"net(\/[\w.]+)?"/m);
+  expect(intentImpl).not.toMatch(/^\s*"os\/exec"/m);
+  expect(intentImpl).toContain('os.Getenv("GUARD_EVIDENCE_FILE")');
 });
 
 test("(d) 真跑：merge-gate success → 写入证据 → 判定 allowed → in-progress 改 done", () => {

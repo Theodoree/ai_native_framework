@@ -98,22 +98,22 @@ hotfix/*/      紧急修复（从 main 拉 → main + develop）
 
 ## 七、本仓库索引
 
-| 要找什么                                                  | 家                                                                        |
-| --------------------------------------------------------- | ------------------------------------------------------------------------- |
-| 架构地图 / 模块关系 / 技术栈                              | `docs/architecture.md`                                                    |
-| 各目录职责 / 模块契约 / 状态标记                          | 就近的模块 `README.md`（代码在 `apps/<模块>/`）                           |
-| 安装 / 测试 / 构建 / 验证命令（项目搭建时按选定语言填实） | `docs/development.md`                                                     |
-| 各语言的格式化 / Lint / 测试标准                          | `docs/language-standards.md`                                              |
-| 测试策略与断言强度 / 强制测试范围                         | `docs/testing.md`                                                         |
-| issue 状态与转换（声明真源）                              | `.agents/platform/state-machine.yml`；判定器 `scripts/state-validate.mjs` |
-| 身份 / 权限矩阵                                           | `docs/permissions.md`                                                     |
-| 「能不能合」的审计契约                                    | `docs/audit-contract.md`                                                  |
-| 门牌（这次变更会被记成什么）                              | `docs/last-change.md`                                                     |
-| 知识库汇入契约                                            | `docs/knowledge-base.md`                                                  |
-| 一次改动从提出到交出证据的全貌与顺序                      | `docs/workflow.md`                                                        |
-| 一次改动的顺序、判据与红线                                | `docs/agent-workflow.md`                                                  |
-| 文档写作规则 / 层级归属                                   | `docs/AGENTS.md`                                                          |
-| 规则的理由 / 定义 / 定律参考                              | `docs/principles.md`                                                      |
-| 决策记录（why + 放弃了什么）                              | `.agents/notes/`                                                          |
-| 高频多步流程                                              | `.agents/skills/`                                                         |
-| 负责人 / 贡献 / 安全披露                                  | `OWNERS.md` / `CONTRIBUTING.md` / `SECURITY.md`                           |
+| 要找什么                                                  | 家                                                                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| 架构地图 / 模块关系 / 技术栈                              | `docs/architecture.md`                                                                                        |
+| 各目录职责 / 模块契约 / 状态标记                          | 就近的模块 `README.md`（代码在 `apps/<模块>/`）                                                               |
+| 安装 / 测试 / 构建 / 验证命令（项目搭建时按选定语言填实） | `docs/development.md`                                                                                         |
+| 各语言的格式化 / Lint / 测试标准                          | `docs/language-standards.md`                                                                                  |
+| 测试策略与断言强度 / 强制测试范围                         | `docs/testing.md`                                                                                             |
+| issue 状态与转换（声明真源）                              | `.agents/platform/state-machine.yml`；判定器 `apps/engine/validate.go`（`state-validate` / `consult` 子命令） |
+| 身份 / 权限矩阵                                           | `docs/permissions.md`                                                                                         |
+| 「能不能合」的审计契约                                    | `docs/audit-contract.md`                                                                                      |
+| 门牌（这次变更会被记成什么）                              | `docs/last-change.md`                                                                                         |
+| 知识库汇入契约                                            | `docs/knowledge-base.md`                                                                                      |
+| 一次改动从提出到交出证据的全貌与顺序                      | `docs/workflow.md`                                                                                            |
+| 一次改动的顺序、判据与红线                                | `docs/agent-workflow.md`                                                                                      |
+| 文档写作规则 / 层级归属                                   | `docs/AGENTS.md`                                                                                              |
+| 规则的理由 / 定义 / 定律参考                              | `docs/principles.md`                                                                                          |
+| 决策记录（why + 放弃了什么）                              | `.agents/notes/`                                                                                              |
+| 高频多步流程                                              | `.agents/skills/`                                                                                             |
+| 负责人 / 贡献 / 安全披露                                  | `OWNERS.md` / `CONTRIBUTING.md` / `SECURITY.md`                                                               |

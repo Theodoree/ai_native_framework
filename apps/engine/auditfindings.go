@@ -693,7 +693,8 @@ func AuditFindingsExplain() *Value {
 		"writes", Array(String("--out")),
 		// 这一格是编译产物的源码模块：文本层读不到产物，但要能指出「产物背后是哪份实现」，
 		// 判据据此把产出者本体的字段名豁免绑到同一处声明上，而不是手写文件名。
-		"source", Array(String("scripts/audit-findings.mjs")),
+		// 载体已从 Node 脚本换成 Go 实现（scripts/audit-findings.mjs 已删），指针跟着走。
+		"source", Array(String("apps/engine/auditfindings.go")),
 		"exitCodes", ObjectOf(
 			"0", String("有结论且结论是 pass"),
 			"1", String("有结论且结论是 needs_revision / reject"),

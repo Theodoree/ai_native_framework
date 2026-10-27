@@ -19,8 +19,9 @@ import { engineInto } from "./helpers/engine.mjs";
 
 const ROOT = process.cwd();
 // 只为一处形状判据读源码：门的生产者常量与 last-change 的 job 键必须一致。
-// 那是 scripts/merge-gate.mjs 的最后一个消费者，删脚本时这条要一起搬到 Go。
-const SCRIPT = join(ROOT, "scripts", "merge-gate.mjs");
+// 生产者的家已随 P-31 搬进编译产物（引擎常量 MergeGateProducer），这里钉的是 Go 侧声明：
+// Node 载体删掉之后，这条判据必须照旧能把「改名」打成红。
+const ENGINE_SOURCE = join(ROOT, "apps", "engine", "mergegate.go");
 const WORKFLOW = ".github/workflows/merge-gate.yml";
 const CONFIG = ".agents/platform/state-machine.yml";
 const PRODUCER = "render";
@@ -155,8 +156,9 @@ test("(e) 等上游：触发点、排除自己、取数顺序都钉在 YAML 上"
   );
   // 正文取现况（pulls/N），不是事件里的快照 —— 否则等到天亮也读到旧正文。
   expect(stepNamed("collect inputs").run).toContain("/pulls/$NUMBER");
-  // 生产者名只有一个家（脚本常量），这里钉住它与 last-change 的 job 键一致。
-  expect(readFileSync(SCRIPT, "utf8")).toContain('const PRODUCER = "render";');
+  // 生产者名只有一个家（引擎常量），这里钉住它与 last-change 的 job 键一致。
+  // check_runs 里挂的是 job 名：门等上游时按这个名字排自己以外的结论，改名两侧都得同时改。
+  expect(readFileSync(ENGINE_SOURCE, "utf8")).toContain('MergeGateProducer = "render"');
   const producer = YAML.parse(
     readFileSync(join(ROOT, ".github/workflows/last-change.yml"), "utf8"),
   );

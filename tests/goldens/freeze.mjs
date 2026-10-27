@@ -1,9 +1,9 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ENGINE, ensureEngine } from "../helpers/engine.mjs";
 import { checkFixture, checkGolden, envSignature, writeGolden, writeIndex } from "../helpers/parity-golden.mjs";
-import { CONFIG_REL, repoRoot, suites } from "./parity-cases.mjs";
+import { repoRoot, suites } from "./parity-cases.mjs";
 
 // 冻结入口（显式命令，默认测试路径永远走不到这里）：
 //   node tests/goldens/freeze.mjs           全量
@@ -20,20 +20,9 @@ import { CONFIG_REL, repoRoot, suites } from "./parity-cases.mjs";
 const SCRIPTS = join(repoRoot, "scripts");
 const scriptOf = (name) => join(SCRIPTS, name);
 
-// A 的 consult 没有独立脚本：原测试是临时写一个探针再调 state-validate.mjs 的导出。
-const CONSULT_PROBE_SOURCE = [
-  "import { readFileSync } from 'node:fs';",
-  "const mod = await import(process.argv[2]);",
-  "const cfg = mod.loadConfig(process.argv[3]);",
-  'const intent = JSON.parse(readFileSync(0, "utf8"));',
-  "try {",
-  "  const result = mod.consultTransition(cfg, intent);",
-  "  console.log(JSON.stringify({ consult: true, from: result.from, to: result.to, by: result.by, flow: result.flow }));",
-  "} catch (error) {",
-  '  console.log(JSON.stringify({ consult: false, kind: error.kind ?? "infra", code: error.code ?? "E_CLI_FAILED", message: error.message, extra: error.extra ?? {} }));',
-  '  process.exit(error.kind === "rejected" ? 1 : 3);',
-  "}",
-].join("\n");
+// A 套的 consult 过去没有独立脚本：靠临时探针调 state-validate.mjs 的导出录制。
+// P-31 阶段 D2 把该脚本删了，探针也随之消失 —— A 套因此不再可重冻，
+// 判定落在 missingReferences 里 "@consult-probe" → state-validate.mjs 的映射上。
 
 // 宿主机器的指纹（PATH / HOME / tmpdir）不能进 golden：它是期望值，必须与 checkout 位置、
 // 谁的机器无关。env 只按 key 集合参与比较，值在这里换成稳定的占位符。
@@ -54,16 +43,11 @@ function sanitizeEnv(env) {
   return out;
 }
 
-const workDir = realpathSync(tmpdir());
-const probePath = join(workDir, "engine-golden-consult-probe.mjs");
-const validatorPath = join(SCRIPTS, "state-validate.mjs");
-
-// Node 侧的命令行形状：脚本名就是命令。C 的 argv 里不含子命令，mapArgs 摘掉它。
+// Node 侧的命令行形状：脚本名就是命令。
+// suite a（state-validate）与 suite c（merge-gate）的参照物已在 P-31 阶段 D2 删除：
+// 它们没有 Node 侧可重跑的来源，assertRefreezePossible 会在任何写入之前中止 ——
+// 这里的 nodeInvoke 不再为它们保留分支，免得多出一条「还能跑」的假象。
 function nodeInvoke(suite, fixture) {
-  if (fixture.script === "@consult-probe")
-    return { bin: process.execPath, prefix: [probePath, validatorPath, CONFIG_REL] };
-  if (suite.id === "c")
-    return { bin: process.execPath, prefix: [scriptOf("merge-gate.mjs")], mapArgs: (argv) => argv.slice(1) };
   if (suite.id === "e")
     return {
       bin: process.execPath,
@@ -83,12 +67,28 @@ function nodeInvoke(suite, fixture) {
 // 免得清单和磁盘各说一套。命中就中止，且在任何写入之前中止：半冻一半的索引比不冻更糟。
 // 目前已有实例：scripts/writer-record.mjs 随 P-31 收尾删除，suite b 的 13 条 writer-record 夹具
 // 因此不可重冻（判据已等价搬进 apps/engine/writer_test.go，golden 不动）。
+// 参照物名：夹具的 script 字段就是 scripts/ 下的文件名，两处例外都在 suite 级：
+//   · A 套的 consult 探针（script = "@consult-probe"）没有独立脚本，过去靠临时探针调 state-validate.mjs；
+//   · C 套（merge-gate）的夹具不带 script 字段 —— 它的 Node 侧命令行形状由 nodeInvoke 单独拼。
+// P-31 阶段 D2 把这几套的载体都删了，映射留着是为了让中止信息点到名，而不是漏成「没有参照物」：
+// 夹具自带 script 时就按夹具走，只有 C 套（以及将来任何不带 script 的夹具）靠这张表兜底。
+const SUITE_SCRIPT = {
+  a: "state-validate.mjs",
+  b: "build-intent.mjs",
+  c: "merge-gate.mjs",
+};
+const referenceOf = (suite, fixture) => {
+  if (fixture.script === "@consult-probe") return "state-validate.mjs";
+  return fixture.script ?? SUITE_SCRIPT[suite.id];
+};
+
 function missingReferences(chosen) {
   const found = [];
   for (const suite of chosen) {
     for (const fixture of suite.cases) {
-      if (!fixture.script || fixture.script === "@consult-probe") continue;
-      if (!existsSync(scriptOf(fixture.script))) found.push({ suite, fixture });
+      const script = referenceOf(suite, fixture);
+      if (!script) continue;
+      if (!existsSync(scriptOf(script))) found.push({ suite, fixture, script });
     }
   }
   return found;
@@ -98,9 +98,9 @@ function assertRefreezePossible(chosen) {
   const missing = missingReferences(chosen);
   if (!missing.length) return;
   const byScript = new Map();
-  for (const { suite, fixture } of missing) {
-    if (!byScript.has(fixture.script)) byScript.set(fixture.script, []);
-    byScript.get(fixture.script).push({ suite, fixture });
+  for (const { suite, fixture, script } of missing) {
+    if (!byScript.has(script)) byScript.set(script, []);
+    byScript.get(script).push({ suite, fixture });
   }
   const lines = ["冻结中止：参照物已删除，这些夹具没有可重冻的来源。", ""];
   for (const [script, items] of byScript) {
@@ -200,27 +200,22 @@ async function main() {
 
   assertRefreezePossible(chosen);
   ensureEngine();
-  writeFileSync(probePath, CONSULT_PROBE_SOURCE);
 
   const indexFile = join(repoRoot, "tests", "goldens", "index.json");
   const previous = existsSync(indexFile) ? JSON.parse(readFileSync(indexFile, "utf8")).suites ?? {} : {};
   const entries = { ...previous };
   for (const suite of chosen) entries[suite.id] = { title: suite.title, count: 0, cases: [] };
-  try {
-    let total = 0;
-    for (const suite of chosen) {
-      const ids = await freezeSuite(suite);
-      entries[suite.id] = { title: suite.title, count: ids.length, cases: ids };
-      total += ids.length;
-    }
-    const ordered = Object.fromEntries(Object.keys(suites).filter((id) => entries[id]).map((id) => [id, entries[id]]));
-    const totalAll = Object.values(ordered).reduce((sum, one) => sum + one.count, 0);
-    // 索引是受版本控制的数据：不写时间戳，重冻同一批 Node 输出必须是逐字节同样的一份。
-    writeIndex({ source: "scripts/*.mjs 的旧输出（P-31 迁移前冻结）；本目录的 golden 即期望值", total: totalAll, suites: ordered });
-    console.log("冻结完成：" + total + " 条（index 共 " + totalAll + " 条）");
-  } finally {
-    rmSync(probePath, { force: true });
+  let total = 0;
+  for (const suite of chosen) {
+    const ids = await freezeSuite(suite);
+    entries[suite.id] = { title: suite.title, count: ids.length, cases: ids };
+    total += ids.length;
   }
+  const ordered = Object.fromEntries(Object.keys(suites).filter((id) => entries[id]).map((id) => [id, entries[id]]));
+  const totalAll = Object.values(ordered).reduce((sum, one) => sum + one.count, 0);
+  // 索引是受版本控制的数据：不写时间戳，重冻同一批 Node 输出必须是逐字节同样的一份。
+  writeIndex({ source: "scripts/*.mjs 的旧输出（P-31 迁移前冻结）；本目录的 golden 即期望值", total: totalAll, suites: ordered });
+  console.log("冻结完成：" + total + " 条（index 共 " + totalAll + " 条）");
 }
 
 main().catch((error) => {

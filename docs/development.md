@@ -6,7 +6,7 @@
 
 本仓库用三种语言，各自有明确的归属：
 
-- **JavaScript（ESM，Node ≥ 20）**：只剩审计四步与路由校验的执行层（`audit-findings` / `audit-slot` / `audit-collect` / `audit-review` / `routing`），它们仍被 `.github/workflows/audit.yml` 直接 `node scripts/*.mjs` 调用；唯一的运行时依赖是 `yaml`。判定/账本/门/留痕/知识库汇入/前端产物复制/接入层已由 Go 引擎执行，`scripts/` 里的同名脚本是对照物，只被 parity 测试与 `import` 它们的测试调用。workflow 里还留有内联 `node -e/-p`（audit.yml / state-writer.yml / merge-gate.yml），所以 `setup-node` 不能撤。
+- **JavaScript（ESM，Node ≥ 20）**：只剩测试与工具链（vitest 用例、`tests/goldens/freeze.mjs` 的冻结脚本、prettier / oxlint），**不执行任何判据**：`scripts/` 里已经没有任何 `.mjs`（15 个 Node 载体整批删除，判据只在 `apps/engine`）。`yaml` 因此降为 devDependency，只被测试 `import`。workflow 里还留有内联 `node -e/-p`（`audit.yml` 4 处 / `state-writer.yml` 5 处 / `merge-gate.yml` 1 处，取 check runs、拼读 JSON 片段），所以 `setup-node` 不能撤。
 - **Go（≥ 1.22）**：本机平台实例的 HTTP 面（`apps/api-go`）与判定/账本引擎（`apps/engine`，库 + 单二进制 CLI，16 个子命令）：CI 与 npm 脚本跑判据时调的就是构建出来的 `.cache/bin/engine`。第三方依赖：`apps/engine` 只有 `gopkg.in/yaml.v3`（解析状态机声明），`apps/api-go` 另加 `modernc.org/sqlite`（纯 Go，无需 cgo）。
 - **TypeScript + Vue 3（Vite）**：本机平台实例的页面（`apps/web-vue`）。
 
@@ -27,12 +27,12 @@ npm run check:engine  # gofmt + go vet + go test（apps/engine）
 npm run check:web     # 构建 apps/web-vue，再用引擎的 copy-dist 把产物铺进 apps/api-go
 ```
 
-- 对照（parity）测试是 `npm test` 的一部分：`tests/engine-parity*.test.mjs` 把同一批夹具同时喂给 `scripts/*.mjs` 与编译好的引擎，比 stdout / stderr / 退出码 / 写出文件。各套用例数与已登记例外见 `apps/engine/README.md` 的「验证」节。
+- 对照（parity）测试是 `npm test` 的一部分：`tests/engine-parity*.test.mjs` 把同一批夹具喂给编译好的引擎，与 `tests/goldens/<suite>/` 里 Node 时代冻下来的期望值逐字节比 stdout / stderr / 退出码 / 写出文件 / 请求记录。期望值不是现算的：`freeze.mjs` 要跑旧 Node 实现才能重冻，而 `scripts/` 里的参照物已删，所以 a / b / c 三套**不可重冻**，命中即以可读说明中止（不崩溃、不静默跳过）。各套用例数与已登记例外见 `apps/engine/README.md` 的「验证」节。
 - `check:web` 与 `web:dist` 都调 `./.cache/bin/engine`：**单独跑它们之前先 `npm run build:engine`**，否则退出码是 127。`npm run check` 因为先跑 `check:state` 不会踩到这一条。
 
 ## 构建
 
-- 引擎：`npm run build:engine` → `.cache/bin/engine`（唯一入口，CI 与测试共用；`.cache/` 已忽略，产物不进仓库。测试缺二进制会自动调它，构建失败即红）。四个 workflow 在 `npm ci` 之后各有一份 `actions/setup-go@v5`(1.22) + 无名 `npm run build:engine`：先有二进制，调用点才可能绿。
+- 引擎：`npm run build:engine` → `.cache/bin/engine`（唯一入口，CI 与测试共用；`.cache/` 已忽略，产物不进仓库。测试缺二进制会自动调它，构建失败即红）。六个 workflow 在 `npm ci` 之后都有一份 `actions/setup-go@v5`(1.22)，其中五个（`audit` / `kb-sync` / `last-change` / `merge-gate` / `state-writer`）另有一步无名 `npm run build:engine`；`check.yml` 不单列这一步，它跑 `npm run check`，构建由链首的 `check:state` 完成。先有二进制，调用点才可能绿。
 - 后端：`npm run api` 直接 `go run .`（无发行产物；需要二进制时 `cd apps/api-go && go build`）。
 - 前端：`npm run web:build`，产物在 `apps/web-vue/dist`；`npm run web:dist`（引擎的 `copy-dist`）把它铺进 `apps/api-go/dist` 供内嵌，后端发现该目录存在就托管它。
 
@@ -41,7 +41,7 @@ npm run check:web     # 构建 apps/web-vue，再用引擎的 copy-dist 把产�
 ```bash
 npm run api        # Go 后端，127.0.0.1:4317（PORT 可覆盖）
 npm run web:dev    # Vite dev server，/api 代理到 4317
-npm run cli -- board   # 接入层命令行（引擎的 cli 子命令，默认打 127.0.0.1:4317，见 scripts/README.md）
+npm run cli -- board   # 接入层命令行（引擎的 cli 子命令，默认打 127.0.0.1:4317，见 apps/engine/README.md）
 ```
 
 ## 验证

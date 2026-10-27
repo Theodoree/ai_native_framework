@@ -50,7 +50,8 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
-      # 判据与门的调用点是 Go 引擎（apps/engine），Node 版脚本留作 parity 对照（tests 两侧同口径）。
+      # 判据与门的调用点都在 Go 引擎（apps/engine）：Node 版 scripts/merge-gate.mjs 已随 P-31 阶段 D2 删除，
+      # 对照物换成 tests/goldens/ 里冻结的期望值（tests/engine-parity-c.test.mjs）。
       # 构建入口只有一个：npm run build:engine → .cache/bin/engine（.cache/ 已忽略，产物不进仓库）。
       # 这一步刻意不写 name：测试沙箱只跑「有 name 的步骤」，构建不该在沙箱里重跑。
       - uses: actions/setup-go@v5
@@ -59,8 +60,8 @@ jobs:
           cache: false
       - run: npm run build:engine
 
-      # 门牌的生产者名（render）只有一个家：scripts/merge-gate.mjs 的 PRODUCER，
-      # 由 tests/merge-gate.test.mjs 钉住它与 last-change.yml 的 job 键一致。
+      # 门牌的生产者名（render）只有一个家：引擎常量 MergeGateProducer（apps/engine/mergegate.go），
+      # 由 tests/merge-gate-wiring.test.mjs 钉住它与 last-change.yml 的 job 键一致。
       # 等的是「别人的结论」，所以自己（SELF=merge-gate）要排除 —— 自己此刻必然
       # in_progress，等自己就是死等，也是逻辑死结。
       - name: wait for upstream to settle

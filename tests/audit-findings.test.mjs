@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -20,20 +20,17 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import YAML from "yaml";
-import {
-  assess,
-  compareFindings,
-  normalizeVerdict,
-  run,
-  toCheckConclusion,
-  validateResult,
-  workflowExitFor,
-} from "../scripts/audit-findings.mjs";
 import { engineInto, ensureEngine } from "./helpers/engine.mjs";
 
 const ROOT = process.cwd();
 const WORKFLOW = ".github/workflows/audit.yml";
-const SCRIPT = join(ROOT, "scripts/audit-findings.mjs");
+// 判定步的执行体是编译产物（阶段 D3 切换；本批把 Node 载体删了）。这里 spawn 的就是
+// beforeAll 真构建出来的那一份 —— 与 workflow 调的是同一个入口、同一族参数。
+// 口径层内部的判据（validateResult / normalizeVerdict / compareFindings / toCheckConclusion /
+// 跨槽不变式 / 崩溃兜底 / 退出码映射）随实现搬进 apps/engine/auditfindings_test.go：
+// Node 侧已经没有那份实现可 import，留在这里只会断言一份影子。
+const FINDINGS = join(ROOT, ".cache/bin/engine");
+const FINDINGS_ARGS = ["audit-findings"];
 
 // 阶段 D3：判定步执行的是编译产物，沙箱里的产物必须**真构建**出来。beforeAll 跑一次唯一
 // 构建入口（npm run build:engine；新鲜度与并发由 helpers/engine.mjs 一处管），各用例复制同一份。
@@ -78,233 +75,6 @@ const result = (over = {}) => ({
   ...over,
 });
 
-describe("validateResult", () => {
-  it("接受合法结果", () => {
-    const out = validateResult(result({ findings: [finding()] }));
-    expect(out.errors).toEqual([]);
-    expect(out.ok).toBe(true);
-  });
-
-  it("缺字段要点名到 path.field", () => {
-    const bad = finding();
-    delete bad.suggestion;
-    const out = validateResult(result({ findings: [bad] }));
-    expect(out.ok).toBe(false);
-    expect(out.errors.join("\n")).toContain("findings[0].suggestion");
-  });
-
-  it("severity 非法枚举要报出实际值", () => {
-    const out = validateResult(
-      result({ findings: [finding({ severity: "critical" })] }),
-    );
-    expect(out.ok).toBe(false);
-    expect(out.errors.join("\n")).toContain("findings[0].severity");
-    expect(out.errors.join("\n")).toContain('"critical"');
-  });
-
-  it("line 必须是正整数", () => {
-    const out = validateResult(
-      result({ findings: [finding({ line: "325" })] }),
-    );
-    expect(out.errors.join("\n")).toContain("findings[0].line");
-  });
-
-  it("verdict 非法枚举要报错", () => {
-    const out = validateResult(result({ verdict: "ok" }));
-    expect(out.errors.join("\n")).toContain("verdict");
-  });
-
-  it("占位符 model 不算证据", () => {
-    // pending-* 是本仓自己承认的占位值（见 .agents/platform/routing.yml），
-    // 漏了它，"没跑到" 就能写成 "跑到并通过"。
-    for (const model of [
-      "",
-      "unknown",
-      "TODO",
-      "n/a",
-      "unset",
-      "pending",
-      "pending-review-a",
-      "PENDING-impl",
-    ]) {
-      const out = validateResult(
-        result({ evidence: { ...result().evidence, model } }),
-      );
-      expect(out.ok).toBe(false);
-      expect(out.errors.join("\n")).toContain("evidence.model");
-    }
-  });
-
-  it("路由表里声明的 pending-* 一律判不合格（真源：.agents/platform/routing.yml）", () => {
-    // 这一条不引用脚本里的常量表：它读的是仓库声明的占位值本身。
-    // 表只覆盖「你想得到的那几个词」，真源覆盖「仓库实际在用的那几个」。
-    const routes = YAML.parse(
-      readFileSync(join(ROOT, ".agents/platform/routing.yml"), "utf8"),
-    ).routes;
-    const pending = routes
-      .map((route) => route.model)
-      .filter((model) => typeof model === "string" && /^pending-/i.test(model));
-    expect(pending.length).toBeGreaterThan(0);
-    for (const model of pending) {
-      const declared = result({ evidence: { ...result().evidence, model } });
-      const out = validateResult(declared);
-      expect(out.ok, model).toBe(false);
-      expect(out.errors.join("\n")).toContain("evidence.model");
-      // 口径是「没判过」，不是「判成不合格」。
-      expect(assess({ a: declared }).conclusion).toBe("action_required");
-    }
-  });
-
-  it("占位符 request_id 不算证据", () => {
-    for (const requestId of ["", "unknown", "todo", "n/a", "unset"]) {
-      const out = validateResult(
-        result({ evidence: { ...result().evidence, request_id: requestId } }),
-      );
-      expect(out.ok).toBe(false);
-      expect(out.errors.join("\n")).toContain("evidence.request_id");
-    }
-  });
-});
-
-describe("normalizeVerdict", () => {
-  it("全 pass -> pass", () => {
-    expect(normalizeVerdict([result(), result()])).toBe("pass");
-  });
-  it("任一 needs_revision -> needs_revision", () => {
-    expect(
-      normalizeVerdict([result(), result({ verdict: "needs_revision" })]),
-    ).toBe("needs_revision");
-  });
-  it("任一 reject -> reject（压过 needs_revision）", () => {
-    expect(
-      normalizeVerdict([
-        result(),
-        result({ verdict: "needs_revision" }),
-        result({ verdict: "reject" }),
-      ]),
-    ).toBe("reject");
-  });
-  it("任一 INFRA -> INFRA（压过 reject）", () => {
-    expect(
-      normalizeVerdict([
-        result({ verdict: "reject" }),
-        result({ verdict: "INFRA" }),
-      ]),
-    ).toBe("INFRA");
-  });
-  it("schema 不合格按 INFRA 计，绝不按 pass", () => {
-    const broken = result({ findings: [finding({ severity: "critical" })] });
-    expect(normalizeVerdict([broken, result()])).toBe("INFRA");
-  });
-  it("没有结果也是 INFRA（空集合不读成通过）", () => {
-    expect(normalizeVerdict([])).toBe("INFRA");
-  });
-});
-
-describe("compareFindings", () => {
-  const shared = finding();
-  const onlyA = finding({
-    path: "scripts/a.mjs",
-    line: 7,
-    criterion: "只有 A 看见",
-  });
-  const onlyB = finding({
-    path: "scripts/b.mjs",
-    line: 9,
-    criterion: "只有 B 看见",
-  });
-  const out = compareFindings(
-    {
-      findings: [
-        shared,
-        onlyA,
-        finding({
-          path: "scripts/c.mjs",
-          line: 3,
-          criterion: "严重度不一致",
-          severity: "low",
-        }),
-      ],
-    },
-    {
-      findings: [
-        shared,
-        onlyB,
-        finding({
-          path: "scripts/c.mjs",
-          line: 3,
-          criterion: "严重度不一致",
-          severity: "blocker",
-        }),
-      ],
-    },
-  );
-
-  it("agreed：path+line+criterion 相同且 severity 相同", () => {
-    expect(out.agreed).toHaveLength(1);
-    expect(out.agreed[0].criterion).toBe("required check 只认 success");
-  });
-  it("onlyA / onlyB 各归一边", () => {
-    expect(out.onlyA.map((f) => f.criterion)).toEqual(["只有 A 看见"]);
-    expect(out.onlyB.map((f) => f.criterion)).toEqual(["只有 B 看见"]);
-  });
-  it("severityMismatch 单独列出且两边严重度都可见", () => {
-    expect(out.severityMismatch).toHaveLength(1);
-    expect(out.severityMismatch[0]).toMatchObject({
-      path: "scripts/c.mjs",
-      line: 3,
-      severityA: "low",
-      severityB: "blocker",
-    });
-  });
-  it("计数与同步率自洽", () => {
-    expect(out.counts).toEqual({
-      agreed: 1,
-      onlyA: 1,
-      onlyB: 1,
-      severityMismatch: 1,
-    });
-    expect(out.agreementRate).toBeCloseTo(0.25);
-  });
-  it("接受裸 findings 数组", () => {
-    expect(compareFindings([shared], [shared]).agreed).toHaveLength(1);
-  });
-  it("非对象元素不参与比对：null/字符串/数组不是一条缺陷，也不许被解引用", () => {
-    const out = compareFindings(
-      { findings: [shared, null, "x", ["y"]] },
-      { findings: [shared] },
-    );
-    expect(out.agreed).toHaveLength(1);
-    expect(out.counts).toEqual({
-      agreed: 1,
-      onlyA: 0,
-      onlyB: 0,
-      severityMismatch: 0,
-    });
-  });
-});
-
-describe("toCheckConclusion", () => {
-  // GitHub 只把 success / skipped / neutral 算通过；
-  // neutral 会放行 required check，所以 INFRA 不能用它。
-  const PASSING = ["success", "skipped", "neutral"];
-
-  it("pass -> success", () => {
-    expect(toCheckConclusion("pass")).toBe("success");
-  });
-  it("needs_revision / reject -> failure", () => {
-    expect(toCheckConclusion("needs_revision")).toBe("failure");
-    expect(toCheckConclusion("reject")).toBe("failure");
-  });
-  it("INFRA 的 conclusion 不在通过集合里", () => {
-    const conclusion = toCheckConclusion("INFRA");
-    expect(conclusion).toBe("action_required");
-    expect(PASSING).not.toContain(conclusion);
-  });
-  it("认不出的 verdict 也不给绿", () => {
-    expect(PASSING).not.toContain(toCheckConclusion("whatever"));
-  });
-});
 
 describe("退出码", () => {
   const run = (a, b) => {
@@ -321,14 +91,14 @@ describe("退出码", () => {
       evidence: { ...body.evidence, executor, agent },
     });
     const args = [
-      SCRIPT,
+      ...FINDINGS_ARGS,
       "--a",
       write("a.json", seat(a, "sandbox", "review-a")),
     ];
     if (b) args.push("--b", write("b.json", seat(b, "github", "review-b")));
     const out = join(dir, "result.json");
     args.push("--out", out);
-    const spawned = spawnSync(process.execPath, args, { encoding: "utf8" });
+    const spawned = spawnSync(FINDINGS, args, { encoding: "utf8" });
     return {
       code: spawned.status,
       stdout: spawned.stdout,
@@ -375,16 +145,16 @@ describe("退出码", () => {
   it("读不到的输入按 INFRA 记", () => {
     const dir = mkdtempSync(join(tmpdir(), "audit-missing-"));
     const spawned = spawnSync(
-      process.execPath,
-      [SCRIPT, "--a", join(dir, "nope.json")],
+      FINDINGS,
+      [...FINDINGS_ARGS, "--a", join(dir, "nope.json")],
       { encoding: "utf8" },
     );
     expect(spawned.status).toBe(3);
     expect(spawned.stdout).toContain("读不到输入");
   });
 
-  // 下面三条各自钉一件事：不崩、不伪造注解、两个退出码不混。
-  // 三条都走真进程（spawn 脚本），而不是调一个「测试专用入口」：
+  // 下面两条各自钉一件事：不崩、不伪造注解。
+  // 两条都走真进程（spawn 编译产物），而不是调一个「测试专用入口」：
   // 崩溃与输出面是入口 + main 的产物，只测内部函数就等于没测。
   const seatFor = (body, executor, agent) => ({
     ...body,
@@ -399,9 +169,9 @@ describe("退出码", () => {
     };
     const out = join(dir, "result.json");
     const spawned = spawnSync(
-      process.execPath,
+      FINDINGS,
       [
-        SCRIPT,
+        ...FINDINGS_ARGS,
         "--a",
         write("a.json", a),
         "--b",
@@ -430,7 +200,8 @@ describe("退出码", () => {
       ),
       seatFor({ ...result(), findings: [finding()] }, "github", "review-b"),
     );
-    expect(spawned.stderr).not.toContain("TypeError");
+    // 崩溃面不许把内部堆栈漏到 stderr（Go 侧的对应物是 panic / goroutine 转储）。
+    expect(spawned.stderr).not.toContain("panic");
     expect(spawned.status).toBe(3);
     const parsed = read();
     expect(parsed.conclusion).toBe("action_required");
@@ -463,86 +234,10 @@ describe("退出码", () => {
     expect(lines.some((line) => line.includes("from-agent"))).toBe(true);
   });
 
-  it("两个退出码不混：只有 failure 让 job 红，action_required 不染 job", () => {
-    // job 级 check 不是第二个结论写者：它的红会把「未判过」说成「代码不合格」。
-    expect(workflowExitFor("success")).toBe(0);
-    expect(workflowExitFor("action_required")).toBe(0);
-    expect(workflowExitFor("failure")).toBe(1);
-  });
-});
-
-describe("崩溃兜底", () => {
-  it("任何未预期异常也必须产出 result.json：宁可写一条 INFRA，也不许留空", () => {
-    // 崩溃面最容易被忽略的一处：结论已经算出来了，死在把它写出去的路上。
-    // 用「stdout 写第一行就抛」来注入一个未预期异常，走到的是真入口函数 run()。
-    const dir = mkdtempSync(join(tmpdir(), "audit-crash-"));
-    const a = join(dir, "a.json");
-    writeFileSync(a, JSON.stringify(result()));
-    const out = join(dir, "result.json");
-    const write = vi
-      .spyOn(process.stdout, "write")
-      .mockImplementationOnce(() => {
-        throw new Error("stdout 挂了");
-      });
-    let code;
-    try {
-      code = run(["--a", a, "--out", out]);
-    } finally {
-      write.mockRestore();
-    }
-    expect(code).toBe(3);
-    const parsed = JSON.parse(readFileSync(out, "utf8"));
-    expect(parsed.conclusion).toBe("action_required");
-    expect(parsed.exit_code).toBe(3);
-    expect(parsed.exit).toBe(0);
-    expect(String(parsed.reason)).toContain("口径层崩溃");
-    expect(String(parsed.reason)).toContain("stdout 挂了");
-  });
-});
-
-describe("跨槽不变式", () => {
-  it("两个槽自报同一个执行器与同一个模型 -> INFRA（一份意见不许记成两票）", () => {
-    const same = result({
-      evidence: { ...result().evidence, executor: "github", agent: "review-b" },
-    });
-    const out = assess({ a: same, b: same });
-    expect(out.verdict).toBe("INFRA");
-    expect(out.conclusion).toBe("action_required");
-    const reasons = out.executors.map((e) => e.reason).join("\n");
-    expect(reasons).toContain("同一个执行器");
-    expect(reasons).toContain("与同一个模型 vendor/model-1");
-  });
-
-  it("同为 github 执行器但模型不同 -> 独立性成立，不判 INFRA", () => {
-    // 两位审查者都跑在 GitHub Actions 里，执行器必然都是 github；
-    // 若只按执行器认重，自动产出 findings 这条路永远拿不到结论。
-    const a = result({
-      evidence: {
-        executor: "github",
-        agent: "review-a",
-        model: "deepseek-chat",
-        request_id: "req_a",
-      },
-    });
-    const b = result({
-      evidence: {
-        executor: "github",
-        agent: "review-b",
-        model: "deepseek-reasoner",
-        request_id: "req_b",
-      },
-    });
-    const out = assess({ a, b });
-    expect(out.verdict).toBe("pass");
-    expect(out.executors.map((e) => e.effective)).toEqual(["pass", "pass"]);
-  });
-
-  it("两个槽不同执行器时不受影响", () => {
-    const other = result({
-      evidence: { ...result().evidence, executor: "github", agent: "review-b" },
-    });
-    expect(assess({ a: result(), b: other }).verdict).toBe("pass");
-  });
+  // 「两个退出码不混」（success/action_required -> 0，failure -> 1）搬到
+  // apps/engine/auditfindings_test.go 的 TestAuditWorkflowExitForKeepsJobGreenForInfra：
+  // 那是口径层内部映射，Node 侧已无实现可 import；两条退出码各自落地后仍在这里被断言
+  // （下面「INFRA -> 3」的 exit_code 与 result.json 的 exit 字段）。
 });
 
 describe("wiring: .github/workflows/audit.yml", () => {
@@ -744,11 +439,11 @@ describe("wiring: 真跑 YAML 的 run 块", () => {
     // 取 diff 的夹具：真 gh 的 `pr diff` 打出的就是一段 unified diff。内容不参与判定
     // （沙箱里没有 key，模型那一层不会被真的调用），但它必须非空 —— workflow 要求 diff 非空。
     const DIFF_FIXTURE = [
-      "diff --git a/scripts/audit-slot.mjs b/scripts/audit-slot.mjs",
-      "--- a/scripts/audit-slot.mjs",
-      "+++ b/scripts/audit-slot.mjs",
+      "diff --git a/apps/engine/auditslot.go b/apps/engine/auditslot.go",
+      "--- a/apps/engine/auditslot.go",
+      "+++ b/apps/engine/auditslot.go",
       "@@ -1,2 +1,3 @@",
-      " # audit-slot",
+      " // audit-slot",
       "+// 夹具：被取走的对象，不参与判定",
       " const x = 1;",
       "",
@@ -883,7 +578,7 @@ try {
       stdout("cafebabe");
       process.exit(0);
     }
-    stdout(["scripts/merge-gate.mjs", "scripts/audit-findings.mjs"].join(NEWLINE));
+    stdout(["apps/engine/auditfindings.go", "apps/engine/cli.go"].join(NEWLINE));
     process.exit(0);
   }
   if (positional[0] !== "api") notFound();
@@ -5895,14 +5590,14 @@ try {
         {
           id: "probe",
           name: "探针",
-          run: "node scripts/audit-review.mjs --slot review-a\n",
+          run: "node scripts/probe-read.mjs --slot review-a\n",
         },
         { root: ROOT },
       ),
-    ).toEqual(["scripts/audit-review.mjs"]);
-    // 判定步本身不再引用任何脚本（它是编译产物）。注意不能断言「脚本闭包里没有
-    // scripts/audit-findings.mjs」：那份模块现在作为库被 audit-review import，
-    // 它仍在闭包里 —— 断言的是**执行面**，不是整个仓库的 import 图。
+    ).toEqual(["scripts/probe-read.mjs"]);
+    // 判定步本身不再引用任何脚本（它是编译产物）。这里断言的是**执行面**，
+    // 不是整个仓库的 import 图；口径层的判据已经从脚本搬进引擎实现，
+    // 谁再 import 它都不该被算成「执行面」。
     const decide = steps.find((s) => s.id === "decide");
     expect(stepScriptRefs(decide, { root: ROOT })).toEqual([
       SANCTIONED_BINARY,
@@ -6086,13 +5781,17 @@ try {
     expect(workflowBinarySourceGaps()).toEqual([SANCTIONED_BINARY]);
   });
 
-  it("阶段 D3 自证：声明的源码模块在仓库里，且它就是本用例 import 的那份判据", () => {
+  it("阶段 D3 自证：声明的源码模块在仓库里，且它就是产出者本体", () => {
     const sources = sanctionedSourceModules();
     expect(sources.length).toBeGreaterThan(0);
-    for (const rel of sources) expect(existsSync(join(ROOT, rel)), rel).toBe(true);
-    // 声明指到错文件会立刻红：这一份导出的 validateResult 就是判定步真正跑的那条判据。
-    expect(SCRIPT).toBe(join(ROOT, sources[0]));
-    expect(typeof validateResult).toBe("function");
+    // 声明指到错文件会立刻红。载体已从 Node 脚本换成 Go 实现（那些脚本已在本批删除），
+    // 所以这里钉的是「产物背后的实现就在仓库里、且带着判定入口」，而不是某条 import。
+    for (const rel of sources) {
+      expect(existsSync(join(ROOT, rel)), rel).toBe(true);
+      expect(readFileSync(join(ROOT, rel), "utf8"), rel).toContain(
+        "func AssessAudit(",
+      );
+    }
   });
 
   it('形状判据认字段名不认拼写：jq 的 .["executors"] 也是读者（逃得过旧正则，逃不过这条）', () => {
@@ -6756,7 +6455,7 @@ try {
       ...result({ verdict: "needs_revision" }),
       findings: [
         {
-          path: "scripts/audit-findings.mjs",
+          path: "apps/engine/auditfindings.go",
           line: 1,
           severity: "low",
           criterion: "注入面",
@@ -7126,7 +6825,7 @@ try {
   // 引擎替身：先把真产物改名成 engine-real（同一条 run 块里的 slot 调用、以及判定步
   // 还要用它），再放一个**按子命令分流**的 sh 替身。替身写一行 marker（.audit/stub-ran），
   // 断言里有它 —— 替身没被执行时用例立刻红，而不是「桩没跑到 → 结论正常 → 用例绿」
-  // （阶段 D3 就踩过这个坑：桩钉在 scripts/audit-review.mjs 上，调用点换成产物后成了空操作）。
+  // （阶段 D3 就踩过这个坑：桩钉在当时的 Node 脚本上，调用点换成产物后成了空操作）。
   function installEngineStub(dir, body) {
     const enginePath = join(dir, SANCTIONED_BINARY);
     const real = join(dir, ".cache/bin/engine-real");
@@ -7395,17 +7094,19 @@ try {
   it("放行单位是步不是文件：另一步再引用口径层脚本去读 result.json，照样是读者", () => {
     const dir = mkdtempSync(join(tmpdir(), "audit-step-allow-"));
     mkdirSync(join(dir, "scripts"), { recursive: true });
+    // 夹具名不再指向口径层（口径层已删，那是另一个事实）：这里要的只是「同一个被引用脚本
+    // 被两步共用，写 result.json 的那步放行、另一步不是」。
     writeFileSync(
-      join(dir, "scripts/audit-findings.mjs"),
+      join(dir, "scripts/probe.mjs"),
       'const r = JSON.parse(readFileSync(".audit/result.json", "utf8"));\nconsole.log(Object.entries(r).length);\n',
     );
     const writer = {
       id: "decide",
-      run: "node scripts/audit-findings.mjs --out .audit/result.json\n",
+      run: "node scripts/probe.mjs --out .audit/result.json\n",
     };
     const thief = {
       id: "thief",
-      run: "node scripts/audit-findings.mjs --out /tmp/elsewhere.json\n",
+      run: "node scripts/probe.mjs --out /tmp/elsewhere.json\n",
     };
     // 同一个文件被两步引用：写 result.json 的那一步放行，另一个不是。
     expect(resultJsonWriterSteps([writer, thief])).toEqual(["decide"]);
@@ -7716,7 +7417,7 @@ try {
     it("缺陷1d：写行里追加一次真读 —— 整行不再被写形态吞掉", () => {
       const dir = mkdtempSync(join(tmpdir(), "audit-write-line-read-"));
       const write =
-        "node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json";
+        "./.cache/bin/engine audit-findings --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json";
       const legal = [
         "set +e",
         write,
@@ -7997,7 +7698,7 @@ try {
       // 正向对照：同一个 --out 落在代码区就是真写者。少了这条，上面那条会退化成「谁都不是写者」。
       const real = {
         id: "real",
-        run: "node scripts/audit-findings.mjs --out .audit/result.json\n",
+        run: "./.cache/bin/engine audit-findings --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json\n",
       };
       expect(resultJsonWriterSteps([real])).toEqual(["real"]);
     });
@@ -8254,7 +7955,7 @@ try {
       ).toEqual([]);
       expect(
         wildcardAuditRefs(
-          '  "用法: node scripts/audit-review.mjs --slot review-a|review-b --diff <diff 文件> --out <输出 json> [--api-base <url>]";',
+          '  "用法: ./.cache/bin/engine audit-review --slot review-a|review-b --diff <diff 文件> --out <输出 json> [--api-base <url>]";',
         ),
       ).toEqual([]);
       // 正面：真操作数一个都不许漏 —— 目录段通配、文件名通配、? 通配、方括号类。
