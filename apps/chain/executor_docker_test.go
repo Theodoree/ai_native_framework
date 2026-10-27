@@ -30,6 +30,18 @@ func fakeDocker(t *testing.T, exitCode int) (string, string) {
 	return script, args
 }
 
+// fakeDockerSaying 写一个把指定几行打出来的 docker 替身，用来验「容器怎么表达自审结论」。
+func fakeDockerSaying(t *testing.T, lines ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "docker")
+	body := strings.Join(append(append([]string{"#!/bin/sh"}, lines...), "exit 0"), nl)
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
 func dockerFixture() (*Requirement, *Node) {
 	r := &Requirement{ID: "REQ-1", ProjectKey: "demo", Branch: "req/demo/REQ-1", Context: "把登录页做出来"}
 	n := &Node{Key: "assess", Type: TypeAssess, Review: ReviewAI, Rules: []string{"先看测试覆盖率"}}
@@ -178,5 +190,32 @@ func TestDockerExecutorLogUsesRealNewlines(t *testing.T) {
 	}
 	if strings.Contains(c.Body, "\\n") {
 		t.Fatalf("评论里出现了字面量反斜杠 n：%q", c.Body)
+	}
+}
+
+// 容器自审的唯一契约：输出里一行 CHAIN_VERDICT。人审节点上这条结论不算数。
+func TestDockerExecutorReadsSelfVerdict(t *testing.T) {
+	script := fakeDockerSaying(t, "echo 干活", "echo 'CHAIN_VERDICT: reject 覆盖率掉了 4 个点'")
+	d := DockerExecutor{
+		Templates: defaultTemplateRegistry(),
+		Docker:    script,
+		BaseURL:   "https://api.example.com",
+		Model:     "deepseek-v4",
+		Timeout:   time.Minute,
+	}
+	r, n := dockerFixture()
+	a, c, _ := d.Run(r, n, time.Now())
+	if a.Verdict != VerdictReject || !strings.Contains(a.VerdictReason, "覆盖率") {
+		t.Fatalf("容器自审结论应当被读出来，实际 %q / %q", a.Verdict, a.VerdictReason)
+	}
+	if !strings.Contains(c.Body, "审核方：AI 自审") {
+		t.Fatalf("评论第一眼就该看到谁在审，实际 %q", c.Body)
+	}
+
+	// 人审节点：执行器照实报告容器说了什么，定性（要不要当结论）由落库那一步决定。
+	n.Review = ReviewHuman
+	_, c2, _ := d.Run(r, n, time.Now())
+	if !strings.Contains(c2.Body, "审核方：人工") {
+		t.Fatalf("人审节点的评论应当写明人工审核，实际 %q", c2.Body)
 	}
 }

@@ -218,6 +218,8 @@ func (s *Server) nodeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, body.Author)
+	// 整条需求被拒时才回告：回告写在落库之后。
+	rejectWhole := ""
 	if IsContainer(n.Type) {
 		attempt, comment, artifacts := s.exec.Run(req, n, s.now())
 		if err := req.FinishRun(n.Key, attempt, comment, artifacts, s.now()); err != nil {
@@ -225,10 +227,31 @@ func (s *Server) nodeRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logEvent(req, n.Key, "finish", StateRunning, StateAwaitingReview, attempt.Template)
+		// 容器自审只有 review=ai 的节点会自动定案；人审节点在这里停住等人按。
+		applied, err := req.ApplyReview(n.Key, attempt.Verdict, attempt.VerdictReason, s.now())
+		if err != nil {
+			fail(w, 409, err.Error())
+			return
+		}
+		switch applied {
+		case "accepted":
+			s.logEvent(req, n.Key, "accept", StateAwaitingReview, StateAccepted, "AI 自审通过")
+		case "rejected":
+			s.logEvent(req, n.Key, "reject", StateAwaitingReview, req.Node(n.Key).State, attempt.VerdictReason)
+			if req.State == ReqRejected {
+				rejectWhole = attempt.VerdictReason
+			}
+		}
+	}
+	if rejectWhole != "" {
+		s.recordRejection(req, n.Key, rejectWhole)
 	}
 	if err := s.store.SaveRequirement(req); err != nil {
 		fail(w, 500, err.Error())
 		return
+	}
+	if rejectWhole != "" {
+		s.deliverCallback(req, n.Key, rejectWhole)
 	}
 	writeJSON(w, 200, req)
 }
