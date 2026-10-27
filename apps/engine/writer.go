@@ -1,6 +1,6 @@
 package engine
 
-// writer-record：唯一写者的「留痕」出口（判据见 scripts/writer-record.mjs）。
+// writer-record：唯一写者的「留痕」出口（判据见 writer_test.go，端到端形状见 parity suite b）。
 // 判定逻辑不在这里：这里只决定「评论什么正文、job 红不红」。
 
 import (

@@ -10,11 +10,12 @@
 
 删掉这批 `.mjs` 的条件：引擎在 `main` 上跑稳之前，parity 仍以它们为黄金基准。
 
+**已删除**：`writer-record.mjs`（P-31 收尾）。它的 9 条判据等价搬进 `apps/engine/writer_test.go`，13 条 CLI 形状仍由 `tests/goldens/b/` 的冻结 golden 钉住（Go 引擎 vs golden，逐字节比 stdout / stderr / 退出码），所以删掉参照物不降低强度；`node tests/goldens/freeze.mjs` 遇到这批夹具会以「参照物已删除」的中止说明退出，不崩溃、不静默跳过。判据与 golden 的落点表见 `apps/engine/README.md`。
+
 | 文件                 | Go 载体                                        | 唯一职责                                                                                                                                                                                                                              | 不做什么                                                                     |
 | -------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | `state-validate.mjs` | `apps/engine/validate.go`                      | 读声明、判定一次状态转换（0 allowed / 1 rejected / 3 INFRA），意图没有归属 issue 也判 INFRA；声明了 guards 的转换必须带非空证据（写入口 fail-closed），给「门」另有只读咨询入口                                                       | 不写任何状态，不知道宿主是谁；不校验证据内容真假                             |
 | `build-intent.mjs`   | `apps/engine/intent.go`                        | 把宿主事件映射成意图（PR 事件解析它引用的 issue）                                                                                                                                                                                     | 不判定；认不出的事件返回 null，解析不出 issue 就交 null 给判定器             |
-| `writer-record.mjs`  | `apps/engine/writer.go`                        | 判定之后怎么留痕：评论正文 + job 红绿（rejected→0 / infra→1）                                                                                                                                                                         | 不判定，不写状态                                                             |
 | `last-change.mjs`    | `apps/engine/lastchange.go`                    | 门牌 `## LAST-CHANGE` 的幂等重算：同一份输入（宿主事件 + git 区间 `BASE..HEAD`）重算任意次输出逐字相同，写回 PR body 后不再变化；算不出来就退出 1（缺 issue 引用 / 区间里没有文件 / 缺 `merged_at`、`merged_by`），绝不输出空表当成功 | 不判定、不改状态、不联网；时间只取事件的 `merged_at`，没有 `Date.now()`      |
 | `ledger.mjs`         | `apps/engine/ledger.go`                        | append-only 账本：追加事件、折叠成投影                                                                                                                                                                                                | 不判定，不决定状态                                                           |
 | `ledger-cli.mjs`     | `apps/engine/ledger.go` + `apps/engine/cli.go` | 账本与声明的机器接口（fold/events/next-id/append/entry/config，一行 JSON），给 Go 后端用                                                                                                                                              | 不判定，不新增字段，不改写返回值                                             |
@@ -47,7 +48,7 @@ npm run cli -- outbox [--json]
 
 ## 状态
 
-stale（作为执行入口）——判定、账本、门、留痕、知识库汇入、前端产物复制与接入层的调用点都已指向 `./.cache/bin/engine`，本目录只剩 parity 对照物与 `audit.yml` 仍在执行的三个审计脚本。模块契约在 `apps/engine/README.md`；迁移记录见 `.agents/notes/proposed/p31-engine-go-migration.md`。
+stale（作为执行入口）——判定、账本、门、留痕、知识库汇入、前端产物复制与接入层的调用点都已指向 `./.cache/bin/engine`，本目录只剩 parity 对照物与 `audit.yml` 仍在执行的三个审计脚本；`writer-record.mjs` 已经没有对照物身份（已删除，留痕只剩 Go 实现）。模块契约在 `apps/engine/README.md`；迁移记录见 `.agents/notes/proposed/p31-engine-go-migration.md`。
 远端（GitHub label）执行器尚未接入，见 `.agents/notes/proposed/p03-remote-and-repo-setup.md`。
 
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)

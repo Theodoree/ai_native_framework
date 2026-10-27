@@ -994,6 +994,10 @@ const bCases = [
   },
 
   // ---------- writer-record ----------
+  // 参照物已删除：P-31 之后 writer-record 的唯一实现是 apps/engine/writer.go，scripts/writer-record.mjs
+  // 与钉它的 Node 套件都删了。下面这 13 条夹具只剩「拿 Go 引擎比已入库 golden」这一半，**不再可重冻** ——
+  // node tests/goldens/freeze.mjs 会以「参照物 scripts/writer-record.mjs 已删除」中止（守卫按 scripts/
+  // 里的文件是否存在判定，不读这里的注释）。改行为＝改 Go 侧，再手工更新 tests/goldens/b/*.json 的期望值。
   {
     title: "writer-record · allowed 不留痕",
     cmd: "writer-record",
@@ -1155,6 +1159,9 @@ const bCases = [
 export const suiteB = {
   id: "b",
   title: "engine parity · build-intent / last-change / writer-record（对照冻结 golden）",
+  // 这些模块的参照物（scripts/*.mjs）已删除，对应夹具只做 Go 侧 parity，不再可重冻：
+  // freeze.mjs 跑 Node 侧之前会按 scripts/ 里文件是否存在自检，命中即中止并点名。
+  refreezeLocked: ["writer-record"],
   cases: assignIds(bCases, "b"),
   async createContext() {
     B.workDir = mkdtempSync(join(tmpdir(), "engine-parity-b-"));
