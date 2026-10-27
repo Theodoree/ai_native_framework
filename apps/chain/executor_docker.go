@@ -155,17 +155,21 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 	}
 
 	shown := redact(strings.Join(append([]string{d.name()}, args...), " "), key)
-	log := "命令: " + shown + "\\n---\\n" + out.String()
+	outText := redact(out.String(), key)
+	log := "命令: " + shown + "\n---\n" + outText
 	if err != nil {
-		log = "命令: " + shown + "\\n错误: " + err.Error() + "\\n---\\n" + out.String()
+		log = "命令: " + shown + "\n错误: " + redact(err.Error(), key) + "\n---\n" + outText
 	}
 	body := strings.Join([]string{
 		fmt.Sprintf("【容器执行】模板 %s（镜像 %s），节点 %s（%s）", tmpl.Key, tmpl.Image, n.Key, n.Type),
 		fmt.Sprintf("分支 %s，退出码 %d，结论 %s", r.Branch, exit, outcome),
 		rulesLine(n.Rules),
 		"--- 容器输出（尾部）---",
-		out.String(),
-	}, "\\n")
+		outText,
+	}, "\n")
+	// 兜底：不管密钥从哪条路径进来，落库前都再抹一次。
+	log = redact(log, key)
+	body = redact(body, key)
 
 	a := Attempt{StartedAt: now, EndedAt: time.Now(), ExitCode: exit, Template: tmpl.Key, Log: log, Outcome: outcome}
 	c := Comment{ID: newID("c"), AuthorType: "container", Author: tmpl.Key, Body: body, At: now}
@@ -217,6 +221,7 @@ func nodeAgents(n *Node) string {
 }
 
 // redact 把密钥从要落盘的文本里抹掉：日志会进数据库、进页面，等于公开。
+// 它必须作用在「最终要落盘的字符串」上——容器的 stdout 也会把密钥打出来。
 func redact(s, secret string) string {
 	if secret == "" {
 		return s
