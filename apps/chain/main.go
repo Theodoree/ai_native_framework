@@ -5,23 +5,58 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 )
 
-//go:embed web/index.html
+//go:embed webui/dist
 var webFS embed.FS
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8099", "监听地址")
-	data := flag.String("data", "data", "数据目录")
+	driver := flag.String("db-driver", "sqlite", "存储驱动（目前只有 sqlite）")
+	dbPath := flag.String("db", "data/chain.db", "数据库：sqlite 是文件路径")
+	execKind := flag.String("exec", "fake", "执行器：fake（不连外部）或 docker（本机 docker）")
+	templates := flag.String("templates", "", "容器模板表 JSON（增量覆盖默认模板）")
+	dockerBin := flag.String("docker", "docker", "docker 可执行文件")
+	timeout := flag.Duration("timeout", 10*time.Minute, "单次容器执行上限")
+	baseURL := flag.String("base-url", "", "注入容器的 BASE_URL")
+	model := flag.String("model", "", "注入容器的 model")
 	flag.Parse()
 
-	store, err := NewStore(*data)
+	store, err := OpenStore(*driver, *dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := NewServer(store, FakeExecutor{})
+	defer store.Close()
+
+	var exec Executor = FakeExecutor{}
+	if *execKind == "docker" {
+		tmpls, err := LoadTemplates(*templates)
+		if err != nil {
+			log.Fatal(err)
+		}
+		exec = DockerExecutor{
+			Templates: tmpls,
+			Docker:    *dockerBin,
+			Timeout:   *timeout,
+			BaseURL:   *baseURL,
+			Model:     *model,
+			Workspace: func(r *Requirement) string {
+				p, err := store.Project(r.ProjectKey)
+				if err != nil || !strings.HasPrefix(p.Repo, "/") {
+					return ""
+				}
+				return p.Repo
+			},
+		}
+	} else if *execKind != "fake" {
+		log.Fatalf("不认识的执行器：%s（只有 fake 与 docker）", *execKind)
+	}
+
+	srv := NewServer(store, exec)
 	mux := http.NewServeMux()
 	srv.Routes(mux)
-	log.Printf("链条平台已启动：http://%s （数据目录 %s）", *addr, *data)
+	log.Printf("链条平台已启动：http://%s （数据库 %s:%s，执行器 %s）", *addr, *driver, *dbPath, *execKind)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

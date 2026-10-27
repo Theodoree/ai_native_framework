@@ -5,21 +5,24 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func newTestServer(t *testing.T) (*httptest.Server, *Store) {
+func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
 	t.Helper()
-	store, err := NewStore(t.TempDir())
+	path := filepath.Join(t.TempDir(), "chain.db")
+	store, err := OpenStore("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	mux := http.NewServeMux()
 	NewServer(store, FakeExecutor{}).Routes(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
-	return ts, store
+	return ts, store, path
 }
 
 // call 发一次请求并解出需求，断言状态码。
@@ -86,7 +89,7 @@ func listReqs(t *testing.T, ts *httptest.Server) []Requirement {
 }
 
 func TestFlowHappyPath(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	setupProject(t, ts)
 	req := call(t, ts, "POST", "/api/p/demo/requirements", map[string]any{"context": "加一个导出按钮"}, 201)
 	if !strings.HasPrefix(req.Branch, "req/demo/REQ-") {
@@ -121,7 +124,7 @@ func TestFlowHappyPath(t *testing.T) {
 }
 
 func TestFlowRejectAtFirstNodeRejectsRequirement(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	setupProject(t, ts)
 	call(t, ts, "POST", "/api/p/demo/requirements", map[string]any{"context": "随手一问"}, 201)
 	newNodeReq(t, ts, "assess", "run", map[string]any{}, 200)
@@ -136,7 +139,7 @@ func TestFlowRejectAtFirstNodeRejectsRequirement(t *testing.T) {
 }
 
 func TestFlowRejectRollsBackToPreviousNode(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	setupProject(t, ts)
 	call(t, ts, "POST", "/api/p/demo/requirements", map[string]any{"context": "改一下导出格式"}, 201)
 	for _, n := range []string{"assess", "dev"} {
@@ -160,7 +163,7 @@ func TestFlowRejectRollsBackToPreviousNode(t *testing.T) {
 }
 
 func TestFlowRejectsBadInput(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	setupProject(t, ts)
 	call(t, ts, "POST", "/api/projects", map[string]any{"key": "demo"}, 409)
 	call(t, ts, "POST", "/api/p/nope/requirements", map[string]any{"context": "x"}, 404)
@@ -177,16 +180,17 @@ func TestFlowRejectsBadInput(t *testing.T) {
 }
 
 func TestFlowSurvivesRestart(t *testing.T) {
-	ts, store := newTestServer(t)
+	ts, _, path := newTestServer(t)
 	setupProject(t, ts)
 	call(t, ts, "POST", "/api/p/demo/requirements", map[string]any{"context": "重启后还在吗"}, 201)
 	newNodeReq(t, ts, "assess", "run", map[string]any{}, 200)
 	ts.Close()
 
-	reopened, err := NewStore(store.root)
+	reopened, err := OpenStore("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer reopened.Close()
 	ps, err := reopened.Projects()
 	if err != nil || len(ps) != 1 || ps[0].Key != "demo" {
 		t.Fatalf("project 应当从磁盘读回来：%v %+v", err, ps)

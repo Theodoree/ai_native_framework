@@ -14,17 +14,18 @@ import (
 
 // Server 只做三件事：校验输入、调状态机、把结果落盘。它自己不下结论。
 type Server struct {
-	store *Store
+	store Store
 	exec  Executor
 	now   func() time.Time
 }
 
-func NewServer(s *Store, e Executor) *Server {
+func NewServer(s Store, e Executor) *Server {
 	return &Server{store: s, exec: e, now: time.Now}
 }
 
 func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", s.index)
+	mux.HandleFunc("GET /assets/", s.assets)
 	mux.HandleFunc("GET /api/projects", s.listProjects)
 	mux.HandleFunc("POST /api/projects", s.createProject)
 	mux.HandleFunc("GET /api/requirements", s.listRequirements)
@@ -42,12 +43,31 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	b, err := webFS.ReadFile("web/index.html")
+	b, err := webFS.ReadFile("webui/dist/index.html")
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(b)
+}
+
+// assets 只从嵌入的构建产物里取：前端是构建出来的静态文件，不是模板。
+func (s *Server) assets(w http.ResponseWriter, r *http.Request) {
+	name := "webui/dist" + r.URL.Path
+	b, err := webFS.ReadFile(name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch {
+	case strings.HasSuffix(name, ".js"):
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	case strings.HasSuffix(name, ".css"):
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	default:
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
 	w.Write(b)
 }
 

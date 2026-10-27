@@ -9,6 +9,8 @@ Thumbs.db
 # 本机缓存与运行时状态（不进库）
 .cache/
 apps/chain/.cache/
+apps/web/node_modules/
+apps/web/.npm-cache/
 .agent-teams/
 
 # 运行时数据：project / 需求 / 事件流（每台实例各自累积，不入库）
@@ -20,3 +22,5 @@ data/
 # 日志
 logs/
 *.log
+# 本地构建出来的二进制（go build ./... 会落在模块根）
+apps/chain/chain
