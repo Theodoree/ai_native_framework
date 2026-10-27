@@ -3296,7 +3296,7 @@ try {
         }
         const tree = scriptTree(root, target);
         // 只对**脚本**引用要求解析成功：扫描面还会收进 node 命令后面的数据文件名
-        // （`node scripts/writer-record.mjs verdict.json`），那不是被跟随的脚本。
+        // （`node scripts/merge-gate.mjs verdict.json`），那不是被跟随的脚本。
         for (const gone of tree.missing) {
           if (SCRIPT_EXT.test(gone) && !tree.files.includes(gone)) {
             noteGap({
