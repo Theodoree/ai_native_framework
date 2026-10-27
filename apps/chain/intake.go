@@ -93,9 +93,11 @@ func (s *Server) isMember(u *User, projectKey string) bool {
 
 // 成员资格这道门在几个地方用到，动词不同但说的是一件事，所以文案只留一处。
 const (
-	actionPostRequirement   = "提不了需求"
-	actionViewRequirement   = "看不到这条需求"
-	actionChangeRequirement = "改不了这条需求"
+	actionPostRequirement    = "提不了需求"
+	actionViewRequirement    = "看不到这条需求"
+	actionChangeRequirement  = "改不了这条需求"
+	actionCommentRequirement = "评不了这条需求"
+	actionRuleRequirement    = "改不了这一站的规则"
 )
 
 // requireMember 是「这件事要的不是权力，而是『你在这个项目里』」的唯一门。

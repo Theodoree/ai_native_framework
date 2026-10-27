@@ -663,17 +663,23 @@ func (s *Server) nodeReject(c *gin.Context) {
 }
 
 func (s *Server) nodeComment(c *gin.Context) {
+	// 身份压在 404 前面（与其他门同一个顺序）；下面那句 nil 判断是兜底——
+	// 中间件已经拦过匿名，但这里不假设它一定在。
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return
+	}
 	req, n, body, ok := s.prepare(c)
 	if !ok {
 		return
 	}
-	// 评论不校验权力：登录了就能说话，作者记成账号名。
-	me := s.me(c)
-	author, authorType := "visitor", "visitor"
-	if me.User != nil {
-		author, authorType = me.User.Username, "user"
+	// 评论要的是成员资格，不是权力：能说话就会被当成这一站的意见记下来，
+	// 所以门槛是「你是这个项目的人」，不是「你有这一站的权力」。作者如实记账号名。
+	if _, ok := s.requireMember(c, req.ProjectKey, actionCommentRequirement); !ok {
+		return
 	}
-	if err := req.AddCommentBy(n.Key, authorType, author, body.Body, s.now()); err != nil {
+	if err := req.AddCommentBy(n.Key, "user", me.User.Username, body.Body, s.now()); err != nil {
 		fail(c, 409, err.Error())
 		return
 	}
@@ -688,6 +694,12 @@ func (s *Server) nodeComment(c *gin.Context) {
 func (s *Server) nodeRule(c *gin.Context) {
 	req, n, body, ok := s.prepare(c)
 	if !ok {
+		return
+	}
+	// 追加规则比评论危险得多：评论只留一句话，规则会被拼进容器注入的 AGENTS.md、
+	// 在下一站真正执行——陌生人的一句话就变成别人 agent 的指令。所以同一道成员门，
+	// 但文案点明这次动的是「这一站的规则」。
+	if _, ok := s.requireMember(c, req.ProjectKey, actionRuleRequirement); !ok {
 		return
 	}
 	rule := or(body.Rule, body.Body)

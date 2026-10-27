@@ -517,8 +517,8 @@ func (r *Requirement) AddComment(key, author, body string, now time.Time) error 
 	return r.AddCommentBy(key, "human", author, body, now)
 }
 
-// AddCommentBy 是评论的落地。评论不校验权力，但作者是谁要如实记下来：
-// 记成 visitor 还是角色名由调用方判定，模型层只负责存。
+// AddCommentBy 是评论的落地。模型层不管权力（那在入口），但作者是谁要如实记下来：
+// 作者类型（user / container / system）与作者名都由调用方判定，模型层只负责存。
 func (r *Requirement) AddCommentBy(key, authorType, author, body string, now time.Time) error {
 	n := r.Node(key)
 	if n == nil {
