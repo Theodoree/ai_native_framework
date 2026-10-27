@@ -1,246 +1,111 @@
 <script setup lang="ts">
+/**
+ * 需求详情：返回 + 需求元信息卡 + 链路卡片（图 + 选中站）+ 底部可折叠的事件流。
+ * 节点不再是「一站一张卡」的纵向列表：整条链是一张卡，点圆切换下面的站点。
+ */
 import { computed } from 'vue'
-import EmptyState from './EmptyState.vue'
-import EventStream from './EventStream.vue'
-import Icon from './Icon.vue'
-import NodeCard from './NodeCard.vue'
+import { IconLeft, IconRefresh } from '@arco-design/web-vue/es/icon'
 import NodeChain from './NodeChain.vue'
-import StatusBadge from './StatusBadge.vue'
-import { fmtTime } from '../format'
+import EventStream from './EventStream.vue'
+import ImageStrip from './ImageStrip.vue'
 import type { Node, NodeAction, RequirementDetail } from '../types'
+import { fmtState, fmtTime, stateColor } from '../format'
 
 const props = defineProps<{
   detail: RequirementDetail | null
   state: 'loading' | 'ready' | 'error'
   error: string
+  /** 当前项目 key 与我的权力：一路传到 NodeCard，缺权时按钮禁用并说明缺哪个。 */
+  projectKey: string
+  powers: string[]
   submit: (node: Node, action: NodeAction, text: string) => Promise<void>
+  restart: (node: Node, reason: string) => Promise<void>
+  uploadImages: (files: File[]) => Promise<void>
+  removeImage: (path: string) => Promise<void>
 }>()
 
 const emit = defineEmits<{ (e: 'back'): void; (e: 'retry'): void }>()
 
 const requirement = computed(() => props.detail?.requirement ?? null)
 const events = computed(() => props.detail?.events ?? [])
-/** 当前站 = 第一个还没通过的节点；全部通过就没有「当前」（链条全灰），不把最后一站误标成绿。 */
+/** 当前站 = 第一个还没通过的节点；全部通过就没有「当前」（-1），不把最后一站误标成当前。 */
 const currentIndex = computed(() => {
   const r = requirement.value
   if (!r) return -1
   return r.nodes.find((n) => n.state !== 'accepted')?.index ?? -1
 })
-
-function submitNode(node: Node, action: NodeAction, text: string): Promise<void> {
-  return props.submit(node, action, text)
-}
 </script>
 
 <template>
-  <section class="detail">
-    <button class="btn btn--ghost detail__back" type="button" @click="emit('back')">
-      <Icon name="back" :size="13" />
-      返回需求列表
-    </button>
-
-    <p v-if="state === 'loading'" class="detail__note">正在加载需求详情…</p>
-
-    <div v-else-if="state === 'error'" class="detail__note detail__note--error">
-      <span><Icon name="alert" :size="13" /> {{ error }}</span>
-      <button class="btn btn--ghost" type="button" @click="emit('retry')">重试</button>
+  <div class="stack">
+    <div class="row">
+      <a-button size="small" type="text" @click="emit('back')">
+        <template #icon><IconLeft /></template>
+        返回需求列表
+      </a-button>
     </div>
 
-    <EmptyState
-      v-else-if="!requirement"
-      title="没有选中需求"
-      hint="从左侧需求列表点一条进来，这里会显示它的链条与每一站的状态。"
-    />
+    <div v-if="state === 'loading' && !requirement" class="state">
+      <a-spin :size="24" />
+      <span>正在读这条需求…</span>
+    </div>
 
-    <template v-else>
-      <header class="meta card">
-        <div class="meta__line">
-          <span class="meta__id mono">{{ requirement.id }}</span>
-          <StatusBadge :state="requirement.state" />
+    <div v-else-if="state === 'error'" class="state">
+      <a-alert type="error">{{ error || '读不到这条需求。' }}</a-alert>
+      <a-button size="small" @click="emit('retry')">
+        <template #icon><IconRefresh /></template>
+        重试
+      </a-button>
+    </div>
+
+    <template v-else-if="requirement">
+      <a-card class="meta-card" :bordered="true">
+        <div class="row" style="gap: 8px; align-items: center">
+          <span class="mono req-id">{{ requirement.id }}</span>
+          <a-tag :color="stateColor(requirement.state)">{{ fmtState(requirement.state) }}</a-tag>
         </div>
-        <div class="meta__facts">
-          <span class="fact">
-            <span class="fact__label">分支</span>
-            <span class="fact__value mono">{{ requirement.branch }}</span>
-          </span>
-          <span class="fact">
-            <span class="fact__label">链条</span>
-            <span class="fact__value mono">{{ requirement.chainKey }} v{{ requirement.chainVersion }}</span>
-          </span>
-          <span class="fact">
-            <span class="fact__label">项目</span>
-            <span class="fact__value mono">{{ requirement.projectKey }}</span>
-          </span>
-          <span class="fact">
-            <span class="fact__label">更新</span>
-            <span class="fact__value">{{ fmtTime(requirement.updatedAt) }}</span>
-          </span>
-          <span class="fact">
-            <span class="fact__label">来源</span>
-            <span class="fact__value">{{ requirement.source || 'api' }}</span>
-          </span>
+        <div class="meta">
+          <div class="meta__item">
+            <span class="meta__label">分支</span>
+            <span class="meta__value mono">{{ requirement.branch }}</span>
+          </div>
+          <div class="meta__item">
+            <span class="meta__label">链条</span>
+            <span class="meta__value mono">{{ requirement.chainKey }} v{{ requirement.chainVersion }}</span>
+          </div>
+          <div class="meta__item">
+            <span class="meta__label">项目</span>
+            <span class="meta__value mono">{{ requirement.projectKey }}</span>
+          </div>
+          <div class="meta__item">
+            <span class="meta__label">来源</span>
+            <span class="meta__value">{{ requirement.source }}</span>
+          </div>
+          <div class="meta__item">
+            <span class="meta__label">更新于</span>
+            <span class="meta__value mono">{{ fmtTime(requirement.updatedAt) }}</span>
+          </div>
         </div>
-        <p class="meta__context">{{ requirement.context }}</p>
-        <p v-if="requirement.images.length" class="meta__images soft">
-          附件：{{ requirement.images.join('、') }}
-        </p>
-      </header>
+        <p class="req-context">{{ requirement.context }}</p>
+
+        <ImageStrip
+          :images="requirement.images ?? []"
+          :upload="props.uploadImages"
+          :remove="props.removeImage"
+        />
+      </a-card>
 
       <NodeChain
-        v-if="requirement.nodes.length"
-        class="detail__chain"
         :nodes="requirement.nodes"
         :current-index="currentIndex"
+        :requirement-state="requirement.state"
+        :project-key="requirement.projectKey"
+        :powers="powers"
+        :submit="submit"
+        :restart="restart"
       />
-
-      <ol class="timeline">
-        <li
-          v-for="node in requirement.nodes"
-          :id="`node-${node.key}`"
-          :key="node.key"
-          class="timeline__item"
-        >
-          <span class="timeline__rail" aria-hidden="true" />
-          <NodeCard
-            :node="node"
-            :current="node.index === currentIndex"
-            :requirement-state="requirement.state"
-            :submit="(action, text) => submitNode(node, action, text)"
-          />
-        </li>
-      </ol>
 
       <EventStream :events="events" />
     </template>
-  </section>
+  </div>
 </template>
-
-<style scoped>
-.detail {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.detail__back {
-  align-self: flex-start;
-  padding-left: 4px;
-  color: var(--text-muted);
-}
-
-.detail__note {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text-muted);
-}
-
-.detail__note--error {
-  border-color: #fecaca;
-  color: var(--danger);
-}
-
-.meta {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 14px 16px;
-}
-
-.meta__line {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.meta__id {
-  font-size: var(--fs-title);
-  font-weight: 700;
-}
-
-.meta__facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 18px;
-  font-size: var(--fs-small);
-}
-
-.fact {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.fact__label {
-  color: var(--text-soft);
-}
-
-.fact__value {
-  color: var(--text);
-  font-weight: 600;
-}
-
-.meta__context {
-  padding-top: 6px;
-  border-top: 1px solid var(--border);
-  color: var(--text);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.meta__images {
-  font-size: var(--fs-small);
-}
-
-.timeline {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.detail__chain {
-  padding: 2px 4px;
-}
-
-.timeline__item {
-  position: relative;
-  display: block;
-  padding-left: 18px;
-  /* 点链条跳转时给 sticky 顶栏留出空间，卡片标题不会被盖住。 */
-  scroll-margin-top: 76px;
-}
-
-.timeline__rail {
-  position: absolute;
-  top: 6px;
-  bottom: -10px;
-  left: 5px;
-  width: 2px;
-  border-radius: 1px;
-  background: var(--border);
-}
-
-.timeline__item:last-child .timeline__rail {
-  bottom: 50%;
-  opacity: 0;
-}
-
-.timeline__item > *:not(.timeline__rail) {
-  position: relative;
-  z-index: 1;
-}
-
-@media (max-width: 900px) {
-  .timeline__item {
-    padding-left: 0;
-  }
-
-  .timeline__rail {
-    display: none;
-  }
-}
-</style>

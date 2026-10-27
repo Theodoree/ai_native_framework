@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import EmptyState from './EmptyState.vue'
-import Icon from './Icon.vue'
-import StatusBadge from './StatusBadge.vue'
-import { excerpt, fmtTime, fmtType } from '../format'
-import type { NewRequirementInput, Node, Requirement } from '../types'
+/**
+ * 需求列表：Arco Table 装数据（行点击进详情），新建需求走 Modal 表单，
+ * 错误与空态都在界面里说清楚，不弹 window.alert。
+ */
+import { computed, ref } from 'vue'
+import { IconPlus, IconRefresh, IconRight } from '@arco-design/web-vue/es/icon'
+import type { TableColumnData } from '@arco-design/web-vue'
+import type { Chain, NewRequirementInput, Requirement } from '../types'
+import { excerpt, fmtNodeName, fmtState, fmtTime, stateColor } from '../format'
 
 const props = defineProps<{
   requirements: Requirement[]
@@ -12,14 +15,63 @@ const props = defineProps<{
   error: string
   projectKey: string
   projectName: string
+  /** 当前项目可选的链；开需求时挑一条，不挑就取第一条。 */
+  chains: Chain[]
   create: ((input: NewRequirementInput) => Promise<void>) | null
 }>()
 
 const emit = defineEmits<{ (e: 'open', id: string): void; (e: 'retry'): void }>()
 
+const dialogOpen = ref(false)
 const context = ref('')
+const source = ref('web')
+const chain = ref('')
 const busy = ref(false)
 const error = ref('')
+
+const columns: TableColumnData[] = [
+  { title: '需求', dataIndex: 'id', slotName: 'req', width: 188 },
+  { title: '状态', dataIndex: 'state', slotName: 'state', width: 96 },
+  { title: '当前站', dataIndex: 'current', slotName: 'cur', width: 196 },
+  // 正文列不给固定宽：Arco 会对无宽列按内容撑开，长正文会把表格顶出面板；
+  // ellipsis + tooltip 让它吃剩余宽度并截断，悬停看全文。
+  { title: '正文', dataIndex: 'context', slotName: 'body', ellipsis: true, tooltip: true },
+  { title: '进度', dataIndex: 'progress', slotName: 'prog', width: 86 },
+  { title: '更新于', dataIndex: 'updatedAt', slotName: 'time', width: 158 },
+  { title: '', slotName: 'ops', width: 56 },
+]
+
+/** 当前站 = 第一个还没通过的节点；全通过就没有当前站。 */
+function currentOf(r: Requirement) {
+  return r.nodes.find((n) => n.state !== 'accepted') ?? null
+}
+
+function doneCount(r: Requirement): number {
+  return r.nodes.filter((n) => n.state === 'accepted').length
+}
+
+const total = computed(() => props.requirements.length)
+const chain2Path = (c: Chain) => c.nodes.map((n) => n.key).join(' → ')
+
+function onRowClick(record: unknown) {
+  emit('open', (record as Requirement).id)
+}
+
+function openDialog() {
+  error.value = ''
+  // 默认选项目的第一条链——和不开链字段时后端的取法一致（pickChain 空串取 Chains[0]）。
+  chain.value = props.chains[0]?.key ?? ''
+  dialogOpen.value = true
+}
+
+function closeDialog() {
+  if (busy.value) return
+  dialogOpen.value = false
+  context.value = ''
+  source.value = 'web'
+  chain.value = ''
+  error.value = ''
+}
 
 async function submit() {
   if (!props.create) return
@@ -30,232 +82,125 @@ async function submit() {
   }
   busy.value = true
   try {
-    await props.create({ context: context.value })
-    context.value = ''
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
-  } finally {
+    await props.create({ context: context.value, source: source.value, chain: chain.value })
     busy.value = false
+    closeDialog()
+  } catch (e) {
+    busy.value = false
+    error.value = e instanceof Error ? e.message : String(e)
   }
-}
-
-/** 当前站 = 第一个还没通过的节点；全部通过时返回 null（这一行显示「全部通过」）。 */
-function currentNode(r: Requirement): Node | null {
-  return r.nodes.find((n) => n.state !== 'accepted') ?? null
-}
-
-function progress(r: Requirement): string {
-  const done = r.nodes.filter((n) => n.state === 'accepted').length
-  return `${done}/${r.nodes.length} 站`
-}
-
-function sourceLabel(source: string): string {
-  const s = (source || '').trim()
-  if (s === '') return 'api'
-  return s
 }
 </script>
 
 <template>
-  <div class="reqs">
-    <form v-if="create" class="composer card" @submit.prevent="submit">
-      <label class="field">
-        <span>给 {{ projectName || projectKey }} 提一条需求</span>
-        <textarea
-          v-model="context"
-          class="textarea"
-          rows="3"
-          placeholder="写清要做什么、验收标准是什么；进链即建分支，第一站是需求评估。"
-        />
-      </label>
-      <div class="composer__foot">
-        <p v-if="error" class="inline-error">{{ error }}</p>
-        <button class="btn btn--primary" type="submit" :disabled="busy">
-          <Icon name="plus" :size="13" />
-          {{ busy ? '提交中…' : '进链' }}
-        </button>
-      </div>
-    </form>
-
-    <p v-if="state === 'loading'" class="note">正在加载需求…</p>
-
-    <div v-else-if="state === 'error'" class="note note--error">
-      <span><Icon name="alert" :size="13" /> {{ error }}</span>
-      <button class="btn btn--ghost" type="button" @click="emit('retry')">重试</button>
+  <section class="pane">
+    <div class="pane__head">
+      <h2 class="pane__title">
+        {{ projectName || projectKey }} 的需求
+        <span class="pane__hint">（{{ total }} 条）</span>
+      </h2>
+      <a-space size="small">
+        <a-button size="small" type="text" @click="emit('retry')">
+          <template #icon><IconRefresh /></template>
+          刷新
+        </a-button>
+        <a-button v-if="create" type="primary" size="small" @click="openDialog">
+          <template #icon><IconPlus /></template>
+          新建需求
+        </a-button>
+      </a-space>
     </div>
 
-    <EmptyState
-      v-else-if="requirements.length === 0"
-      title="这个项目还没有需求"
-      hint="在上面写一条需求，它会自动进链、建分支，第一站是需求评估。"
-    />
+    <div v-if="state === 'loading' && !requirements.length" class="state">
+      <a-spin :size="20" />
+      <span>正在读需求列表…</span>
+    </div>
 
-    <ul v-else class="rows">
-      <li v-for="r in requirements" :key="r.id">
-        <button class="row card" type="button" @click="emit('open', r.id)">
-          <span class="row__head">
-            <span class="row__id mono">{{ r.id }}</span>
-            <StatusBadge :state="r.state" />
-            <span class="row__time soft">{{ fmtTime(r.updatedAt) }}</span>
-          </span>
+    <div v-else-if="state === 'error'" class="state">
+      <a-alert type="error">{{ error || '读不到需求列表。' }}</a-alert>
+      <a-button size="small" @click="emit('retry')">重试</a-button>
+    </div>
 
-          <span class="row__body">{{ excerpt(r.context) }}</span>
+    <a-table
+      v-else
+      :data="requirements"
+      :columns="columns"
+      row-key="id"
+      :pagination="false"
+      :bordered="{ cell: true }"
+      size="small"
+      class="req-table"
+      @row-click="onRowClick"
+    >
+      <template #req="{ record }">
+        <div class="stack" style="gap: 2px">
+          <span class="mono strong">{{ record.id }}</span>
+          <span class="pane__hint mono">{{ record.branch }}</span>
+        </div>
+      </template>
+      <template #state="{ record }">
+        <a-tag :color="stateColor(record.state)">{{ fmtState(record.state) }}</a-tag>
+      </template>
+      <!-- 当前站只留站号 + 中文名：状态词左边「状态」列已经写过一次，这里再写一遍就是同屏重复。 -->
+      <template #cur="{ record }">
+        <div v-if="currentOf(record)" class="row" style="gap: 6px; align-items: baseline">
+          <span class="cur-n mono">{{ currentOf(record)!.index + 1 }}</span>
+          <span class="cur-name">{{ fmtNodeName(currentOf(record)!.type) }}</span>
+        </div>
+        <span v-else class="pane__hint">全部通过</span>
+      </template>
+      <template #body="{ record }">
+        <span class="ellipsis">{{ excerpt(record.context, 96) }}</span>
+      </template>
+      <template #prog="{ record }">
+        <span class="mono pane__hint">{{ doneCount(record) }}/{{ record.nodes.length }} 站</span>
+      </template>
+      <template #time="{ record }">
+        <span class="mono pane__hint">{{ fmtTime(record.updatedAt) }}</span>
+      </template>
+      <template #ops="{ record }">
+        <a-button size="mini" type="text" aria-label="打开这条需求" @click.stop="emit('open', record.id)">
+          <template #icon><IconRight /></template>
+        </a-button>
+      </template>
+      <template #empty>
+        <a-empty description="这个项目还没有需求：点右上角「新建需求」写正文，链条会从第一站开始跑。" />
+      </template>
+    </a-table>
 
-          <span class="row__foot">
-            <span class="row__station">
-              <span class="row__station-label soft">当前站</span>
-              <template v-if="currentNode(r)">
-                <span class="row__station-key mono">{{ currentNode(r)?.key }}</span>
-                <span class="row__station-type soft">{{ fmtType(currentNode(r)?.type ?? '') }}</span>
-                <StatusBadge :state="currentNode(r)?.state ?? 'pending'" />
-              </template>
-              <span v-else class="row__station-all">全部通过</span>
-            </span>
-            <span class="row__meta soft">
-              <span class="row__progress">{{ progress(r) }}</span>
-              <span class="row__source" :title="'来源通道'">来源 {{ sourceLabel(r.source) }}</span>
-              <span class="row__chain mono">{{ r.chainKey }} v{{ r.chainVersion }}</span>
-            </span>
-          </span>
-        </button>
-      </li>
-    </ul>
-  </div>
+    <a-modal
+      v-model:visible="dialogOpen"
+      title="新建需求"
+      :mask-closable="!busy"
+      :ok-loading="busy"
+      ok-text="建立需求"
+      cancel-text="取消"
+      @ok="submit"
+      @cancel="closeDialog"
+    >
+      <a-form :model="{ context, source }" layout="vertical">
+        <a-form-item label="需求正文（context）">
+          <a-textarea
+            v-model="context"
+            :auto-size="{ minRows: 5, maxRows: 10 }"
+            placeholder="写清楚要做什么、验收标准是什么。这条正文会作为整条链的输入。"
+          />
+        </a-form-item>
+        <a-form-item label="链条">
+          <a-select v-model="chain" :disabled="busy">
+            <a-option v-for="c in props.chains" :key="c.key" :value="c.key">
+              {{ c.key }} · {{ chain2Path(c) }}
+            </a-option>
+          </a-select>
+          <div class="pane__hint" style="margin-top: 4px">
+            需求按这条链一站一站往下走，登进详情就定了，之后不能换链。
+          </div>
+        </a-form-item>
+        <a-form-item label="来源">
+          <a-input v-model="source" placeholder="web" allow-clear />
+        </a-form-item>
+        <a-alert v-if="error" type="error">{{ error }}</a-alert>
+      </a-form>
+    </a-modal>
+  </section>
 </template>
-
-<style scoped>
-.reqs {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.composer {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 14px 16px;
-}
-
-.composer__foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.note {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text-muted);
-}
-
-.note--error {
-  border-color: #fecaca;
-  color: var(--danger);
-}
-
-.rows {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.row {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
-  padding: 12px 14px;
-  text-align: left;
-  cursor: pointer;
-  transition: border-color 0.12s ease;
-}
-
-.row:hover {
-  border-color: var(--chain-current-border);
-}
-
-.row__head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.row__id {
-  font-size: var(--fs-body);
-  font-weight: 700;
-}
-
-.row__time {
-  margin-left: auto;
-  font-size: var(--fs-small);
-}
-
-.row__body {
-  display: -webkit-box;
-  overflow: hidden;
-  color: var(--text);
-  font-size: var(--fs-body);
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-}
-
-.row__foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 14px;
-  font-size: var(--fs-small);
-}
-
-.row__station {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.row__station-key {
-  font-weight: 700;
-}
-
-.row__station-all {
-  color: var(--chain-done-fg);
-  font-weight: 700;
-}
-
-.row__meta {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-  margin-left: auto;
-  font-size: 11px;
-}
-
-.row__progress,
-.row__source {
-  padding: 0 6px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--bg);
-  font-weight: 600;
-}
-
-.row__chain {
-  font-weight: 600;
-}
-
-@media (max-width: 720px) {
-  .row__meta {
-    margin-left: 0;
-  }
-}
-</style>
