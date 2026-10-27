@@ -22,6 +22,7 @@ func main() {
 	timeout := flag.Duration("timeout", 10*time.Minute, "单次容器执行上限")
 	baseURL := flag.String("base-url", "", "注入容器的 BASE_URL")
 	model := flag.String("model", "", "注入容器的 model")
+	adminToken := flag.String("admin-token", "", "接入层管理口令：建 project 用它认证；不配则接入层关闭")
 	flag.Parse()
 
 	store, err := OpenStore(*driver, *dbPath)
@@ -54,7 +55,7 @@ func main() {
 		log.Fatalf("不认识的执行器：%s（只有 fake 与 docker）", *execKind)
 	}
 
-	srv := NewServer(store, exec)
+	srv := NewServer(store, exec).WithAdminToken(*adminToken)
 	mux := http.NewServeMux()
 	srv.Routes(mux)
 	log.Printf("链条平台已启动：http://%s （数据库 %s:%s，执行器 %s）", *addr, *driver, *dbPath, *execKind)

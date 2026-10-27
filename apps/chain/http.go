@@ -14,13 +14,20 @@ import (
 
 // Server 只做三件事：校验输入、调状态机、把结果落盘。它自己不下结论。
 type Server struct {
-	store Store
-	exec  Executor
-	now   func() time.Time
+	store      Store
+	exec       Executor
+	now        func() time.Time
+	adminToken string
 }
 
 func NewServer(s Store, e Executor) *Server {
 	return &Server{store: s, exec: e, now: time.Now}
+}
+
+// WithAdminToken 打开接入层的「建 project」入口；不调用它就等于接入层关闭。
+func (s *Server) WithAdminToken(token string) *Server {
+	s.adminToken = strings.TrimSpace(token)
+	return s
 }
 
 func (s *Server) Routes(mux *http.ServeMux) {
@@ -36,6 +43,12 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/reject", s.nodeReject)
 	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/comment", s.nodeComment)
 	mux.HandleFunc("POST /api/requirements/{id}/nodes/{node}/rules", s.nodeRule)
+
+	// 接入层：给平台外的人用。只认 project 口令，不认人。
+	mux.HandleFunc("POST /api/intake/projects", s.intakeCreateProject)
+	mux.HandleFunc("GET /api/intake/projects", s.intakeListProjects)
+	mux.HandleFunc("POST /api/intake/requirements", s.intakeCreateRequirement)
+	mux.HandleFunc("GET /api/intake/requirements/{id}", s.intakeGetRequirement)
 }
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
@@ -251,9 +264,17 @@ func (s *Server) nodeReject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logEvent(req, n.Key, "reject", from, req.Node(n.Key).State, reason)
+	whole := req.State == ReqRejected
+	if whole {
+		s.recordRejection(req, n.Key, reason)
+	}
 	if err := s.store.SaveRequirement(req); err != nil {
 		fail(w, 500, err.Error())
 		return
+	}
+	// 先落库再回告：回告失败不该让一条已经落定的驳回看起来没发生。
+	if whole {
+		s.deliverCallback(req, n.Key, reason)
 	}
 	writeJSON(w, 200, req)
 }

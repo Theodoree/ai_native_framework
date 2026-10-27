@@ -75,6 +75,7 @@ type Project struct {
 	Repo          string    `json:"repo"`
 	DefaultBranch string    `json:"defaultBranch"`
 	Chains        []Chain   `json:"chains"`
+	IntakeToken   string    `json:"intakeToken,omitempty"`
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
@@ -128,6 +129,14 @@ type Requirement struct {
 	Rev          int       `json:"rev"`
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
+	Reporter     *Reporter `json:"reporter,omitempty"`
+}
+
+// Reporter 是「谁提的需求、结论怎么送回去」。接入层用它回告，不参与判定。
+type Reporter struct {
+	Kind        string `json:"kind"`
+	Ref         string `json:"ref"`
+	CallbackURL string `json:"callbackURL,omitempty"`
 }
 
 // ValidateChain 校验链条声明：六类之内、不重复、头是需求评估、尾是上线。
@@ -324,6 +333,22 @@ func (r *Requirement) AddComment(key, author, body string, now time.Time) error 
 		return errors.New("评论不能为空")
 	}
 	n.Comments = append(n.Comments, Comment{ID: newID("c"), AuthorType: "human", Author: author, Body: body, At: now})
+	n.Rev++
+	r.touch(now)
+	return nil
+}
+
+// AddSystemComment 是平台自己留话（比如整条需求被拒）。
+// 作者类型与人的评论分开：读的人要能分清哪句是人说的、哪句是平台说的。
+func (r *Requirement) AddSystemComment(key, body string, now time.Time) error {
+	n := r.Node(key)
+	if n == nil {
+		return fmt.Errorf("没有这个节点：%s", key)
+	}
+	if body == "" {
+		return errors.New("平台留言不能为空")
+	}
+	n.Comments = append(n.Comments, Comment{ID: newID("c"), AuthorType: "system", Author: "平台", Body: body, At: now})
 	n.Rev++
 	r.touch(now)
 	return nil
