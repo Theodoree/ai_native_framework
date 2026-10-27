@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildIntent,
+  closedTerminalTargets,
   readGuardEvidence,
   readIssueLabels,
   resolveIssueRefs,
@@ -334,6 +335,125 @@ test("CLI：有意图时 has_intent=1，并照旧输出意图 JSON", () => {
   expect(r.status).toBe(0);
   expect(r.output).toBe("has_intent=1\n");
   expect(JSON.parse(r.stdout)).toMatchObject({ issue: 7, to: "accepted" });
+});
+
+
+// —— §九 的缺口：PR 合并时 GitHub 由 PR body 的 Fixes #N 自动关单 ——
+// 写者拦不住这条路径（也测不到它），所以意图层必须认 issues.closed：否则标签停在
+// state:in-progress，而 G1 拿标签问转换表会得到「还能带到 done」= 把已关单当在途单放行。
+// 目标不写死：问声明（closedTerminalTargets），只认由 ci 驱动、且唯一的终态后继。
+test("issues.closed + state:in-progress → 目标 done（ci），但缺守卫证据 → 判 E_GUARD_MISSING", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "closed",
+    payload: issue(["state:in-progress"]),
+    closedTargets: closedTerminalTargets(CONFIG),
+  });
+  expect(out).toMatchObject({
+    issue: 7,
+    to: "done",
+    actor_role: "ci",
+    labels: ["state:in-progress"],
+    comment: "",
+  });
+  // 关单拿不到守卫证据（守卫属于 PR 事件的 check run）：判定必须拒绝并说清缺什么，
+  // 而不是静默放过 —— 这条痕就是「关单了但状态没动，因为缺 merge-gate 证据」。
+  let error;
+  try {
+    validateIntent(loadConfig(CONFIG), out);
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error.kind).toBe("rejected");
+  expect(error.code).toBe("E_GUARD_MISSING");
+  expect(error.message).toContain("in-progress → done 需要守卫证据：merge-gate");
+});
+
+test("issues.closed + 已在终态 state:done → 无意图（终态没有再转换）", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "closed",
+    payload: issue(["state:done"]),
+    closedTargets: closedTerminalTargets(CONFIG),
+  });
+  expect(out).toBeNull();
+});
+
+test("issues.closed + 没有任何 state 标签 → 无意图（机器没管过这个 issue，不凭空造起点）", () => {
+  const out = buildIntent({
+    eventName: "issues",
+    action: "closed",
+    payload: issue([]),
+    closedTargets: closedTerminalTargets(CONFIG),
+  });
+  expect(out).toBeNull();
+});
+
+test("issues.closed + state:accepted → 无意图（accepted 的终态要 owner 裁决，不由关单自动落）", () => {
+  // accepted → rejected 是 by owner 且要评论：PR 合并顺手关单不能替 owner 裁决。
+  const out = buildIntent({
+    eventName: "issues",
+    action: "closed",
+    payload: issue(["state:accepted"]),
+    closedTargets: closedTerminalTargets(CONFIG),
+  });
+  expect(out).toBeNull();
+});
+
+test("issues.closed 上有两个 state 标签 → fail-closed 报错，不替人猜起点", () => {
+  expect(() =>
+    buildIntent({
+      eventName: "issues",
+      action: "closed",
+      payload: issue(["state:in-progress", "state:blocked"]),
+      closedTargets: closedTerminalTargets(CONFIG),
+    }),
+  ).toThrow(/关单事件上 issue 有 2 个 state 标签/);
+});
+
+test("issues.closed 从同一状态有多个 ci 终态 → 不猜，报错说明候选", () => {
+  expect(() =>
+    buildIntent({
+      eventName: "issues",
+      action: "closed",
+      payload: issue(["state:in-progress"]),
+      closedTargets: { "in-progress": ["done", "cancelled"] },
+    }),
+  ).toThrow(/关单事件从 in-progress 出发有多个 ci 终态/);
+});
+
+test("closedTerminalTargets 只收 by=ci 的终态后继：in-progress→done，通配与 owner 裁决的不算", () => {
+  const targets = closedTerminalTargets(CONFIG);
+  expect(targets["in-progress"]).toEqual(["done"]);
+  // cancelled 是通配（from: "*"）+ by owner：不属于任何具体状态，也不由关单自动落。
+  expect(Object.keys(targets)).not.toContain("*");
+  expect(Object.values(targets).flat()).not.toContain("cancelled");
+  expect(targets["accepted"]).toBeUndefined();
+  expect(targets["triage"]).toBeUndefined();
+});
+
+test("closedTerminalTargets 读不到声明时返回空映射（缺声明是 check-config 的事，不在这里造失败面）", () => {
+  expect(closedTerminalTargets(join(tmpdir(), "没有这个声明.yml"))).toEqual({});
+});
+
+test("CLI：issues.closed + state:in-progress → has_intent=1 并输出意图（端到端）", () => {
+  const r = runCli("issues", {
+    action: "closed",
+    issue: {
+      number: 85,
+      labels: [{ name: "state:in-progress" }],
+      author_association: "OWNER",
+    },
+    sender: { login: "ted" },
+  });
+  expect(r.status).toBe(0);
+  expect(r.output).toBe("has_intent=1\n");
+  expect(JSON.parse(r.stdout)).toMatchObject({
+    issue: 85,
+    to: "done",
+    actor_role: "ci",
+    labels: ["state:in-progress"],
+  });
 });
 
 // 默认流程的唯一真相源是声明，不是 CI 的 env：workflow 没传 DEFAULT_FLOW 时

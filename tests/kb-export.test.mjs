@@ -2,17 +2,16 @@ import { test, expect } from "vitest";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { deniedReason, isKbPath } from "../scripts/kb-export.mjs";
+import { engineInto } from "./helpers/engine.mjs";
 
 // 专测 kb-export 与 kb-sync 的接线：清单由脚本真跑出来，job 红绿由 YAML 的 if 与步骤正文决定。
 // 契约（六字段 / 幂等 / 排除项 / INFRA 不阻断合并）都落成可执行的断言，不靠读代码确认。
@@ -528,7 +527,10 @@ test("(f) wiring 钉在 YAML 上：只在合并后跑、真调脚本、失败走
   expect(doc.on.push.branches).toContain("main");
 
   const exportStep = byId("export");
-  expect(exportStep.run).toContain("node scripts/kb-export.mjs");
+  // 调用点是 Go 引擎（载体在 apps/engine，由 tests/engine-parity-e.test.mjs 逐字节对照），
+  // 这里钉的是 workflow 里那行字：退回 node 就等于退回 Node 侧的判据。
+  expect(exportStep.run).toContain("./.cache/bin/engine kb-export");
+  expect(exportStep.run).not.toContain("node scripts/kb-export.mjs");
   for (const flag of [
     "--repo",
     "--ref",
@@ -597,9 +599,9 @@ function runWorkflow(
   dir,
   { repository = REPO, before, after, refName = "main" },
 ) {
-  // 沙箱里要有被调用的脚本与它的依赖：YAML 写的是仓库相对路径 scripts/kb-export.mjs。
-  cpSync(join(ROOT, "scripts"), join(dir, "scripts"), { recursive: true });
-  symlinkSync(join(ROOT, "node_modules"), join(dir, "node_modules"));
+  // 沙箱里要真有被调用的东西：YAML 写的是仓库相对路径 ./.cache/bin/engine，
+  // 所以把构建好的引擎按同一相对路径复制进去 —— 缺了就该红在 127，不是静默跳过。
+  engineInto(dir);
   const ctx = {
     "github.repository": repository,
     "github.ref_name": refName,

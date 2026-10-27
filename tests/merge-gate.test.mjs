@@ -100,6 +100,9 @@ function gate({
   bodyText,
   issue = 12,
   labels = ["state:in-progress"],
+  // issue 的关闭状态：GitHub 的 issue 响应带 state（gh api repos/.../issues/N）。
+  // 缺省不写 = 输入里没有这个字段，用来钉「门不靠猜补输入」。
+  state,
   checks,
   infra = [],
   skip = [],
@@ -134,7 +137,11 @@ function gate({
     // 事件里的正文是那一刻的快照；--pr 才是现况（门牌写回后才有表）。
     "event.json": { pull_request: prView },
     "pr.json": prView,
-    "issue.json": { number: issue, labels: labels.map((name) => ({ name })) },
+    "issue.json": {
+      number: issue,
+      ...(state ? { state } : {}),
+      labels: labels.map((name) => ({ name })),
+    },
     "checks.json": { total_count: runs.length, check_runs: runs },
     "infra.json": infra,
   };
@@ -183,6 +190,36 @@ test("(a1) 只坏 G1：issue 已在终态，status=1，G2/G3/G4 仍 PASS", () =>
   expect(g.line("G1")).toContain("FAIL E_TERMINAL_STATE");
   for (const id of ["G2", "G3", "G4"]) expect(g.line(id)).toContain("PASS OK");
   expect(g.last).toBe("merge-gate FAIL 1/4 真失败=1(G1) 未就绪=0");
+});
+
+// 裁决 A：已关闭的单不能被判成在途。G1 问的是「x → done 被声明了吗」，
+// 「还能不能转」与「还该不该转」是两件事：issue 已经关闭（PR body 的 Fixes #N 会让
+// GitHub 自己关单，写者拦不到，标签于是停在 in-progress）说明前提已不成立。
+test("(a1) 只坏 G1：已关闭的单不能被判成在途（裁决 A）", () => {
+  const g = gate({ labels: ["state:in-progress"], state: "closed" });
+  expect(g.status).toBe(1);
+  expect(g.line("G1")).toContain("FAIL E_ISSUE_CLOSED_IN_FLIGHT");
+  // 失败文案要点名成因，不能只给一个 E_ 码。
+  expect(g.line("G1")).toContain("已经关闭");
+  expect(g.line("G1")).toContain("in-progress");
+  for (const id of ["G2", "G3", "G4"]) expect(g.line(id)).toContain("PASS OK");
+  expect(g.last).toBe("merge-gate FAIL 1/4 真失败=1(G1) 未就绪=0");
+});
+
+// 反向用例：守卫不能写成恒拒 —— 未关闭的单 + in-progress 仍然 PASS。
+test("(a1) 未关闭的单 + in-progress 仍然 PASS（新守卫不是恒拒）", () => {
+  const g = gate({ labels: ["state:in-progress"], state: "open" });
+  expect(g.status).toBe(0);
+  expect(g.line("G1")).toContain("PASS OK");
+  expect(g.line("G1")).toContain("in-progress → done");
+  expect(g.last).toBe("merge-gate PASS 4/4");
+});
+
+// 输入里没有 state 时不当成已关闭：门不靠猜补输入。
+test("(a1) 输入缺 state 时按未关闭判，不看标签就拒", () => {
+  const g = gate({ labels: ["state:in-progress"] });
+  expect(g.status).toBe(0);
+  expect(g.line("G1")).toContain("PASS OK");
 });
 
 test("(a1) 只坏 G1：accepted 没有到 done 的转换（规则来自状态机声明，不是 gate 里另写的）", () => {
