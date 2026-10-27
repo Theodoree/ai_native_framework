@@ -132,3 +132,51 @@ func TestLoadTemplatesMergesIntoDefaults(t *testing.T) {
 		t.Fatalf("新增模板没读进来：%+v", tmpls["mine"])
 	}
 }
+
+// 容器把自己的环境打出来是很常见的事（echo、报错栈、--verbose）。
+// 密钥一旦走到 stdout，抹参数那一层就管不住了。
+func TestDockerExecutorRedactsSecretInContainerOutput(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "docker")
+	body := strings.Join([]string{
+		"#!/bin/sh",
+		`printf '%s\n' "$@"`,
+	}, nl)
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d := DockerExecutor{Templates: defaultTemplateRegistry(), Docker: script, Timeout: time.Minute}
+	secret := "sk-printed-by-container"
+	t.Setenv("CHAIN_MODEL_KEY", secret)
+	r, n := dockerFixture()
+	a, c, _ := d.Run(r, n, time.Now())
+
+	if strings.Contains(a.Log, secret) {
+		t.Fatalf("容器把密钥打到 stdout，日志里还留着：%s", a.Log)
+	}
+	if strings.Contains(c.Body, secret) {
+		t.Fatalf("容器把密钥打到 stdout，评论里还留着：%s", c.Body)
+	}
+	if !strings.Contains(a.Log, "***") {
+		t.Fatalf("日志里应当能看到被抹过的痕迹 ***，实际 %q", a.Log)
+	}
+}
+
+// 分隔符要是真的换行。写成双反斜杠的 \n 会把转义原样贴进日志与评论，
+// 页面上一整段挤成一行还带着反斜杠。
+func TestDockerExecutorLogUsesRealNewlines(t *testing.T) {
+	script, _ := fakeDocker(t, 0)
+	d := DockerExecutor{Templates: defaultTemplateRegistry(), Docker: script, Timeout: time.Minute}
+	r, n := dockerFixture()
+	a, c, _ := d.Run(r, n, time.Now())
+
+	if !strings.Contains(a.Log, nl+"---"+nl) {
+		t.Fatalf("日志里应当是真实换行分隔，实际 %q", a.Log)
+	}
+	if strings.Contains(a.Log, "\\n") {
+		t.Fatalf("日志里出现了字面量反斜杠 n：%q", a.Log)
+	}
+	if strings.Contains(c.Body, "\\n") {
+		t.Fatalf("评论里出现了字面量反斜杠 n：%q", c.Body)
+	}
+}
