@@ -643,3 +643,11 @@ PR #95 的 `check` 红在一条只有 CI 能看见的差异上：
 - 六处调用点前后逐条对照，退出码语义与 Node 版一致（实测：review 无 key → 3；review 缺参数 → 2；slot 身份不符 → 0 并写 INFRA；slot 缺参数 → 1；两槽 pass → findings 0 且结论 success），所以 workflow 里 `|| code=$?` 的分流不用改。
 - 我自己跑两组变异：把一处调用退回 `node scripts/audit-slot.mjs` → 1 红；往 workflow 的 job env 加 `AUDIT_COLLECT_POLL_INTERVAL_MS` → 2 红（第一次做这组探针时锚点没命中、脚本静默失败，看到的是「全绿」——又一次「探针自己坏了」）。
 - **仍未关**：`audit-review.mjs` / `audit-slot.mjs` / `routing.mjs` / `build-intent.mjs` / `last-change.mjs` / `merge-gate.mjs` / `state-validate.mjs` / `audit-findings.mjs` 八个脚本仍在，卡在 `tests/goldens/parity-cases.mjs` 冻结夹具与两处 workflow 上；usage 文案里仍写 `node scripts/*.mjs`（改它要重冻 40 条不可重冻 golden，留到下一次 golden 口径变更一并做）。
+
+### 17.5 第三类只在 CI 红：用例读了环境
+
+`TestKbExportUsageErrors` 的「缺 source_repo」用例在本地一直绿、在 CI 红成「退出码 = 3，期望 2」：它要验的是「没给 `--repo` 也不在环境里 → 用法错」，而 CI 里 `GITHUB_REPOSITORY` 一定被设过，于是代码拿它当 repo、一路走到 git 解析失败、落成 INFRA（3）。本地没有这个变量，所以永远是 2。
+
+修法是 unset 而不是置空（`LookupEnv` 认「设了空串」为设了），helper 见 `apps/engine/kbexport_test.go` 的 `kbClearEnv`。复现命令：`GITHUB_REPOSITORY=o/n go test -run TestKbExportUsageErrors ./...` —— **用例读环境变量时，本地绿不构成证据**；验证要在带 CI 变量的环境里跑一遍（`CI=true GITHUB_ACTIONS=true GITHUB_REPOSITORY=… GITHUB_SHA=… go test ./...`）。
+
+这是同一条病根的第三次出现：判据的输入如果来自「跑它的那台机器」——时钟（17.1）、工作区里的运行时文件（17.1）、进程环境（本节）——它就不是判据，是概率。

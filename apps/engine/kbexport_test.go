@@ -511,8 +511,27 @@ func TestKbExportRetryReReadsFailedPaths(t *testing.T) {
 
 // ---- 用法错误 ----
 
+// kbClearEnv 只在本测试里把环境变量真正删掉。
+// 「缺 source_repo」这类判据读的是 GITHUB_REPOSITORY：CI 上它一定被设过，
+// 用置空的办法躲不掉（LookupEnv 认「设了空串」为设了），只能 unset。
+func kbClearEnv(t *testing.T, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		previous, had := os.LookupEnv(name)
+		os.Unsetenv(name)
+		t.Cleanup(func() {
+			if had {
+				os.Setenv(name, previous)
+			} else {
+				os.Unsetenv(name)
+			}
+		})
+	}
+}
+
 func TestKbExportUsageErrors(t *testing.T) {
 	repo := kbNewRepo(t)
+	kbClearEnv(t, "GITHUB_REPOSITORY")
 
 	rangeCode, _, rangeStderr := repo.run(t, "--repo", "o/n", "--range", "no-dots")
 	kbWantCode(t, rangeCode, 2)
