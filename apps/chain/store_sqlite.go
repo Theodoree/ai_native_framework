@@ -2,10 +2,12 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -32,6 +34,7 @@ CREATE TABLE IF NOT EXISTS projects (
   repo           TEXT NOT NULL,
   default_branch TEXT NOT NULL,
   chains         TEXT NOT NULL,
+  intake_token   TEXT NOT NULL DEFAULT '',
   created_at     TEXT NOT NULL
 );
 
@@ -43,6 +46,7 @@ CREATE TABLE IF NOT EXISTS requirements (
   context       TEXT NOT NULL,
   images        TEXT NOT NULL,
   source        TEXT NOT NULL,
+  reporter      TEXT NOT NULL DEFAULT '',
   branch        TEXT NOT NULL,
   state         TEXT NOT NULL,
   rev           INTEGER NOT NULL,
@@ -119,7 +123,25 @@ func openSQLite(path string) (*sqliteStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("建表失败：%w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &sqliteStore{db: db}, nil
+}
+
+// migrate 给已经存在的库补列。CREATE TABLE IF NOT EXISTS 不会改动老表，
+// 所以新列必须在这里补；「列已存在」不是错误，其余错误照报。
+func migrate(db *sql.DB) error {
+	for _, stmt := range []string{
+		`ALTER TABLE projects ADD COLUMN intake_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requirements ADD COLUMN reporter TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("补列失败：%w", err)
+		}
+	}
+	return nil
 }
 
 func (s *sqliteStore) Close() error { return s.db.Close() }
@@ -130,12 +152,12 @@ func (s *sqliteStore) SaveProject(p *Project) error {
 		return err
 	}
 	_, err = s.db.Exec(`
-INSERT INTO projects (key, name, repo, default_branch, chains, created_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO projects (key, name, repo, default_branch, chains, intake_token, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET
   name = excluded.name, repo = excluded.repo, default_branch = excluded.default_branch,
-  chains = excluded.chains, created_at = excluded.created_at`,
-		p.Key, p.Name, p.Repo, p.DefaultBranch, chains, formatTime(p.CreatedAt))
+  chains = excluded.chains, intake_token = excluded.intake_token, created_at = excluded.created_at`,
+		p.Key, p.Name, p.Repo, p.DefaultBranch, chains, p.IntakeToken, formatTime(p.CreatedAt))
 	return err
 }
 
@@ -143,8 +165,8 @@ func (s *sqliteStore) Project(key string) (*Project, error) {
 	p := &Project{}
 	var chains, created string
 	err := s.db.QueryRow(`
-SELECT key, name, repo, default_branch, chains, created_at FROM projects WHERE key = ?`, key).
-		Scan(&p.Key, &p.Name, &p.Repo, &p.DefaultBranch, &chains, &created)
+SELECT key, name, repo, default_branch, chains, intake_token, created_at FROM projects WHERE key = ?`, key).
+		Scan(&p.Key, &p.Name, &p.Repo, &p.DefaultBranch, &chains, &p.IntakeToken, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("没有这个 project：%s", key)
 	}
@@ -202,14 +224,23 @@ func (s *sqliteStore) SaveRequirement(r *Requirement) error {
 	if err != nil {
 		return err
 	}
+	reporter := ""
+	if r.Reporter != nil {
+		b, err := json.Marshal(r.Reporter)
+		if err != nil {
+			return err
+		}
+		reporter = string(b)
+	}
 	if _, err := tx.Exec(`
-INSERT INTO requirements (id, project_key, chain_key, chain_version, context, images, source, branch, state, rev, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO requirements (id, project_key, chain_key, chain_version, context, images, source, reporter, branch, state, rev, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   project_key = excluded.project_key, chain_key = excluded.chain_key, chain_version = excluded.chain_version,
-  context = excluded.context, images = excluded.images, source = excluded.source, branch = excluded.branch,
-  state = excluded.state, rev = excluded.rev, created_at = excluded.created_at, updated_at = excluded.updated_at`,
-		r.ID, r.ProjectKey, r.ChainKey, r.ChainVersion, r.Context, images, r.Source, r.Branch,
+  context = excluded.context, images = excluded.images, source = excluded.source, reporter = excluded.reporter,
+  branch = excluded.branch, state = excluded.state, rev = excluded.rev,
+  created_at = excluded.created_at, updated_at = excluded.updated_at`,
+		r.ID, r.ProjectKey, r.ChainKey, r.ChainVersion, r.Context, images, r.Source, reporter, r.Branch,
 		r.State, r.Rev, formatTime(r.CreatedAt), formatTime(r.UpdatedAt)); err != nil {
 		return err
 	}
@@ -262,11 +293,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 
 func (s *sqliteStore) Requirement(id string) (*Requirement, error) {
 	r := &Requirement{}
-	var images, created, updated string
+	var images, reporter, created, updated string
 	err := s.db.QueryRow(`
-SELECT id, project_key, chain_key, chain_version, context, images, source, branch, state, rev, created_at, updated_at
+SELECT id, project_key, chain_key, chain_version, context, images, source, reporter, branch, state, rev, created_at, updated_at
 FROM requirements WHERE id = ?`, id).
-		Scan(&r.ID, &r.ProjectKey, &r.ChainKey, &r.ChainVersion, &r.Context, &images, &r.Source, &r.Branch,
+		Scan(&r.ID, &r.ProjectKey, &r.ChainKey, &r.ChainVersion, &r.Context, &images, &r.Source, &reporter, &r.Branch,
 			&r.State, &r.Rev, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("没有这条需求：%s", id)
@@ -281,6 +312,13 @@ FROM requirements WHERE id = ?`, id).
 	}
 	if r.Images == nil {
 		r.Images = []string{}
+	}
+	if reporter != "" {
+		var rep Reporter
+		if err := json.Unmarshal([]byte(reporter), &rep); err != nil {
+			return nil, fmt.Errorf("需求 %s 的提需求人记录坏了：%w", id, err)
+		}
+		r.Reporter = &rep
 	}
 	nodes, err := s.loadNodes(id)
 	if err != nil {

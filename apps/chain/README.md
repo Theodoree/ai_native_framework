@@ -15,7 +15,8 @@
 ## 它不做什么
 
 - 不代做合并：`merge` 是人按「通过」来认定完成。
-- 不做鉴权、不做多租户、不做并发控制（单机单写者）。
+- 不做人员鉴权、不做多租户、不做并发控制（单机单写者）：接入层只认 project 级的访问口令，不认是谁在用。
+- 不保证回告必达：回告失败只记事件，结论靠拉模式自己取。
 - 不读 GitHub：仓库只是 project 上的一个字符串字段，平台不调用任何仓库 API。
 - 不在容器里替人改仓库：容器只产出日志、产物与评论。
 
@@ -23,10 +24,10 @@
 
 | 实体 | 关键字段 |
 | --- | --- |
-| Project | key、name、repo、defaultBranch、chains |
+| Project | key、name、repo、defaultBranch、chains、intakeToken（只在建 project 时交出去一次） |
 | Chain | key、type、version、nodes[]（key、type、review） |
 | Node | key、type、review、index、state、attempts[]、comments[]、rules[]、artifacts[]、rev |
-| Requirement | id、projectKey、chainKey、chainVersion、context、images、source、branch、state、nodes[]、rev |
+| Requirement | id、projectKey、chainKey、chainVersion、context、images、source、branch、state、nodes[]、rev、reporter（谁提的、回告地址） |
 
 存储是接口 `Store`（`store.go`），默认实现是 SQLite（`store_sqlite.go`，纯 Go 驱动 modernc.org/sqlite，免 cgo）。默认库文件 `data/chain.db`（已 gitignore）。换 MySQL 只需要再写一个 `Store` 实现：调用方一行不改。
 
@@ -63,6 +64,22 @@
 
 请求体用 `DisallowUnknownFields` + 1MiB 上限解码；未知字段返回 400。
 
+## 接入层
+
+给平台外面的人（脚本、另一个系统）用的四个接口。它们只做「认身份 / 塞需求 / 拿回结果」，判定仍归状态机：
+
+| 方法 | 路径 | 认证 | 用途 |
+| --- | --- | --- | --- |
+| POST | `/api/intake/projects` | 管理口令 `-admin-token` | 建 project，**唯一一次**返回它的访问口令 `pk_…` |
+| GET | `/api/intake/projects` | 访问口令 | 这个 project 的名字与链条（选链条用） |
+| POST | `/api/intake/requirements` | 访问口令 | 收需求（context、images、chain、reporter） |
+| GET | `/api/intake/requirements/{id}` | 访问口令 | 拉模式：到哪一步了、成没成、为什么 |
+
+- 认证走 `Authorization: Bearer <token>`；口令比较是常数时间，且不落日志。
+- 服务不配 `-admin-token` 时「建 project」直接 503：接入层默认是关的。
+- 整条需求被拒（首站被拒）时，除了库里留一条平台留言，还会尽力 POST 一次到 `reporter.callbackURL`（5 秒超时），结果记成一条 `notify` 事件。**回告失败不改状态**——送不到是网络的事，不是判定的事。
+- 没有 callback 也能拿到结论：拉模式就是兜底。
+
 ## 怎么跑
 
 前端产物已经入库（`webui/dist`），因为 `//go:embed` 要它：
@@ -72,6 +89,8 @@ cd apps/chain
 export GOCACHE=$PWD/.cache/go-build GOPATH=$PWD/.cache/go
 go test ./...
 go run . -addr 127.0.0.1:8099 -exec fake     # 打开 http://127.0.0.1:8099
+# 要对外开放接入层（建 project 用的管理口令）：
+# go run . -addr 127.0.0.1:8099 -exec fake -admin-token "$(openssl rand -hex 16)"
 ```
 
 要接真容器（需要本机 docker daemon）：
@@ -93,3 +112,5 @@ cd ../web && npm run build      # 输出到 ../chain/webui/dist
 2. 事件流是给人看的记录，不参与任何判定。
 3. 没有乐观锁：同一需求的两次并发写会互相覆盖（`rev` 字段已留，但还没有使用）。
 4. 容器里跑什么都没验证：平台只保证注入与留痕，不保证镜像真的能干那件事。
+5. 回告只发一次、没有重试队列，也没有签名：对方不能靠签名验真伪，只能靠拉模式对账。
+6. 访问口令不能轮换也不能吊销：要换只能改库或重建 project。

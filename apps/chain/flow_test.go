@@ -132,9 +132,18 @@ func TestFlowRejectAtFirstNodeRejectsRequirement(t *testing.T) {
 	if got.State != ReqRejected {
 		t.Fatalf("首站被拒应拒掉整条需求，实际 %s", got.State)
 	}
+	var human *Comment
+	for i := range got.Node("assess").Comments {
+		if c := got.Node("assess").Comments[i]; c.AuthorType == "human" {
+			human = &c
+		}
+	}
+	if human == nil || human.Verdict != "reject" || human.Body != "这不是需求" {
+		t.Fatalf("拒绝理由应落成人的 reject 评论，实际 %+v", human)
+	}
 	last := got.Node("assess").Comments[len(got.Node("assess").Comments)-1]
-	if last.Verdict != "reject" || last.Body != "这不是需求" {
-		t.Fatalf("拒绝理由应落成 reject 评论，实际 %+v", last)
+	if last.AuthorType != "system" {
+		t.Fatalf("整条需求被拒应留一条平台留言在最后，实际 %+v", last)
 	}
 }
 
