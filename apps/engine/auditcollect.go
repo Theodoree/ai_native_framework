@@ -547,7 +547,7 @@ func RunAuditCollect(argv []string, stdout, stderr io.Writer) (code int) {
 				"第 4 步 轮询超时（"+strconv.Itoa(opts.timeout)+" 秒）：没有等到 sha="+*state.sha+" 上本次发起的 run 结束",
 				detailOf(candidateDetail))
 		}
-		time.Sleep(CollectPollIntervalMs * time.Millisecond)
+		time.Sleep(collectPollInterval())
 	}
 	selectedCreated, _ := collectStringField(selected, "createdAt")
 	selectedStatus, _ := collectStringField(selected, "status")
@@ -638,6 +638,18 @@ func RunAuditCollect(argv []string, stdout, stderr io.Writer) (code int) {
 	}
 	return emit(code, "audit-collect "+prLabel+" sha="+*state.sha+" conclusion="+conclusionText+
 		" exit="+strconv.Itoa(code)+"（"+note+"）")
+}
+
+// collectPollInterval 是轮询间隔。默认走 CollectPollIntervalMs；AUDIT_COLLECT_POLL_INTERVAL_MS
+// 是给测试用的注入点——JS 侧把 intervalMs 当依赖注入，Go 侧只能从进程边界注入，
+// 否则每条「还在跑 / 轮询超时」的用例都要真等 10 秒。生产环境不设这个变量，行为与常量一致。
+func collectPollInterval() time.Duration {
+	if raw := os.Getenv("AUDIT_COLLECT_POLL_INTERVAL_MS"); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+			return time.Duration(value) * time.Millisecond
+		}
+	}
+	return CollectPollIntervalMs * time.Millisecond
 }
 
 type collectState struct {

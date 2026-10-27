@@ -1,23 +1,24 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { deniedReason, isKbPath } from "../scripts/kb-export.mjs";
 
-// 「汇什么」在仓库里只有一个家：导出器的 ALLOWED/DENY_* 是真源，Go 侧有两份实现 ——
-// api-go 的 kb.go（HTTP 侧的汇入索引）与 engine 的 kbexport.go（CI 侧算清单）。
-// 这个测试读三份源码逐字比对，任何一处改了而别处没跟，立刻红 —— 没有 Go 进程、不联网。
+// 「汇什么」在仓库里有两份实现：api-go 的 kb.go（HTTP 侧的汇入索引）与 engine 的
+// kbexport.go（CI 侧算清单）。这个测试读这两份源码逐字比对，任何一处改了而别处没跟，
+// 立刻红 —— 没有 Go 进程、不联网，不依赖任何 executable。
+//
+// 第三份真源 scripts/kb-export.mjs（JS 导出器）已在 E2 第四批随判据一起搬进
+// apps/engine/kbexport.go 并删除，因此原先的 JS ↔ Go 两组比对、以及判定表里拿 JS 实现
+// 当答案的那一路一并下线；判定表的期望值改为直接钉在表里。「拒绝原因怎么算」的行为判据
+// 现在钉在 apps/engine/kbexport_test.go 的 TestKbExportDeniesSecretsAndBuildDirs
+// （deny 目录 / deny 名字 / deny 先于 allow / denied 文案）。
 //
 // 归一（只此几条，其余一律算漂移）：
-//   - Go 的 (?i) 行内标志 → JS 的 i 标志（既有做法）；
+//   - Go 的 (?i) 行内标志剥成 flags 再比（两份 Go 实现写字方式不同）；
 //   - 捕获组 (…) 与非捕获组 (?:…) 视为同一个规则：两个 Go 侧风格不同，
-//     对 .test()/MatchString 的结论没有差别；
-//   - Go 的 \. 与 JS 的 \. —— 源码里都是两个字符，剥掉转义后按正则原文比。
-// 不算差异的：清单顺序（三者顺序各不相同，比的是集合）、注释、变量名。
+//     对 MatchString 的结论没有差别；
+//   - 源码里的 \/ 与 / 归一（都是两个字符，剥掉转义后按正则原文比）。
+// 不算差异的：清单顺序（两者顺序各不相同，比的是集合）、注释、变量名。
 const KB_GO = readFileSync(fileURLToPath(new URL("../apps/api-go/kb.go", import.meta.url)), "utf8");
-const KB_EXPORT = readFileSync(
-  fileURLToPath(new URL("../scripts/kb-export.mjs", import.meta.url)),
-  "utf8",
-);
 const ENGINE_GO = readFileSync(
   fileURLToPath(new URL("../apps/engine/kbexport.go", import.meta.url)),
   "utf8",
@@ -35,12 +36,6 @@ const ENGINE_ANCHORS = {
   allow: ["var kbAllowed = []*regexp.Regexp{", "// kbDenyDirs"],
   denyDirs: ["var kbDenyDirs = map[string]bool{", "// kbDenyNames"],
   denyNames: ["var kbDenyNames = []*regexp.Regexp{", "var kbShaPattern"],
-};
-
-const JS_ANCHORS = {
-  allow: ["const ALLOWED = [", "const DENY_DIRS"],
-  denyDirs: ["const DENY_DIRS = new Set([", "const DENY_NAMES"],
-  denyNames: ["const DENY_NAMES = [", "export function deniedReason"],
 };
 
 function region(text, label, [startAnchor, endAnchor]) {
@@ -101,56 +96,8 @@ function goDenyDirs() {
 function engineDenyDirs() {
   return goDenyDirsIn(ENGINE_GO, "apps/engine/kbexport.go", ENGINE_ANCHORS.denyDirs);
 }
-// 从 JS 源码里扫出正则字面量（/…/flags）：`\` 是转义、[…] 里的 / 不需要转义。
-// 只认「整行就是一个字面量」的行 —— 两份清单都是一行一条；注释行含 / 但不是规则。
-function jsRegexLiterals(anchorPair) {
-  const body = region(KB_EXPORT, "scripts/kb-export.mjs", anchorPair);
-  const literals = [];
-  for (const rawLine of body.split("\n")) {
-    const line = rawLine.trim();
-    if (!line.startsWith("/") || line.startsWith("//") || line.startsWith("/*")) continue;
-    let cursor = 1;
-    let inClass = false;
-    let closed = false;
-    while (cursor < line.length) {
-      const char = line[cursor];
-      if (char === "\\") {
-        cursor += 2;
-        continue;
-      }
-      if (char === "[") {
-        inClass = true;
-      } else if (char === "]") {
-        inClass = false;
-      } else if (char === "/" && !inClass) {
-        closed = true;
-        break;
-      }
-      cursor += 1;
-    }
-    if (!closed) {
-      throw new Error(`导出器的这一行不是完整的正则字面量：${line}`);
-    }
-    let flagsEnd = cursor + 1;
-    while (flagsEnd < line.length && /[a-z]/.test(line[flagsEnd])) flagsEnd += 1;
-    literals.push({ source: line.slice(1, cursor), flags: line.slice(cursor + 1, flagsEnd) });
-  }
-  if (literals.length === 0) {
-    throw new Error(`导出器的区间里没有正则字面量：${anchorPair.join(" → ")}`);
-  }
-  return literals;
-}
 
-function jsDenyDirs() {
-  const body = region(KB_EXPORT, "scripts/kb-export.mjs", JS_ANCHORS.denyDirs);
-  const found = [...body.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
-  if (found.length === 0) {
-    throw new Error(`导出器的 DENY_DIRS 区间里没有目录名：${JS_ANCHORS.denyDirs.join(" → ")}`);
-  }
-  return found;
-}
-
-// Go 的 (?i) 等行内标志要与 JS 的 i 标志对上：抽成 flags，再从源码里剥掉。
+// Go 的 (?i) 等行内标志抽成 flags 再从源码里剥掉：两份实现的写法不同，规则必须一样。
 function normalizeGo(literal) {
   const flags = new Set();
   let source = literal;
@@ -158,16 +105,10 @@ function normalizeGo(literal) {
     for (const flag of match[1]) flags.add(flag);
     source = source.split(match[0]).join("");
   }
-  // 捕获组 (…) 与非捕获组 (?:…) 对 test/MatchString 的结论没有差别：
+  // 捕获组 (…) 与非捕获组 (?:…) 对 MatchString 的结论没有差别：
   // kb.go 写 (?:…) 而 kbexport.go 写 (…)，归一到同一条规则再比。
   source = source.split("(" + "?" + ":").join("(");
   return { source: source.split("\\/").join("/"), flags: [...flags].sort().join("") };
-}
-
-function normalizeJs(literal) {
-  // 与 normalizeGo 同一套归一：捕获组 (…) 与非捕获组 (?:…) 视为同一条规则。
-  const source = literal.source.split("(" + "?" + ":").join("(");
-  return { source: source.split("\\/").join("/"), flags: [...literal.flags].sort().join("") };
 }
 
 const canonical = (literal) => `/${literal.source}/${literal.flags}`;
@@ -218,49 +159,19 @@ function engineAccepts(target) {
   return asRegexes(engineAllowRules()).some((re) => re.test(target));
 }
 
-describe("知识库白名单：三处同口径（+ apps/engine/kbexport.go）", () => {
-  it("引擎的 kbAllowed 与 ALLOWED 是同一个正则集合", () => {
-    const fromEngine = new Set(engineAllowRules().map((literal) => canonical(normalizeGo(literal))));
-    const fromJs = new Set(jsRegexLiterals(JS_ANCHORS.allow).map((literal) => canonical(normalizeJs(literal))));
-    expect([...fromEngine].sort()).toEqual([...fromJs].sort());
-  });
-
-  it("引擎的 kbDenyNames 与 DENY_NAMES 是同一个正则集合", () => {
-    const fromEngine = new Set(engineDenyNameRules().map((literal) => canonical(normalizeGo(literal))));
-    const fromJs = new Set(
-      jsRegexLiterals(JS_ANCHORS.denyNames).map((literal) => canonical(normalizeJs(literal))),
-    );
-    expect([...fromEngine].sort()).toEqual([...fromJs].sort());
-  });
-
-  it("引擎的 kbDenyDirs 与 DENY_DIRS 是同一个目录集合", () => {
-    expect([...new Set(engineDenyDirs())].sort()).toEqual([...new Set(jsDenyDirs())].sort());
-  });
-
-  it("引擎与 kb.go 各自抽出来的三张表逐条一致", () => {
+describe("知识库白名单：两处同口径（apps/api-go/kb.go ↔ apps/engine/kbexport.go）", () => {
+  it("两边的白名单正则是同一个集合", () => {
     const asSet = (literals) => [...new Set(literals.map((literal) => canonical(normalizeGo(literal))))].sort();
     expect(asSet(engineAllowRules())).toEqual(asSet(goAllowRules()));
+  });
+
+  it("两边的 DENY_NAMES 正则是同一个集合", () => {
+    const asSet = (literals) => [...new Set(literals.map((literal) => canonical(normalizeGo(literal))))].sort();
     expect(asSet(engineDenyNameRules())).toEqual(asSet(goDenyNameRules()));
+  });
+
+  it("两边的 DENY 目录是同一个目录集合", () => {
     expect([...new Set(engineDenyDirs())].sort()).toEqual([...new Set(goDenyDirs())].sort());
-  });
-});
-describe("知识库白名单：两处同口径（apps/api-go/kb.go ↔ scripts/kb-export.mjs）", () => {
-  it("kbAllowRules 与 ALLOWED 是同一个正则集合", () => {
-    const fromGo = new Set(goAllowRules().map((literal) => canonical(normalizeGo(literal))));
-    const fromJs = new Set(jsRegexLiterals(JS_ANCHORS.allow).map((literal) => canonical(normalizeJs(literal))));
-    expect([...fromGo].sort()).toEqual([...fromJs].sort());
-  });
-
-  it("kbDenyNames 与 DENY_NAMES 是同一个正则集合", () => {
-    const fromGo = new Set(goDenyNameRules().map((literal) => canonical(normalizeGo(literal))));
-    const fromJs = new Set(
-      jsRegexLiterals(JS_ANCHORS.denyNames).map((literal) => canonical(normalizeJs(literal))),
-    );
-    expect([...fromGo].sort()).toEqual([...fromJs].sort());
-  });
-
-  it("kbDenyDirs 与 DENY_DIRS 是同一个目录集合", () => {
-    expect([...new Set(goDenyDirs())].sort()).toEqual([...new Set(jsDenyDirs())].sort());
   });
 });
 
@@ -291,9 +202,7 @@ describe("知识库白名单：判定表两边结论一致", () => {
   ];
 
   it.each(TABLE)("%s → 放行=%s", (target, expected) => {
-    const exportersAnswer = deniedReason(target) === null && isKbPath(target);
-    expect(goAccepts(target)).toBe(exportersAnswer);
-    expect(engineAccepts(target)).toBe(exportersAnswer);
-    expect(exportersAnswer).toBe(expected);
+    expect(goAccepts(target)).toBe(expected);
+    expect(engineAccepts(target)).toBe(expected);
   });
 });

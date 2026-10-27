@@ -606,3 +606,48 @@ PR #95 的 `check` 红在一条只有 CI 能看见的差异上：
 ### 16.6 记一笔操作噪声
 
 我曾误发起一个 brief 为 `noop` 的子代理（什么都没做就结束）。它无副作用，但它说明「派单前先读一遍自己写的 prompt」这件事对调度方同样成立。
+
+## 十七、E2 第三批之后：判据批量搬进 Go（t15–t21 一次收口）
+
+前两批（writer-record、last-change）是「一个模块一条线」手工做的；从第三批起改由 AgentTeams 的成员并行推进，规则不变，只是每批要连带处理两类反例：**概率红**（判据的输入不可复现）与**逃逸断言**（断言被另一个分支的文案满足）。
+
+| 批次 | 搬进 Go 的判据 | Node 套件 | 载体（Node 脚本） | 计数 |
+| --- | --- | --- | --- | --- |
+| 第三批 | ledger / ledger-cli / copy-dist | 0（原本无人钉） | 删 3 个 | 774 |
+| 第四批 | routing / build-intent / cli / kb-export | routing 与 build-intent 套件删，cli 与 kb-export 套件删 | 删 `cli.mjs` / `kb-export.mjs`；`routing.mjs` / `build-intent.mjs` 暂留（仍被 `audit-review.mjs`、`last-change.mjs`、`merge-gate.mjs` import） | 665 |
+| t15 | state-validate 与 auto-flow | 删 `state-machine.test.mjs`(15) + `auto-flow.test.mjs`(10) → `validator_test.go`(25) | `state-validate.mjs` 暂留（`merge-gate.mjs` 与 `freeze.mjs` 的 @consult-probe 录制器） | 640 |
+| t16 / t19 | merge-gate 36 条 → `mergegate_cli_test.go`(35)，wiring 3 条另立 `tests/merge-gate-wiring.test.mjs` | 删 `merge-gate.test.mjs`(39) | `merge-gate.mjs` 暂留（workflow 仍在跑它，且它是门牌渲染器的最后消费者） | 604 |
+| t18 / t20 | guards 15 条 → `guards_validator_test.go` | `guards.test.mjs` 320 → 73 行（留 2 条 Node 独占判据） | — | 589 |
+| t17 | audit-collect / audit-review / audit-slot 51 条 | 删三个套件 | 删 `audit-collect.mjs` | 526 |
+| t21 | —（切换批次） | 8 条扫描面用例泛化成按子命令的契约表，0 条删除 | `audit.yml` 六处调用切 `./.cache/bin/engine audit-review|audit-slot` | 527 |
+
+### 17.1 两类假红（判据的输入不可复现）
+
+1. **sha 随墙钟变**：`TestMergeGateIgnoresUndeclaredFlags` 比两次独立运行的完整 stdout，而夹具每次新建 git 仓库、commit 时间精确到秒 → sha 不同 → 概率红（`-count=10` 抓出 4 次）。修法是把夹具钉成确定的（`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` 冻结 + `TestMergeGateFixtureIsDeterministic`），不是把 sha 归一化掉——归一化是降级断言，缺陷在夹具不在判据。
+2. **扫描面扫进不受版本控制的文件**："仓库源码里没有 skipGuards" 用 `walk(ROOT)` 实现，把 `.gitignore` 忽略的 `.agent-teams/`（运行时写、内容随任务描述变）也扫进来。修法是把扫描面换成 `git ls-files --cached --others --exclude-standard`，让排除规则回到 `.gitignore` 这唯一一处，而不是加一张手写目录黑名单（那张名单永远漏下一个）。
+
+假红比真红更坏：它训练人把红当噪声，而噪声一旦合理，真红就没人看。
+
+### 17.2 一类逃逸断言（断言被另一个分支满足）
+
+`audit-review` 的 request_id 守卫被短路后，记录里确实没有 `evidence.request_id`（断言真），下游确实判 INFRA（断言真），退出码确实 3（断言真）——但那条 INFRA 的理由是 schema 校验写的，理由文本里**也**含 `request_id`。四条断言全被另一个分支满足，判据绿而守卫已死。修法是把断言钉在守卫自己那句话的前缀上（`HasPrefix("上游没有回 request_id")`）。
+
+教训：断言里出现某个「标识串」时，要问一句**除了我以为的那个分支，还有谁会输出它**。
+
+### 17.3 测试接缝会变成生产参数
+
+`audit-collect` 的 10 秒轮询原本是注入依赖，Go 侧只能从进程边界注入，于是引入 `AUDIT_COLLECT_POLL_INTERVAL_MS`。接受它时同时加了一条静态判据：**该变量出现在任何 workflow 里即违规**——接缝一旦能在 CI 里被设上，它就从接缝变成别人能改门行为的旋钮。
+
+### 17.4 t21 切换批次的验收
+
+- 六处调用点前后逐条对照，退出码语义与 Node 版一致（实测：review 无 key → 3；review 缺参数 → 2；slot 身份不符 → 0 并写 INFRA；slot 缺参数 → 1；两槽 pass → findings 0 且结论 success），所以 workflow 里 `|| code=$?` 的分流不用改。
+- 我自己跑两组变异：把一处调用退回 `node scripts/audit-slot.mjs` → 1 红；往 workflow 的 job env 加 `AUDIT_COLLECT_POLL_INTERVAL_MS` → 2 红（第一次做这组探针时锚点没命中、脚本静默失败，看到的是「全绿」——又一次「探针自己坏了」）。
+- **仍未关**：`audit-review.mjs` / `audit-slot.mjs` / `routing.mjs` / `build-intent.mjs` / `last-change.mjs` / `merge-gate.mjs` / `state-validate.mjs` / `audit-findings.mjs` 八个脚本仍在，卡在 `tests/goldens/parity-cases.mjs` 冻结夹具与两处 workflow 上；usage 文案里仍写 `node scripts/*.mjs`（改它要重冻 40 条不可重冻 golden，留到下一次 golden 口径变更一并做）。
+
+### 17.5 第三类只在 CI 红：用例读了环境
+
+`TestKbExportUsageErrors` 的「缺 source_repo」用例在本地一直绿、在 CI 红成「退出码 = 3，期望 2」：它要验的是「没给 `--repo` 也不在环境里 → 用法错」，而 CI 里 `GITHUB_REPOSITORY` 一定被设过，于是代码拿它当 repo、一路走到 git 解析失败、落成 INFRA（3）。本地没有这个变量，所以永远是 2。
+
+修法是 unset 而不是置空（`LookupEnv` 认「设了空串」为设了），helper 见 `apps/engine/kbexport_test.go` 的 `kbClearEnv`。复现命令：`GITHUB_REPOSITORY=o/n go test -run TestKbExportUsageErrors ./...` —— **用例读环境变量时，本地绿不构成证据**；验证要在带 CI 变量的环境里跑一遍（`CI=true GITHUB_ACTIONS=true GITHUB_REPOSITORY=… GITHUB_SHA=… go test ./...`）。
+
+这是同一条病根的第三次出现：判据的输入如果来自「跑它的那台机器」——时钟（17.1）、工作区里的运行时文件（17.1）、进程环境（本节）——它就不是判据，是概率。
