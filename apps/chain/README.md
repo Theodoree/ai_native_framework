@@ -16,7 +16,7 @@
 ## 它不做什么
 
 - 不代做合并：`merge` 是人按「通过」来认定完成。
-- 不做人员鉴权、不做多租户、不做并发控制（单机单写者）：接入层只认 project 级的访问口令，不认是谁在用。
+- 不做账号体系、不做多租户、不做并发控制（单机单写者）：身份只有 project 级管理口令、project 访问口令与角色口令三种，没有用户表，也没有登录。
 - 不保证回告必达：回告失败只记事件，结论靠拉模式自己取。
 - 不读 GitHub：仓库只是 project 上的一个字符串字段，平台不调用任何仓库 API。
 - 不在容器里替人改仓库：容器只产出日志、产物与评论。
@@ -27,12 +27,13 @@
 | --- | --- |
 | Project | key、name、repo、defaultBranch、chains、intakeToken（只在建 project 时交出去一次） |
 | Chain | key、type、version、nodes[]（key、type、review） |
-| Node | key、type、review、index、state、attempts[]、comments[]、rules[]、artifacts[]、rev |
+| Node | key、type、review、power、index、state、attempts[]、comments[]、rules[]、artifacts[]、rev |
+| Role | id、projectKey、name、powers[]、token（只在建角色与换口令的响应里出现一次）、createdAt |
 | Requirement | id、projectKey、chainKey、chainVersion、context、images、source、branch、state、nodes[]、rev、reporter（谁提的、回告地址） |
 
 存储是接口 `Store`（`store.go`），默认实现是 SQLite（`store_sqlite.go`，纯 Go 驱动 modernc.org/sqlite，免 cgo）。默认库文件 `data/chain.db`（已 gitignore）。换 MySQL 只需要再写一个 `Store` 实现：调用方一行不改。
 
-表：`projects` / `requirements` / `nodes` / `attempts` / `comments` / `events`。一次保存是单事务快照（upsert 需求 → 重插它的节点、执行记录、评论），连接池上限 1（SQLite 单写者）。
+表：`projects` / `roles` / `requirements` / `nodes` / `attempts` / `comments` / `events`。一次保存是单事务快照（upsert 需求 → 重插它的节点、执行记录、评论），连接池上限 1（SQLite 单写者）。
 
 ## 执行器
 
@@ -80,6 +81,54 @@
 - 服务不配 `-admin-token` 时「建 project」直接 503：接入层默认是关的。
 - 整条需求被拒（首站被拒）时，除了库里留一条平台留言，还会尽力 POST 一次到 `reporter.callbackURL`（5 秒超时），结果记成一条 `notify` 事件。**回告失败不改状态**——送不到是网络的事，不是判定的事。
 - 没有 callback 也能拿到结论：拉模式就是兜底。
+
+## 角色与权力
+
+节点动作要「资格」：一个请求能不能按某一站，由「角色对这个节点有没有权力」决定。身份只有口令，没有账号体系。
+
+权力四值：`review` / `dev` / `test` / `release`。
+
+不写权力时按节点类型给默认值（建链可逐站覆盖）：
+
+| 节点类型 | 默认权力 |
+| --- | --- |
+| create | dev |
+| assess | review |
+| dev | dev |
+| crosstest | test |
+| merge | review |
+| release | release |
+
+链条上每个节点可以写 `power` 覆盖默认值；需求进链那一刻把权力定死在快照里——之后改链条，不改已经在飞的需求。
+
+角色管理接口用 project 管理口令认证（`-admin-token`），不是角色口令：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/api/p/{project}/roles` | 建角色（name + powers），**唯一一次**返回角色口令 `rl_…` |
+| GET | `/api/p/{project}/roles` | 列出角色，不回显口令 |
+| POST | `/api/p/{project}/roles/{id}/rotate` | 换口令：旧口令立刻失效，新口令只在这条响应里出现 |
+| DELETE | `/api/p/{project}/roles/{id}` | 删角色；删掉之后它再也不能按 |
+
+- 同一个 project 里角色名唯一：评论里记的是角色名，重名就分不清是谁按的。
+- 角色只在它自己的 project 里有意义：拿一个 project 的管理口令改不到别的 project 的角色。
+- 没配 `-admin-token` 的部署里这四个接口一律 503（接入层没开），也就建不出角色。
+
+### 动作默认拒绝
+
+`run` / `accept` / `reject` 要求「带得出对应权力的角色口令」，判不了就挡。三条 403 的文案就是契约（前端靠它们区分「该去建角色」还是「该换口令」）：
+
+| 情形 | 响应 |
+| --- | --- |
+| 请求里没有认得出的角色口令 | `这个动作需要一个带 %s 权力的角色口令` |
+| 角色属于别的 project | `角色属于 %s，这条需求在 %s` |
+| 角色属于本 project 但没有这个权力 | `角色「%s」没有 %s 权力，不能在这个节点上确认/拒绝` |
+
+没有角色时按钮按不动，只能看。这是刻意的：宽进来一次就会变成常态。
+
+### 评论不受限
+
+`comment` 不校验权力：谁都能说话。带了认得出的角色口令，作者记成那个角色；没带就是访客。`rules`（给这一站追加规则）同样不看权力。
 
 ## 怎么跑
 
@@ -137,3 +186,6 @@ cd ../web && npm run build      # 输出到 ../chain/webui/dist
 4. 容器里跑什么都没验证：平台只保证注入与留痕，不保证镜像真的能干那件事。
 5. 回告只发一次、没有重试队列，也没有签名：对方不能靠签名验真伪，只能靠拉模式对账。
 6. 访问口令不能轮换也不能吊销：要换只能改库或重建 project。
+7. 角色口令没有过期时间、也没有审计：发出去就一直有效，谁用过只留在评论与事件里。
+8. 角色不能跨 project：一个角色只在一个 project 里有意义。
+9. 管理口令不分级：拿到它的人能建任意角色；它和访问口令一样不能吊销。
