@@ -1,6 +1,6 @@
-# P-31 判据与门搬进 Go（进行中）
+# P-31 判据与门搬进 Go
 
-状态：阶段 A、B、C、D1 已完成并合入，D2（删 .mjs、parity 转 golden、去掉剩余 Node 依赖）未做。
+状态：阶段 A–D3 已完成，交付均未提交（工作树内）。`audit.yml` 的判定步自阶段 D3 起调编译产物（§十三）；`scripts/*.mjs` 本轮一份不删（用户裁决，引擎在 `main` 上跑稳之前仍作 parity 黄金基准），`USAGE` 文案仍写 Node 载体名。
 
 ## 一、为什么做
 
@@ -19,12 +19,14 @@
 
 ## 三、阶段
 
-| 阶段 | 内容 | 完成判据 |
-| --- | --- | --- |
-| A | `apps/engine` 骨架 + 账本 + 判定器（`ledger` 55+104 行、`state-validate` 366 行）；`api-go` 改直接调用库，不再 subprocess | parity 全绿；`go vet`/`go test`/`npm run check` 全绿；`go build ./cmd/engine` 产出单二进制 |
-| B | `build-intent`（280 行）+ `last-change`（280 行）+ `writer-record`（72 行） | `state-writer` workflow 改调 Go 二进制；parity 全绿 |
-| C | `merge-gate`（523 行） | `merge-gate` workflow 改调 Go；parity 全绿 |
-| D | 清场：删已迁移的 `.mjs`、`package.json` 脚本改 Go、`check:state`/`check:go` 合并、workflow 铺 `setup-go`、parity 转 golden、文档与决策记录更新 | 仓库里只剩审计与知识库的 Node 脚本；`grep -r 'state-validate.mjs\|ledger-cli.mjs'` 零命中 |
+| 阶段 | 内容                                                                                                                                           | 完成判据                                                                                   |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| A    | `apps/engine` 骨架 + 账本 + 判定器（`ledger` 55+104 行、`state-validate` 366 行）；`api-go` 改直接调用库，不再 subprocess                      | parity 全绿；`go vet`/`go test`/`npm run check` 全绿；`go build ./cmd/engine` 产出单二进制 |
+| B    | `build-intent`（280 行）+ `last-change`（280 行）+ `writer-record`（72 行）                                                                    | `state-writer` workflow 改调 Go 二进制；parity 全绿                                        |
+| C    | `merge-gate`（523 行）                                                                                                                         | `merge-gate` workflow 改调 Go；parity 全绿                                                 |
+| D    | 清场：删已迁移的 `.mjs`、`package.json` 脚本改 Go、`check:state`/`check:go` 合并、workflow 铺 `setup-go`、parity 转 golden、文档与决策记录更新 | 仓库里只剩审计与知识库的 Node 脚本；`grep -r 'state-validate.mjs\|ledger-cli.mjs'` 零命中  |
+
+> 上表是初始计划。实际落地分阶段记录：§六（A）、§八（B）、§十（C）、§十一（D1：CI 与 npm 脚本）、§十二（D2：Node 调用面）、§十三（D3：`audit.yml` 判定步）。阶段 D 原定的「删已迁移的 `.mjs`」**本轮不做**（用户裁决）：引擎在 `main` 上跑稳之前，`scripts/*.mjs` 保留为 parity 的黄金基准，一份不删。
 
 ## 四、不做什么
 
@@ -76,13 +78,15 @@
 **阶段 C 的耦合点（先说清，免得改错）**：`merge-gate.mjs` 是 **import 这三个 .mjs 的导出函数**（`buildIntent`/`resolveIssueRefs`/`renderSection`/`recordBody`），不是调 CLI —— Go 侧已有同名导出，阶段 C 是把 merge-gate 改成调库，入口契约不经过命令行。另：last-change 的 git 命令别换 plumbing（`-z` 等），`core.quotePath=true` 会把非 ASCII 路径转八进制转义，两侧逐字节一致正是靠它；writer-record 的退出码是「判定结论 × 评论成功」的合成，infra 评论成功仍退 1，不是可重试信号；`GITHUB_OUTPUT` 是追加写。
 **运行时方言第二次咬人（与阶段 A 同一类，这次的载体是 stderr 文案）**：last-change 的「EVENT 非法 JSON」用例本地（Node 24）全绿、CI（Node 20）红——JSON.parse 的坐标后缀 (line 1 column 2) 只在 Node 22+ 出现。修法与阶段 A 同口径：比对前把坐标后缀从两侧摘掉（位置数字仍比），并**单独断言 Go 侧一律带坐标**，避免「两边都摘」退化成什么都没比。判断：凡是把 JSON.parse 的消息写进输出面的入口，都按这条办。
 
-## 九、同步到 main 时暴露的一个状态机缺口（未修，登记）
+## 九、同步到 main 时暴露的一个状态机缺口（已修，见 §十二）
 
 阶段 B 的 PR #83 基分支误设为 `develop`：GitHub 只在**指向默认分支**时自动关单，main 也就没快进。补的同步 PR #84（`develop → main`）又踩到第二层：门 G1 需要一个**还能被合并带到 done 的 issue**，而 #82 已被写者带到 `state:done`，门如实报 `E_TERMINAL_STATE 终态 done 不能再转换`。于是单独开 #85 作为同步单。
 
 PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progress`。原因查清：写者的意图表**只认 `issues.opened` 与 `issues.labeled`**（`scripts/build-intent.mjs:158`、`:164`，Go 侧同源），`issues.closed` 不产生意图；而 PR 关闭事件（`pull_request.closed && merged` → done）与 GitHub 的自动关单几乎同时发生，谁先谁后不确定。结果是「关单是平台外的动作，状态标签是平台内的记录」这两件事在时间上脱钩。
 
-不在这里手工改标签：状态只有一个写者，绕过写者改标签等于把契约当建议。这条缺口留给后续（要么给 `issues.closed` 建意图，要么把自动关单从平台外挪进写者）。当前状态如实写在 PR/issue 里，读的人能看到。
+不在这里手工改标签：状态只有一个写者，绕过写者改标签等于把契约当建议。当时的状态如实写在 PR/issue 里，读的人能看到。
+
+**后续已修**（阶段 D2）：`issues.closed` 现在产生意图，门 G1 另加「已关闭的 issue 不得判在途」。两条路径里选了前者，理由与实现见 §12.4。
 
 ## 十、阶段 C 落地记录（merge-gate）
 
@@ -96,13 +100,13 @@ PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progres
 
 **我的独立变异（五组，就地改 + /tmp 备份 + 先打印改后行 + 恢复）**：
 
-| # | 变异 | 红数 |
-| --- | --- | --- |
-| A | `mergegate.go:276` `mergeGateNewest` 的 `>=` → `>`（平手取先出现的那条） | **0 红（漏了）** |
-| B | `mergegate.go:449` `!strictEqual(sha, ctx.head)` → `!strictEqual(sha, sha)`（stale 永不成立） | 1 红 |
-| C | `mergegate.go:318` `len(refs) != 1` → `len(refs) < 1`（放过多个引用） | 1 红 |
-| D | `mergegate.go:353` 咨询 `to:"done"` → `to:"in-progress"`（G1 目标状态错） | 30 红 |
-| E | `mergegate.go:727` 汇总行「未就绪=」→「未完成=」 | 28 红 |
+| #   | 变异                                                                                          | 红数             |
+| --- | --------------------------------------------------------------------------------------------- | ---------------- |
+| A   | `mergegate.go:276` `mergeGateNewest` 的 `>=` → `>`（平手取先出现的那条）                      | **0 红（漏了）** |
+| B   | `mergegate.go:449` `!strictEqual(sha, ctx.head)` → `!strictEqual(sha, sha)`（stale 永不成立） | 1 红             |
+| C   | `mergegate.go:318` `len(refs) != 1` → `len(refs) < 1`（放过多个引用）                         | 1 红             |
+| D   | `mergegate.go:353` 咨询 `to:"done"` → `to:"in-progress"`（G1 目标状态错）                     | 30 红            |
+| E   | `mergegate.go:727` 汇总行「未就绪=」→「未完成=」                                              | 28 红            |
 
 **A 是这一轮唯一抓到的缺口，根因是夹具 id 全不等**：`newest` 在 JS 里是 `(a,b) => Number(b?.id ?? 0) >= Number(a?.id ?? 0) ? b : a`，平手取**后**出现的那条；交付方的 45 个夹具里没有一条让两条同名 check 的 id 相等，于是 `>=` 与 `>` 在测试面上不可区分。补的夹具是「两条 `render`，id 都是 2，前一条 completed/success、后一条 in_progress」——JS 取后者 → `E_LAST_CHANGE_PENDING`/exit 3；改成 `>` 取前者 → 直接放行。补完后 A 变 1 红，恢复 47 全绿（46 + 新增 1）。
 
@@ -125,21 +129,22 @@ PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progres
 
 顺带看清了它的**后果不只是显示难看**：门 G1 拿标签去咨询转换表，标签停在 `state:in-progress` 的已关单看起来「还能被合并带到 done」，于是 G1 会对一个已经关掉的 issue 判 PASS。也就是说，缺口的真实风险是**门可能把已关单当成在途单放行**，而不只是标签不准。
 
-修法仍是那两条（给 `issues.closed` 建意图，或把自动关单挪进写者），本轮不动：状态只有一个写者这条约束优先。
+两条修法与最终取舍见 §十二：给 `issues.closed` 建意图（已落地），把自动关单挪进写者不做。
+
 ## 十一、阶段 D1 落地记录（CI 与 npm 脚本切到 Go 引擎）
 
 阶段 A/B/C 让 Go 有了全部判据，但调用点还在 Node——冗余没真正消掉。D1 把 8 个生产调用点指向 `./.cache/bin/engine`：
 
-| 调用点 | 命令 |
-| ------ | ---- |
-| `merge-gate.yml` collect | `./.cache/bin/engine merge-gate --event … --pr … --print-issue` |
-| `merge-gate.yml` gate | `./.cache/bin/engine merge-gate --event … --pr … --issue … --checks … --infra …` |
-| `state-writer.yml` resolve | `ISSUE="$(./.cache/bin/engine build-intent --resolve-issue)"` |
-| `state-writer.yml` intent | `./.cache/bin/engine build-intent > intent.json` |
-| `state-writer.yml` validate | `./.cache/bin/engine validate --intent intent.json --json` |
-| `state-writer.yml` record | `./.cache/bin/engine writer-record --verdict verdict.json --issue "$TARGET"` |
-| `last-change.yml` render | `./.cache/bin/engine last-change --in body.in.md --out body.out.md` |
-| `package.json` `check:state` | `npm run --silent build:engine && ./.cache/bin/engine check-config` |
+| 调用点                       | 命令                                                                             |
+| ---------------------------- | -------------------------------------------------------------------------------- |
+| `merge-gate.yml` collect     | `./.cache/bin/engine merge-gate --event … --pr … --print-issue`                  |
+| `merge-gate.yml` gate        | `./.cache/bin/engine merge-gate --event … --pr … --issue … --checks … --infra …` |
+| `state-writer.yml` resolve   | `ISSUE="$(./.cache/bin/engine build-intent --resolve-issue)"`                    |
+| `state-writer.yml` intent    | `./.cache/bin/engine build-intent > intent.json`                                 |
+| `state-writer.yml` validate  | `./.cache/bin/engine validate --intent intent.json --json`                       |
+| `state-writer.yml` record    | `./.cache/bin/engine writer-record --verdict verdict.json --issue "$TARGET"`     |
+| `last-change.yml` render     | `./.cache/bin/engine last-change --in body.in.md --out body.out.md`              |
+| `package.json` `check:state` | `npm run --silent build:engine && ./.cache/bin/engine check-config`              |
 
 构建入口只有一个：`build:engine`（`cd apps/engine` + `go build -o ../../.cache/bin/engine ./cmd/engine`，GOPATH/GOCACHE 指仓库 `.cache`；`.cache/` 早已在 .gitignore，产物不进仓库）。三个 workflow 各在 `npm ci` 之后加 `actions/setup-go@v5`(1.22) + `npm run build:engine`；`check` 链未变，故一次 check 只构建一次。仍用 Node 的只剩审计六件套、kb-sync、copy-dist、cli 与内联 `node -e/-p`，所以 `setup-node` 全部保留——**零 Node 属 D2，不是本阶段**。
 
@@ -161,3 +166,296 @@ PR #84 合并后 #85 被 GitHub 自动关闭，但标签停在 `state:in-progres
 - workflow 里仍有内联 `node -e/-p`（取 check runs、拼 JSON），所以运行时依赖 Node 只是变少，没有消失；要归零得把这些也搬到引擎，属 D2。
 - `tests/helpers/engine.mjs` 用 mtime 判新鲜：Go 源比二进制新就重建。时钟异常或跨机器搬运二进制会误判，代价是多一次 `go build`。
 - `cache:false`（与 `check.yml` 现状一致）每次下载 Go 工具链，换来的是不受缓存键漂移影响。
+
+## 十一·补、阶段 D1 的 CI 红：文本扫描器把编译产物当源码读
+
+切到 Go 引擎后 PR #89 的 `check` 红了九条断言，全部一个根：`tests/audit-findings.test.mjs` 的 workflow 扫描器把 `./.cache/bin/engine` 当成被引用的脚本，用 utf8 把 4 MB 二进制读进了判据面。CI 上因此报出 669 条「写结论」violation，`excerpt` 全是乱码；本地同一份代码全绿——本地构建的二进制里没有能命中的字节，于是「同一份判据 + 同一个文件」在两个环境给出相反结论。
+
+判断：文本扫描器读二进制，两个方向都不成立——随机字节可能被当成命中（假红），真写面也可能藏进读不出来的字节里（假绿）。所以正确的修法不是「让本地也红」，而是**这类文件根本不该进文本判据面**。
+
+修法（只改 `tests/audit-findings.test.mjs`）：
+
+- `isBinarySource()`（读前 8 KB，含 NUL 即判二进制）把二进制挡在扫描面外，改记 `binary-source` gap；
+- 该 gap 不计入 violation，也不计入「命中写面的文件」；
+- 新增 `workflowBinarySourceGaps()`，在真仓库用例里断言被跳过的恰好是 `.cache/bin/engine`（只有构建过引擎才做精确断言，未构建不失败）——**跳过不等于没看见**。
+
+学到的三条：
+
+1. 判据的输入面必须先回答「这是不是文本」，否则同一份判据会在不同机器上给出不同答案。CI 红、本地绿这种分歧，多半是环境把判据的某个假设改掉了，而不是环境有 bug。
+2. 变异能证明「断言在承重」，证不了「它读的东西在两个环境里是同一类东西」。
+3. 三组变异留存：`isBinarySource` 恒 false → 1 红；gap 允许计入 violation → 10 红；`stepTexts` 不跳过 → 1 红；还原后 199 绿，整仓 665 绿。
+
+## 十二、阶段 D2 落地记录（Node 调用面收进引擎 + §九 收口）
+
+D2 的原计划是「删 `.mjs`、parity 转 golden、去掉剩余 Node 依赖」。实际做的是**先把行为搬进 Go 并切换能切干净的那部分调用点**，`.mjs` 一份没删——理由见下面「用户裁决」第 4 条。
+
+### 12.1 逐文件交付
+
+| 文件                                                  | 行数      | 子命令           | 内容                                                                                                                 |
+| ----------------------------------------------------- | --------- | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `apps/engine/auditfindings.go`                        | 新增      | `audit-findings` | 审计口径层：schema 校验、多执行器 verdict 归一、两槽逐条比对、Check conclusion（0 pass / 1 不合格 / 3 INFRA）        |
+| `apps/engine/auditslot.go`                            | 新增      | `audit-slot`     | 槽位落盘 + 自报身份与槽位一致性校验                                                                                  |
+| `apps/engine/routing.go`                              | 新增      | `routing`        | 路由真源自洽 + 扫 workflow 硬编码模型名                                                                              |
+| `apps/engine/auditcollect.go`                         | 新增      | `audit-collect`  | 编排：预检 → dispatch → 轮询 run → 回读 Check Run                                                                    |
+| `apps/engine/auditreview.go`                          | 新增      | `audit-review`   | 一个槽一次模型调用，落契约形状 findings                                                                              |
+| `apps/engine/copy_dist.go`                            | 114       | `copy-dist`      | `apps/web-vue/dist` → `apps/api-go/dist`                                                                             |
+| `apps/engine/cli_tool.go`                             | 722       | `cli`            | 接入层五个命令 + 显示宽度算表格                                                                                      |
+| `apps/engine/kbexport.go`                             | 803       | `kb-export`      | 知识库汇入清单（sha256 幂等、白名单、累积继承、INFRA 重试）                                                          |
+| `apps/engine/cli.go`                                  | +24       | —                | 注册上述 8 个子命令与 `EngineUsage` 行                                                                               |
+| `apps/engine/config.go`                               | +34       | —                | `(*Config).ClosedTerminalTargets()`：只认 `by=ci`、目标是 terminal、排除 `from="*"/"none"`                           |
+| `apps/engine/intent.go`                               | +54       | —                | `issues + closed` 分支（见 12.4）                                                                                    |
+| `apps/engine/mergegate.go`                            | +16       | —                | `mergeGateIssueClosed` + G1 的 `E_ISSUE_CLOSED_IN_FLIGHT`（见 12.4）                                                 |
+| `apps/engine/closed_intent_test.go`                   | 新增      | —                | 7 个 Test：关单意图四种形状 + 带守卫终态 + G1 关单拒绝                                                               |
+| `scripts/build-intent.mjs` / `scripts/merge-gate.mjs` | +56 / +11 | —                | 对照物同源落地（parity 需要两侧都能跑出新行为）                                                                      |
+| `package.json`                                        | +6/-6     | —                | `check:web` / `web:dist` / `cli` 改指 `./.cache/bin/engine`                                                          |
+| `.github/workflows/kb-sync.yml`                       | +11       | —                | `npm ci` 后插 `actions/setup-go@v5`(1.22) + 无名 `npm run build:engine`；export 步改 `./.cache/bin/engine kb-export` |
+| `tests/engine-parity-d.test.mjs`                      | 新增      | —                | 50 条（见 12.2）                                                                                                     |
+| `tests/engine-parity-e.test.mjs`                      | 新增      | —                | 37 条（见 12.2）                                                                                                     |
+| `tests/build-intent.test.mjs`                         | 41→50     | —                | 关单意图的四种形状 + 带守卫终态                                                                                      |
+| `tests/state-writer-wiring.test.mjs`                  | 16→19     | —                | `on.issues.types` 含 `closed`、意图步读得到 `ISSUE_STATE_FILE`                                                       |
+| `tests/merge-gate.test.mjs`                           | +3        | —                | G1 已关闭+非终态 → 拒；未关闭仍 PASS；缺 `state` 按未关闭判                                                          |
+| `tests/engine-parity-b.test.mjs`                      | 55→59     | —                | 3 条关单意图 parity + 1 条新登记例外                                                                                 |
+| `tests/engine-wiring.test.mjs`                        | +1        | —                | 期望集合加 `kb-sync.yml`（仍 `toEqual`）                                                                             |
+| `tests/kb-export.test.mjs`                            | +14/-7    | —                | 钉 `./.cache/bin/engine kb-export` 且 `not.toContain("node")`；沙箱改用 `tests/helpers/engine.mjs`                   |
+
+边界：`.github/workflows/audit.yml` 一字符未动（理由见 12.5）。
+
+### 12.2 parity 覆盖（四套，实测）
+
+| 套                               | 条数 | 结构                                                                                                                                                        | 说明                                                                  |
+| -------------------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `tests/engine-parity-c.test.mjs` | 47   | 46 fixture + 1 条数量断言                                                                                                                                   | 阶段 C 的 merge-gate                                                  |
+| `tests/engine-parity-b.test.mjs` | 59   | 22 build-intent + 19 last-change + 13 writer-record + 5 已登记例外                                                                                          |                                                                       |
+| `tests/engine-parity-d.test.mjs` | 50   | 48 fixture + 2 条数量/例外断言；夹具 8 audit-findings + 6 audit-slot + 7 routing + 7 audit-collect + 20 audit-review；失败路径 33 条，退出码 0/1/2/3 全覆盖 | `gh` 与模型上游都是替身（上游是另一个进程里的假 `/chat/completions`） |
+| `tests/engine-parity-e.test.mjs` | 37   | 3 copy-dist + 10 kb-export + 19 cli + 3 条「引擎都是真跑出来的结论」+ 2 条调用点钉住；失败路径 16 条                                                        | 后端是另一个进程里的假 `apps/api-go`；kb-export 在真 git 仓库上跑     |
+
+对照手法与前几个阶段一致：同一批输入同时喂两侧，比 stdout 逐字节 / stderr / 退出码 / 写出文件 / 打到上游的请求体。
+
+### 12.3 非逐字节例外（D2 新增，全部写成显式归一）
+
+| #   | 例外                                                                      | 归一方式                                                              |
+| --- | ------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| 1   | 路由声明的 YAML 解析器文案（`npm yaml` vs `yaml.v3`）                     | 只比前缀「路由声明不是合法 YAML: .agents/platform/routing.yml: 」     |
+| 2   | 网络栈文案（`fetch failed` vs `dial tcp …: connect: connection refused`） | 只比前缀「调用上游失败（没拿到响应）：」                              |
+| 3   | `cli` 连不上后端（`connect ECONNREFUSED 127.0.0.1:1` vs `dial tcp …`）    | 只比前缀「连不上后端 <origin>: 」                                     |
+| 4   | `issues.closed` + 两个终态标签的 fail-closed 报错                         | 登记进 `tests/engine-parity-b.test.mjs` 的 `KNOWN_DIVERGENCES`（4→5） |
+
+归一的写法是「按固定前缀截断后只比前缀」而不是「整段跳过」——例外仍然要求两侧同一个 code、同一个退出码。
+
+### 12.4 §九 的缺口：怎么修的、为什么这么修
+
+**落地**：`issues.closed` 现在产生意图。
+
+- 候选来源：`(*Config).ClosedTerminalTargets()` 只把 `by=ci` 且目标是 terminal 的转换当候选，排除 `from="*"` 与 `from="none"`——owner 裁决出来的终态不自动落。
+- 判定分支（两侧同源）：没有 `state:*` 标签 → 无意图；同时带两个标签 → fail-closed；候选为空 → 无意图；恰好一个候选 → `to=该终态`、`actor_role=ci`；多个候选 → fail-closed。
+- 带守卫的终态在关单事件上必然 `E_GUARD_MISSING` → 写者留痕、标签不动、job 绿。这是**如实交出去**，不是漏：门那边由 G1 兜住（下条）。
+
+**G1 也补了判据**（用户裁决 1）：门现在读 `issue.state`，已关闭 + 非终态标签 → `rejected / E_ISSUE_CLOSED_IN_FLIGHT`，文案点名成因；输入里没有 `state` 时不当作已关闭（门不靠猜补输入）。两侧各一份：`mergegate.go` 与 `scripts/merge-gate.mjs`；测试分别由 `apps/engine/closed_intent_test.go` 与 `tests/merge-gate.test.mjs` 覆盖。
+
+**为什么不选另一条**（把 `Fixes #N` 的自动关单挪进写者）：自动关单发生在 GitHub 侧，写者拦不住、也没法在测试里复现；而 `Fixes #N` 这个引用语法是 merge-gate G2 的前置判据，挪走会打坏 G2。代价是「关单事件与标签落定」仍在时间上脱钩，所以 G1 的判据是配套而非可选。
+
+### 12.5 用户裁决（4 条，逐条落地）
+
+| #   | 裁决                                                                                | 落地                                                                                                               |
+| --- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| 1   | G1 加「已关闭的 issue 不得判在途」                                                  | `mergegate.go` + `scripts/merge-gate.mjs` + `tests/merge-gate.test.mjs` 3 条新 test + `closed_intent_test.go` 断言 |
+| 2   | 阶段 D3 切 `audit.yml` 到引擎二进制**之前**必须补等价判据（不接受「证明责任降级」） | D2 轮内 `audit.yml` 一字符未动；7 条前置清单见 12.7，已在阶段 D3 逐条收口（§十三）                                 |
+| 3   | workflow 沙箱内真构建引擎（照其他三个 workflow 的无名 `setup-go` + build 做法）     | `kb-sync.yml` 加 `actions/setup-go@v5`(1.22) + 无名 `npm run build:engine`，wiring 测试期望集合同步                |
+| 4   | `scripts/*.mjs` 保留，等引擎在 `main` 上跑稳再删；parity 仍以它们为黄金基准         | 一份没删；`tests/engine-parity*.test.mjs` 继续双侧对照                                                             |
+
+### 12.6 变异验证（12 组，全部见红，均在 `/tmp` 副本做）
+
+| 组       | 变异                                | 红数                                             |
+| -------- | ----------------------------------- | ------------------------------------------------ |
+| audit-1  | `auditfindings` 的 INFRA 退出码改错 | 4                                                |
+| audit-2  | `auditreview` 的 blocker 判定失效   | 1                                                |
+| audit-3  | `auditcollect` 的 failure 结论失效  | 1                                                |
+| audit-4  | `routing` 词边界失效                | **首轮 0 红**，补 `rt-word-boundary` 夹具后 1 红 |
+| intent-1 | 关单分支整体失效                    | go 3 + vitest 3                                  |
+| intent-2 | 多个终态取第一个                    | go 1                                             |
+| intent-3 | 两个标签不 fail-closed              | go 1                                             |
+| intent-4 | 去掉 `by=ci` 过滤                   | go 2                                             |
+| intent-5 | Node 侧关单分支失效                 | vitest 6                                         |
+| port-1   | `kb-sync.yml` 改回 `node`           | 3                                                |
+| port-2   | wiring 期望里删 `kb-sync.yml`       | 1                                                |
+| port-3   | 沙箱不给引擎二进制                  | 1（`expected '127' to be '3'`）                  |
+
+门（各自实测真退出码）：`gofmt -l` 空、`go vet ./...` 0、`go test ./...` 0；三条交付线交付时的整仓 `npm run check` 均 exit=0（t3 交付时 23 文件 / 772 用例）。
+
+### 12.7 教训与未关面
+
+**教训**
+
+1. **软链会让 parity 假绿**：JS 那份 `copy-dist.mjs` 只在 `process.argv[1]` 与 `import.meta.url` 相等时执行主体，而 macOS 的 `/var` 指向 `/private/var`、ESM loader 会把 `import.meta.url` 解成真实路径——沙箱目录不 `realpath` 就出现「两侧都没有输出」的假绿（`tests/engine-parity-e.test.mjs` 已 `realpathSync`）。这是「两侧同样失败被当成一致」的第四次同款。
+2. **夹具形状单一 ＝ 判据半个身子没测**（第三次）：`routing` 词边界那组首轮 0 红，因为夹具里没有能区分「按词边界」与「按子串」的样例；补一条才咬住。
+3. **变异必须在副本上做**：用 `PARITY_ENGINE_DIR` 指向 `/tmp` 里改过的引擎，仓库里的对照物保持原样，否则「黄金基准」被自己改坏。
+4. **真仓库探针会留外部痕迹**：验证 G1 时对真仓库 issue #85 发过一条评论（`issuecomment-6418895158`）。探针要么走 dry-run，要么接受留痕。
+
+**未关面（登记在案，不在本轮做）**
+
+- `cli` / `kb-export` 的 `USAGE` 文案仍写 Node 载体名（`node scripts/cli.mjs …`）：parity 比字节，改文案两侧要一起改，单独一轮处理。
+- `tests/engine-parity-c.test.mjs` 的 issue 夹具不带 `state`：G1 的 `E_ISSUE_CLOSED_IN_FLIGHT` 不在 Go↔JS parity 面内，两侧一致性只由 `closed_intent_test.go` 与 `tests/merge-gate.test.mjs` 各自保证。
+- `audit.yml` 切到引擎（阶段 D3）的前置：`tests/audit-findings.test.mjs` 里对 `scripts/audit-findings.mjs` 的字面量断言、`resultWriters` 的「唯一生产者」断言、回放沙箱里没有 `.cache/bin/engine`、以及 `binary-source` 口径（二进制产物会被文本扫描器跳过）。这几条都属判据口径变更，要按用户裁决 2 先补等价判据。**已在阶段 D3 收口**（§十三）：13 条既有断言等价重写或换注入点、无一条删除；判据改为按「这一次调用」放行并由 `--explain` 自证，放行名单与契约各自被用例与变异钉住。
+- `kb-export` 的白名单/排除项三处同口径（`scripts/kb-export.mjs` / `apps/api-go/kb.go` / `apps/engine/kbexport.go`），三份表的对照在 `tests/kb-allowlist-parity.test.mjs`；变量名与正则写法各不相同，改动必须三处一起动。
+
+## 十三、阶段 D3 落地记录（`audit.yml` 的判定步切编译产物 + 自证声明）
+
+### 13.1 切了什么
+
+**workflow 侧**（`.github/workflows/audit.yml`）：
+
+| 位置 | 改动 |
+| ---- | ---- |
+| 「安装依赖」之后 | 新增 `actions/setup-go@v5`（`go-version: "1.22"`）与「构建引擎」步（`npm run build:engine`），与其余四家调引擎的 workflow 同形态 |
+| 判定步 | `node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json` → `./.cache/bin/engine audit-findings --a … --b … --out …` |
+
+构建步的位置是判据的一部分：产物必须由**这个 workflow 自己**在调它之前建出来。少了它，「能不能合」那一步会在 CI 上以 `No such file or directory` 失败，而那是管线故障、不是「判不了」——两者在 check-run.json 里必须分得开。
+
+**引擎侧**：
+
+| 文件 | 改动 |
+| ---- | ---- |
+| `apps/engine/auditfindings.go` | 新增 `AuditFindingsExplain() *Value`：机器可读地声明 `subcommand` / `args` / `reads` / `writes` / `source` / `exitCodes`（走 `value.go` 的保序编码器 `EncodeIndent(2)`，键序稳定）；`RunAuditFindings` 开头 `if hasArg(argv, "--explain")` → 打印声明并退 0 |
+| `apps/engine/cli.go` | `EngineUsage` 的 `audit-findings` 行补「`--explain` 打印它读什么 / 写什么 / 退出码语义」 |
+| `apps/engine/README.md` | 状态行改为「阶段 D3 起 audit.yml 判定步也调编译产物」；用法补 `[--explain]`；新增 P-31 阶段 D3 的迁移注记 |
+
+`--explain` 的实测输出（`./.cache/bin/engine audit-findings --explain`，exit 0）：`subcommand=audit-findings`、`args=[--a,--b,--out]`、`reads=[--a,--b]`、`writes=[--out]`、`exitCodes={0: 有结论且结论是 pass, 1: 有结论且结论是 needs_revision / reject, 3: 判不了（INFRA）}`、`source=[scripts/audit-findings.mjs]`。
+
+**测试侧**：`tests/audit-findings.test.mjs` 的判据改造（见 13.3、13.4）+ 5 条 D3 用例；`tests/engine-wiring.test.mjs` 的「调引擎的 workflow」名单 +1（`audit.yml`）——这是切换的**连带判据**，不是放宽。
+
+### 13.2 为什么要自证，而不是「换个二进制就完了」
+
+t6 的原话要点：
+
+> **D3 的价值不在换成二进制，而在二进制也要有可对账的声明**：`--explain` 的声明必须同时与调用点 argv、与实现行为各对一次账，否则就是声明自证声明。
+
+代价是实测出来的，不是推测：这一行换掉之后，冻结的 `tests/audit-findings.test.mjs` 从 199 passed / exit 0 变成 **29 failed | 170 passed / exit 1**；把引擎塞进 wiring 沙箱后仍有 **13 failed | 186 passed**。这 13 条不是「测试写得脆」，是三类真实的口径缺口：
+
+1. 扫描面对**二进制执行体**一律默认拒绝（9 条）：`binary-source` 只在「二进制当被扫的数据源」时被容忍，当执行体时落进兜底文案「执行面跟不下去：按默认拒绝」。
+2. 「口径层崩溃兜底」「空 conclusion 不许互证」这两类行为**在二进制下无法再注入与观测**（2 条）。
+3. 判据直接从文本里推导（写死的旧命令、读者/产出者由 import 图推导）（2 条）。
+
+于是三件事一起做：引擎自证（`--explain`）、判据按**这一次调用**放行（`sanctionedContractHolds`）、每次跳过留账（`noteBinarySkip` / `takeBinarySkips`）。
+
+### 13.3 判据是怎么保持严格的
+
+- **放行粒度是「那一次调用」，不是文件名**：`SANCTIONED_CONTRACT` 记 `{subcommand, argv}`，`sanctionedContractHolds(argv)` 先比 `words[0]` 再逐词比 `argv`——多一个参数、少一个参数、换个子命令、换条路径，全部退回默认拒绝。**放行名单本身**也有用例对账：它必须与调用点那一次 argv 逐词相等，不许是手抄的副本。
+- **声明与实现各对一次账**：① 声明 ↔ 调用点：`shellCommands(decide.run)` 里 `./.cache/bin/engine` 那一次的 argv 与 `--explain` 的 `subcommand`/`args`/`reads`/`writes`/`exitCodes` 逐项相等，三个 option 的**文件名**也逐个对（`--a`/`--b`/`--out`）；② 声明 ↔ 实现：tmp 目录写两份 findings，真跑产物，断言退出 0、`readdirSync(dir).sort()` **恰好**三份（声明说只写 `--out`，就该只有它）、`out.json` 的 `verdict === "pass"`。声明与实现各有一条，缺一条就是自证自明。
+- **每一次跳过都要留账，且 `why` 非空**：`noteBinarySkip(file, why)` 记账，`takeBinarySkips()` 的每一格 `why` 都要有内容——静默 `continue` 等于给「把执行体换成二进制」开一条谁都查不到的暗道。真 audit.yml 的判定步在扫描里产生的 gap 必须 `detail === ".cache/bin/engine"`、`sanctioned === true`、`why === BINARY_SKIP_WHY_SANCTIONED`。
+- **源码模块由声明豁免，不由硬编码路径豁免**：`writers` 变成 `[".cache/bin/engine"]` 之后，`scripts/audit-findings.mjs` 会被当成「造字段名的读者」——根因是 `scripts/audit-review.mjs` 里 `import { validateResult } from "./audit-findings.mjs"`。解法是把「实现是谁」放进自证（`--explain` 的 `source`），判据按声明豁免（`isSanctionedSource`），而不是把路径写死进判据。
+- **两条反面对照**（防「白名单变成万能钥匙」）：换子命令（`audit-slot`）与多一个参数（`--explain`）都仍必须是 `where === "binary-source"` 的违规；`sanctionedBinaryUse(".cache/bin/other", …) === false`；只被 `echo` 提及、没被执行，也不算放行。
+- **扫描器本身没被放宽**：`workflowWriteSurfaceFiles()` 仍恰好是 `["audit.yml"]`，`workflowBinarySourceGaps()` 仍把 `.cache/bin/engine` 记成二进制 gap——只是这个 gap 带 `sanctioned` 标记，不是不记。
+
+### 13.4 上一轮 13 条既有断言的处置：等价重写或换注入点，没有一条被删
+
+| # | 断言在原处钉什么 | 本轮处置 |
+| - | ---------------- | -------- |
+| 1 | 判定步把结论交给 Check Run | 写死的 Node 命令改成写死**新调用**；另加一条更强的：放行名单必须与调用点 argv 逐词相等 |
+| 2 | 「空 conclusion 不许互证」 | 注入目标从 `scripts/audit-findings.mjs` 搬到**产物**（`#!/bin/sh` 替身写 `{"verdict":"INFRA","conclusion":""…}`）；用例语义不变，另加「桩真被执行」marker，防「桩没跑到所以空绿」 |
+| 3 | 兜底补的结果不是第二份口径层 | `fieldReadViolations` 增加「自证声明的源码模块」豁免；产物身份仍是 `.cache/bin/engine` |
+| 4 | 口径层崩溃、result.json 没落地 | 同第 2 条：产物替身 `exit 70` + marker 断言 |
+| 5–13 | 9 条「执行面跟不下去：按默认拒绝」 | 二进制扫描分支先算 `sanctioned`（按这一次调用比对声明契约）再决定放行，并把 `sanctioned`/`why` 写进 gap；`auditDirReferenceViolations` 只对 `sanctioned` 的二进制 gap 放行，未 sanction 的照旧是违规 |
+
+结果：`npx vitest run tests/audit-findings.test.mjs` = **204 passed / exit 0**（切换前 199 条，另加 5 条 D3 用例）；`tests/engine-wiring.test.mjs` = 11 passed。
+
+### 13.5 变异验证（8 组，全部见红）
+
+| 组 | 变异 | 结果 |
+| -- | ---- | ---- |
+| M1 | 放行名单 argv 少一条（`--out`） | 红 1 |
+| M2 | `sanctionedContractHolds` → `return true`（按文件名放行） | 红 1 |
+| M3 | 删掉两处 `isSanctionedSource` 豁免 | 红 1 |
+| M4 | 删掉「已 sanction 的二进制 gap 放行」那一行 | 红 1 |
+| M5 | `noteBinarySkip` 的 `why` 置空 | 红 1 |
+| M5b | gap 的 `sanctioned` 恒 `false`（二进制永远被拒） | 红 1 |
+| M6 | 引擎 `--explain` 的 `source` 改指向 `scripts/routing.mjs` | 红 1 |
+| M7 | 判定步退回 `node scripts/audit-findings.mjs …` | 红 1 |
+
+前两轮 M1、M5 曾**逃逸**（M1 是断言只对「声明 vs 调用点」对账、放行名单本身没人对；M5 是账本 `why` 没有用例读）。本轮补了这两条不变式后不再逃逸——又一次印证 12.7 那条教训：**判据没被变异咬过就不算判据**。
+
+### 13.6 未关面
+
+- **`scripts/*.mjs` 本轮一份不删**（用户裁决）：引擎在 `main` 上跑稳之前，parity 仍以它们为黄金基准；`audit.yml` 切的是判定步的执行体，没删对照物。
+- **`USAGE` 文案仍写 Node 载体名**（`node scripts/audit-findings.mjs …`）：parity 比字节，改文案两侧要一起改，单独一轮处理。
+- **`--explain` 是声明，不是证明**：一个被改坏的引擎可以声明得漂亮而行为不同。目前只靠「按契约真跑一遍、只比落盘形态与结论」挡一层；更严的做法是在 Go 单测里直接钉 `AuditFindingsExplain()` 的字段，本轮没加（避免与 parity 用例重复记账）。
+- **`.audit/*.json` 的读写面在 CI 上已不可文本扫描**：等价覆盖靠 `tests/audit-findings.test.mjs` 的静态判据与 `tests/engine-parity-d.test.mjs` 的 50 条行为对照，两者都在 `npm run check` 里。
+
+### 13.7 验收（独立对抗验收，t12）
+
+**结论：D3 这一刀可以放行——判定面收紧、无断言被削弱、无逃逸变异。**
+
+验收人未改仓库（真仓只读快照 `/tmp/vd4`，变异在独立副本 `/tmp/vm4`，每组改完 `cmp` 还原），自跑门：`npm run check` exit=0 / 23 files / **786 tests**（与交付方声称一致，非转述）；`gofmt -l` 无输出、`go vet ./...` 与 `go test ./...` exit=0。共 10 组变异，**全部见红**（A1–A4、B1–B3、D1–D2、E1；红数依次 28/27/20/24/2/1/1/1/1/3）。
+
+#### 13.7.1 放行粒度确实是「那一次调用」，不是文件名
+
+每次只改判定步那一行，跑 `tests/audit-findings.test.mjs`（基线 204 passed）：
+
+| 组 | 变异 | 结果 |
+| -- | ---- | ---- |
+| A1 | 路径对、子命令换成 `audit-slot` | exit=1，**28 failed** / 176 passed |
+| A2 | 子命令对、行尾多一个 `--explain` | exit=1，**27 failed** / 177 passed |
+| A3 | 行首加 `echo`（提及但不执行） | exit=1，**20 failed** / 184 passed |
+| A4 | 二进制换成 `engine-copy` | exit=1，**24 failed** / 180 passed |
+| E1 | 引擎调用**下一行再加回** `node scripts/audit-findings.mjs …`（两种载体并存） | exit=1，**3 failed** / 201 passed |
+
+E1 是最值得记的一条：引擎那次已经逐词对了，残留的 node 调用仍然被判成第二份口径层（红在「兜底补的结果不是第二份口径层」等 3 条）。**半切换不会被整体放行** ——「这一刀切干净」本身是判据，不是结果。
+
+#### 13.7.2 `--explain` 声明 ↔ 实现是真对账
+
+变异改 Go 源码，**重建引擎**后再跑（`ensureEngine()` 会因 mtime 触发重建，这条链路本身也是被验的）：
+
+| 组 | 变异 | 结果 |
+| -- | ---- | ---- |
+| B1 | `source` 改指 `scripts/merge-gate.mjs` | build=0，exit=1，**2 failed**：「声明的源码模块在仓库里，且它就是本用例 import 的那份判据」+「兜底补的结果不是第二份口径层」 |
+| B2 | `args` 去掉 `--out` | build=0，exit=1，**1 failed**：「声明里的…与判定步的实际参数逐词一致」 |
+| B3 | `exitCodes` 去掉 `3`（判不了/INFRA） | build=0，exit=1，**1 failed**：同一条 |
+
+B1 尤其关键：`source` 不是抄死的常量，是被真读出来再对仓库核对的——改 Go 必须重建才生效，而重建后的偏差确实被抓到。
+
+#### 13.7.3 既有断言没有被削弱
+
+`expect` 计数（HEAD → 现在），6 个文件**无一处减少**：
+
+| 文件 | expect | it |
+| ---- | ------ | -- |
+| `tests/audit-findings.test.mjs` | 1022 → **1057** | 199 → **204** |
+| `tests/build-intent.test.mjs` | 125 → **143** | 0 → 0 |
+| `tests/engine-parity-b.test.mjs` | 22 → 22 | 4 → 4 |
+| `tests/engine-parity-c.test.mjs` | 15 → 15 | 2 → 2 |
+| `tests/engine-wiring.test.mjs` | 19 → 19 | 6 → 6 |
+| `tests/kb-allowlist-parity.test.mjs` | 5 → **12** | 3 → **7** |
+
+被删改的 4 条「-侧」断言逐条定性——没有一条是「删掉少判一点」：
+
+| # | 原断言 | 定性 |
+| - | ------ | ---- |
+| 1 | 判定步引用的脚本 `toContain("scripts/audit-findings.mjs")` | **换钉点**：判定步已不引用脚本，改钉仍在被执行的 `scripts/audit-review.mjs`；判定步的真实命令由新增 D3 用例逐词钉住 |
+| 2 | `resultWriters(steps) toEqual(["scripts/audit-findings.mjs"])` | **等价重写**：仍是 `toEqual` 精确相等，只换载体为 `.cache/bin/engine` |
+| 3 | 沙箱跳过集合 `NETWORK_STEPS = {"安装依赖"}` | **沙箱跳过面 +1**（见下，唯一一处扫描面变窄） |
+| 4 | 两处注入桩（ESM 脚本 + `exit 70`/写 result.json） | **换注入点且加强**：改 posix `sh` 桩，并新增正向对照断言「桩确实跑过」（`stub-ran` 标记），老写法区分不了「桩没跑到」与「桩跑了但没写」 |
+
+**唯一一处扫描面变窄**：`SANDBOX_SKIPPED_STEPS` 由 1 项（`安装依赖`）扩为 2 项（+`构建引擎`）。理由：构建步在沙箱里不再真跑（`beforeAll` 已真跑一次、`engineInto` 复制同一份），否则 133 条用例各建一次引擎。补偿只在 `tests/engine-wiring.test.mjs` 的单条顺序用例。
+
+#### 13.7.4 workflow 层顺序与「删步」对抗
+
+真仓 `audit.yml` 的实际顺序：`node`（setup-node）→ `安装依赖` → `setup-go`（`actions/setup-go@v5`, `go-version "1.22"`）→ `构建引擎`（`npm run build:engine`）→ `口径层判定`（`./.cache/bin/engine audit-findings …`）。构建步与 setup-go 都在判定步之前，顺序正确。
+
+| 组 | 变异 | 结果 |
+| -- | ---- | ---- |
+| D1 | 删掉「构建引擎」步 | `tests/engine-wiring.test.mjs` **1 failed / 10 passed**；`tests/audit-findings.test.mjs` **204 passed（不红）** |
+| D2 | 删掉 `setup-go` 步 | `tests/engine-wiring.test.mjs` **1 failed / 10 passed** |
+
+`tests/engine-wiring.test.mjs` 的 workflow 名单仍 `.sort()).toEqual([...5 项])` 精确相等，没有放宽成包含；本次只是 +1 元素（`audit.yml`）。
+
+#### 13.7.5 还没被钉住的面（低危、不阻塞、本轮不改）
+
+1. **单跑 `tests/audit-findings.test.mjs` 看不见构建前置**：删掉「构建引擎」步它仍 204 passed（D1 实测），这个面只由 `tests/engine-wiring.test.mjs` 那一条顺序用例兜。谁把那一条的断言挪走，`audit.yml` 的构建前置就会静默消失。
+2. **步名与沙箱跳过集合字符串耦合**：`SANDBOX_SKIPPED_STEPS` 认的是步名 `构建引擎`，改名后沙箱会去真跑构建（慢，但不红）。顺序判据按 `run: npm run build:engine` 的内容与位置判，这点是够的。
+3. **`tests/engine-wiring.test.mjs` 的 it 标题仍写「恰好是三家」**，而列表已是 5 项。纯文案，不影响判定（本轮只记录，不改测试）。
+4. **sanction 只认 `.cache/bin/engine` 这一个字面路径**：将来改用绝对路径或 `sh -c` 包裹会被判成 unsanctioned 违规。方向安全（fail-closed），届时该改契约而不是改放行口径。
+5. **`vi` 在 `tests/audit-findings.test.mjs` 两侧都是 0 使用**（既有冗余，oxlint 未报，非本轮引入）。
+6. **`USAGE` 文案仍写 Node 载体名**（13.6 已登记，未变化）。
+
+验收方法学有一条值得固化：本轮探针**两次假绿**（B1 首版嵌套引号导致替换未落盘、B3 首版 `\n` 变成真换行导致 SyntaxError，两次都读到 204 passed）。规则因此定为「改后行必须与改前不同（grep 打印 + `cmp` 还原），否则不算变异」——与 13.5 的「判据没被变异咬过就不算判据」是同一条教训的两面。
+
+证据：`/tmp/p31d3-verify.md`（166 行，含逐组日志路径）、`/tmp/v4-check.log`、`/tmp/v4-mut-{A1..A4,B1..B3,D1,D2,E1}.log`。

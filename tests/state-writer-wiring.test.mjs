@@ -278,6 +278,70 @@ test("(e) 空 intent 文件进不了 record：validate 被跳过，verdict.json 
   expect(r.failed).toEqual([]);
 });
 
+
+// ---- §九 的缺口：PR 合并时 GitHub 由 PR body 的 Fixes #N 自动关单 ----
+// 关单是宿主事实驱动的写入，写者拦不住；意图层必须认它，否则标签停在 in-progress，
+// 而 G1 拿标签问转换表会得到「还能带到 done」= 把已关单当在途单放行。
+
+test("issues.closed + state:in-progress：产生意图 → 缺守卫证据被拒 → 在 issue 上留痕，标签不动、job 绿", () => {
+  const r = runWorkflow({
+    eventName: "issues",
+    event: issueEvent("closed", { labels: ["state:in-progress"], number: 85 }),
+    number: 85,
+  });
+  expect(r.outputs.intent.has_intent).toBe("1");
+  expect(r.intent).toMatchObject({
+    issue: 85,
+    to: "done",
+    actor_role: "ci",
+    labels: ["state:in-progress"],
+  });
+  // 关单拿不到守卫证据（守卫属于 PR 事件的 check run）：判定必须拒绝，并说清缺什么。
+  expect(r.outputs.validate.exit).toBe("1");
+  expect(r.ok("apply").skipped).toBe(true);
+  expect(r.edits).toEqual([]);
+  expect(r.comments).toHaveLength(1);
+  expect(r.comments[0]).toContain(
+    "issue comment 85 --body 状态未被修改：REJECTED E_GUARD_MISSING",
+  );
+  expect(r.comments[0]).toContain("in-progress → done 需要守卫证据：merge-gate");
+  expect(r.ok("record").status).toBe(0);
+  expect(r.failed).toEqual([]);
+});
+
+test("issues.closed + 已在终态 state:done：无意图，判定与留痕都不跑", () => {
+  const r = runWorkflow({
+    eventName: "issues",
+    event: issueEvent("closed", { labels: ["state:done"], number: 86 }),
+    number: 86,
+  });
+  expect(r.intentBytes).toBe(0);
+  expect(r.ok("intent").status).toBe(0);
+  expect(r.ok("intent").stderr).toContain("no-state-change issues.closed");
+  expect(r.outputs.intent.has_intent).toBe("0");
+  expect(r.ok("validate").skipped).toBe(true);
+  expect(r.ok("apply").skipped).toBe(true);
+  expect(r.ok("record").skipped).toBe(true);
+  expect(r.comments).toEqual([]);
+  expect(r.edits).toEqual([]);
+  expect(r.failed).toEqual([]);
+});
+
+test("issues.closed + 没有任何 state 标签：无意图（机器没管过的 issue，不凭空造一个起点）", () => {
+  const r = runWorkflow({
+    eventName: "issues",
+    event: issueEvent("closed", { labels: [], number: 87 }),
+    number: 87,
+  });
+  expect(r.intentBytes).toBe(0);
+  expect(r.outputs.intent.has_intent).toBe("0");
+  expect(r.ok("intent").stderr).toContain("no-state-change issues.closed");
+  expect(r.ok("validate").skipped).toBe(true);
+  expect(r.comments).toEqual([]);
+  expect(r.edits).toEqual([]);
+  expect(r.failed).toEqual([]);
+});
+
 test("(b) 有意图且合法（analyzing → accepted）：apply 用 intent 的 issue 改标签", () => {
   const r = runWorkflow({
     eventName: "issues",

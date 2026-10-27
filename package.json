@@ -10,15 +10,15 @@
     "check:state": "npm run --silent build:engine && ./.cache/bin/engine check-config",
     "check:go": "cd apps/api-go && test -z \"$(gofmt -l *.go)\" && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
     "check:engine": "cd apps/engine && test -z \"$(gofmt -l .)\" && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go vet ./... && go test ./...",
-    "check:web": "npm --prefix apps/web-vue run build && node scripts/copy-dist.mjs",
-    "cli": "node scripts/cli.mjs",
+    "check:web": "npm --prefix apps/web-vue run build && ./.cache/bin/engine copy-dist",
+    "cli": "./.cache/bin/engine cli",
     "format": "prettier --write .",
     "lint": "oxlint scripts tests",
     "test": "vitest run",
     "api": "cd apps/api-go && export GOPATH=\"$(cd ../.. && pwd)/.cache/go\" && export GOCACHE=\"${GOCACHE:-$(cd ../.. && pwd)/.cache/go-build}\" && go run .",
     "web:dev": "npm --prefix apps/web-vue run dev",
     "web:build": "npm --prefix apps/web-vue run build",
-    "web:dist": "node scripts/copy-dist.mjs"
+    "web:dist": "./.cache/bin/engine copy-dist"
   },
   "devDependencies": {
     "oxlint": "^0.16.0",

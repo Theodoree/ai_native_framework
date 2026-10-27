@@ -130,7 +130,15 @@ function prepare(spec) {
   const files = {
     event: JSON.stringify(event),
     pr: JSON.stringify({ number: pr, body, title: spec.prTitle ?? "t", ...(spec.omitPrHead ? {} : { head: { sha: head } }) }),
-    issue: JSON.stringify(spec.issue ?? { number: issue, labels: spec.labels ?? ["state:in-progress"] }),
+    // state 是可选字段：不给就整条不写进 JSON（「缺 state」本身就是要对照的输入形状），
+    // 给了就原样写进去 —— G1 用它判「这张单是不是已经关了」。
+    issue: JSON.stringify(
+      spec.issue ?? {
+        number: issue,
+        labels: spec.labels ?? ["state:in-progress"],
+        ...(spec.state === undefined ? {} : { state: spec.state }),
+      },
+    ),
     checks: JSON.stringify(spec.checks ?? greenChecks(head)),
     infra: JSON.stringify(spec.infra ?? []),
   };
@@ -186,6 +194,25 @@ gate({
 });
 gate({ name: "G1 真失败：没有状态标签", exit: 1, code: "E_NO_TRANSITION", labels: [] });
 gate({ name: "G1 真失败：已经是终态 done", exit: 1, code: "E_TERMINAL_STATE", labels: ["state:done"] });
+
+// ---- G1 issue.state：已关闭的单不能被判成在途（裁决 A）----
+// 这组夹具的存在理由：「已关闭就拒」是 Go 与 JS 各写一份的同一判据。
+// 夹具不带 state 时，两侧哪天只对一边生效（或两边都没生效），逐字节对照也看不见。
+gate({
+  name: "G1 真失败：issue 已关闭但标签还停在 in-progress",
+  exit: 1,
+  code: "E_ISSUE_CLOSED_IN_FLIGHT",
+  state: "closed",
+});
+gate({ name: "G1 通过：issue 未关闭 + in-progress（守卫不是恒拒）", exit: 0, code: "PASS 4/4", state: "open" });
+gate({ name: "G1 放行：issue 缺 state 字段时当作未关闭", exit: 0, code: "PASS 4/4" });
+gate({
+  name: "G1 真失败：issue 已关闭且标签已在终态（终态判定先于关闭判定）",
+  exit: 1,
+  code: "E_TERMINAL_STATE",
+  state: "closed",
+  labels: ["state:done"],
+});
 gate({ name: "G1 无法判定：未知状态", exit: 3, code: "E_UNKNOWN_STATE", labels: ["state:bogus"] });
 gate({
   name: "G1 无法判定：两个状态标签",

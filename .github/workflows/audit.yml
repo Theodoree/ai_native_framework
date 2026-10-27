@@ -118,6 +118,18 @@ jobs:
       - name: 安装依赖
         run: npm ci || npm install
 
+      - name: setup-go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      # 判定步执行的是编译产物（./.cache/bin/engine），所以产物必须由本 workflow 自己建：
+      # 少了这一步，决定「能不能合」的那一步会以 No such file or directory 失败 ——
+      # 那是管线故障，不是「判不了」，两者在 check-run.json 里必须分得开。
+      # 产物落 .cache/bin/engine（.cache/ 已忽略，不入库）；构建入口只有 package.json 的 build:engine。
+      - name: 构建引擎
+        run: npm run build:engine
+
       # 这一步永不失败：解不出 PR 上下文本身就是一种结论（判不了），
       # 而失败的 step 会让后面所有 step 被跳过、连 Check Run 都写不出去——
       # 于是同一个 sha 上上一轮的 success 原样留着，「这次判不了」退化成「上次判过了」。
@@ -257,7 +269,7 @@ jobs:
         if: steps.ctx.outputs.ok == '1'
         run: |
           set +e
-          node scripts/audit-findings.mjs --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json
+          ./.cache/bin/engine audit-findings --a .audit/review-a.json --b .audit/review-b.json --out .audit/result.json
           set -e
           node -e '
             const fs = require("node:fs");

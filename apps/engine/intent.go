@@ -156,6 +156,9 @@ type IntentRequest struct {
 	DefaultFlow         *Value
 	IssueLabelsFromHost *Value
 	GuardEvidence       *Value
+	// ClosedTargets 是「关单事件可以落到哪些终态」的映射（由声明算出，见 Config.ClosedTerminalTargets）。
+	// 传进来而不是在这里读磁盘：BuildIntent 是纯映射，读声明的活儿归调用方，两种方言才不会各自读一份。
+	ClosedTargets map[string][]string
 }
 
 // BuildIntent 复刻 buildIntent：返回 nil 表示「这个事件不需要动状态」。
@@ -232,6 +235,36 @@ func BuildIntent(request IntentRequest) (*Value, error) {
 		}
 		return build(issue.Get("number"), label.str[len("state:"):], request.ActorRole, eventLabels), nil
 	}
+	// 关单：PR 合并时 GitHub 由 PR body 的 Fixes #N 自动关单，这条路径写者拦不住也测不到，
+	// 只能在这里认下来（否则标签会停在 in-progress，而门还当它「能带到 done」）。
+	// 目标不在这里写死状态名，全部问声明：只接受由 ci 驱动、且唯一的终态后继。
+	// 关单拿不到守卫证据（守卫证据属于 PR 事件的 check run），所以带守卫的终态在这里
+	// 一定判不成 —— 那不是漏，是如实交出去让写者留一条痕（「关单了但状态没动，缺什么」）。
+	if request.EventName == "issues" && isStringValue(request.Action, "closed") {
+		// 拿不到标签、或一个 state 标签都没有：机器没管过这个 issue，不能凭空造一个起点。
+		if stateLabels == nil || stateLabels.Len() == 0 {
+			return nil, nil
+		}
+		// 两个 state 标签是形状坏掉了（判定器会判 E_STATE_LABEL_COUNT），但意图得先选一个起点，
+		// 选哪个都是替人猜：fail-closed，别把一条错的状态写进留痕。
+		if stateLabels.Len() > 1 {
+			return nil, fmt.Errorf("意图无法归一：关单事件上 issue 有 %d 个 state 标签（%s），无法确定起点状态",
+				stateLabels.Len(), jsJSON(stateLabels))
+		}
+		from := strings.TrimPrefix(jsDisplay(stateLabels.At(0)), "state:")
+		candidates := request.ClosedTargets[from]
+		switch len(candidates) {
+		case 0:
+			// 这个状态没有「关单即可落到的终态」（例如 triage 只有通向 analyzing 的路）：
+			// 关单在这里不代表任何一次转换 —— 留空，交给「放弃要由 owner 带评论裁决」那条路。
+			return nil, nil
+		case 1:
+			return build(issue.Get("number"), candidates[0], "ci", hostLabels), nil
+		default:
+			return nil, fmt.Errorf("意图无法归一：关单事件从 %s 出发有多个 ci 终态（%s），无法唯一确定目标",
+				from, jsJSON(issueRefsStrings(candidates)))
+		}
+	}
 	if request.EventName == "pull_request" {
 		to := ""
 		switch {
@@ -299,6 +332,15 @@ func isTrue(v *Value) bool {
 	return ok && value
 }
 
+// issueRefsStrings 把字符串切片包成 JSON 数组值，只为错误文案里能打印候选集。
+func issueRefsStrings(items []string) *Value {
+	values := make([]*Value, 0, len(items))
+	for _, item := range items {
+		values = append(values, String(item))
+	}
+	return Array(values...)
+}
+
 func mergeEntries(target, extra *Value) {
 	for _, key := range extra.Keys() {
 		target.Set(key, extra.Get(key))
@@ -341,6 +383,7 @@ func RunBuildIntent(argv []string, stdout, stderr io.Writer) int {
 	}
 
 	intent, buildErr := BuildIntent(IntentRequest{
+		ClosedTargets:       closedTerminalTargetsFromDeclaration(ConfigRel),
 		EventName:           eventName,
 		Action:              action,
 		Payload:             payload,
@@ -372,6 +415,17 @@ func RunBuildIntent(argv []string, stdout, stderr io.Writer) int {
 	}
 	stdout.Write(append(intent.EncodeIndent(2), '\n'))
 	return 0
+}
+
+// closedTerminalTargetsFromDeclaration 读声明算出关单目标映射。
+// 读不到声明时返回空映射（=「没有可落的终态」）：声明缺失是 check-config 的地盘，
+// 这里不另造一个失败面；判定器那边缺声明也会红。
+func closedTerminalTargetsFromDeclaration(path string) map[string][]string {
+	cfg, fail := LoadConfig(path)
+	if fail != nil {
+		return map[string][]string{}
+	}
+	return cfg.ClosedTerminalTargets()
 }
 
 // runResolveIssue 是只做解析的入口：只打印 issue 号，解不出就什么都不打印。

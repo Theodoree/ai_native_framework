@@ -32,6 +32,15 @@ jobs:
           node-version: 20
       - run: npm ci || npm install
 
+      # 汇入的判据与产出在 Go 引擎（apps/engine）里，Node 版脚本留作 parity 对照（tests 两侧同口径）。
+      # 构建入口只有一个：npm run build:engine → .cache/bin/engine（.cache/ 已忽略，产物不进仓库）。
+      # 这一步刻意不写 name：测试沙箱只跑「有 name 的步骤」，构建不该在沙箱里重跑。
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - run: npm run build:engine
+
       # 上一次的产物：清单用来按 path + sha256 去重（并继承进本次产物累积），INFRA 记录用来重试失败路径。
       # 基准只能来自「别的 run」：本 run 自己（attempt 2 的 rerun）已经写过同名 artifact，
       # 从它取等于从未来取——拿不到就被当成首次汇入，同一个合并于是被汇入两次。
@@ -77,7 +86,7 @@ jobs:
           # 而不是按空清单去重、把同一份内容再汇入一遍。
           REQUIRE=""
           if [ "${BASE:-none}" != "none" ]; then REQUIRE="--require-existing"; fi
-          node scripts/kb-export.mjs \
+          ./.cache/bin/engine kb-export \
             --repo "$GITHUB_REPOSITORY" \
             --ref "${{ github.ref_name }}" \
             --from "${{ github.event.before }}" \

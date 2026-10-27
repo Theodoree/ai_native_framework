@@ -176,6 +176,28 @@ const issueClosed = JSON.stringify({
   issue: { number: 7, labels: [] },
   sender: { login: 'alice' },
 });
+// §九：PR 合并时 GitHub 由 Fixes #N 自动关单，写者拦不住 —— 意图层必须认 issues.closed。
+// 这四条钉的是「关单按当前标签咨询终态」在两种方言里逐字节一致。
+const issueClosedInProgress = JSON.stringify({
+  action: 'closed',
+  issue: { number: 7, labels: ['state:in-progress'], author_association: 'OWNER' },
+  sender: { login: 'alice' },
+});
+const issueClosedDone = JSON.stringify({
+  action: 'closed',
+  issue: { number: 7, labels: [{ name: 'state:done' }] },
+  sender: { login: 'alice' },
+});
+const issueClosedAccepted = JSON.stringify({
+  action: 'closed',
+  issue: { number: 7, labels: ['state:accepted'] },
+  sender: { login: 'alice' },
+});
+const issueClosedTwoStateLabels = JSON.stringify({
+  action: 'closed',
+  issue: { number: 7, labels: ['state:in-progress', 'state:blocked'] },
+  sender: { login: 'alice' },
+});
 const prOpened = JSON.stringify({
   action: 'opened',
   pull_request: { number: 3, body: 'Fixes #12', labels: [{ name: 'state:triage' }], author_association: 'OWNER' },
@@ -252,6 +274,24 @@ const buildIntentCases = [
     name: 'issues.closed → 无意图',
     env: { EVENT_NAME: 'issues', EVENT: issueClosed },
     githubOutput: true,
+  },
+  {
+    name: 'issues.closed + state:in-progress → 目标 done（ci），缺守卫证据交给判定器',
+    env: { EVENT_NAME: 'issues', EVENT: issueClosedInProgress },
+    githubOutput: true,
+    stdoutContains: ['"to": "done"', '"actor_role": "ci"', '"labels": [\n    "state:in-progress"\n  ]'],
+  },
+  {
+    name: 'issues.closed 已在终态 state:done → 无意图',
+    env: { EVENT_NAME: 'issues', EVENT: issueClosedDone },
+    githubOutput: true,
+    expectGithubOutput: 'has_intent=0\n',
+  },
+  {
+    name: 'issues.closed + state:accepted → 无意图（终态要 owner 裁决，不由关单自动落）',
+    env: { EVENT_NAME: 'issues', EVENT: issueClosedAccepted },
+    githubOutput: true,
+    expectGithubOutput: 'has_intent=0\n',
   },
   {
     name: 'pull_request opened 无宿主标签 → issue-state-unavailable',
@@ -585,6 +625,16 @@ const KNOWN_DIVERGENCES = [
     jsContains: 'TypeError',
     goPrefix: 'build-intent 失败: 意图无法归一：labels 必须是数组',
     reason: '.map is not a function 的 TypeError + stack trace；Go 一行错误；退出码一致。',
+  },
+  {
+    // 关单上两个 state 标签是形状坏掉了：两侧都 fail-closed，但 Node 抛未捕获 Error 打 stack trace，
+    // Go 只给一行可读错误 —— 与上面三条同类，只钉前缀 + 退出码。
+    name: 'build-intent：关单上两个 state 标签',
+    side: 'build-intent',
+    env: { EVENT_NAME: 'issues', EVENT: issueClosedTwoStateLabels },
+    jsContains: '意图无法归一：关单事件上 issue 有 2 个 state 标签',
+    goPrefix: 'build-intent 失败: 意图无法归一：关单事件上 issue 有 2 个 state 标签',
+    reason: 'Node 抛未捕获 Error 并打整段 stack trace，Go 给一行可读错误；退出码一致。',
   },
   {
     name: 'last-change：--out 目录不存在',
