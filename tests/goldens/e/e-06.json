@@ -1,0 +1,20 @@
+{
+  "suite": "e",
+  "id": "e-06",
+  "title": "kb-export · --help",
+  "argv": [
+    "kb-export",
+    "--help"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "kb-export — 从 commit 区间算出知识库汇入清单\n\n用法：\n  node scripts/kb-export.mjs --repo owner/name [--ref main] \\\n    (--from <sha> --to <sha> | --range <from>..<to>) [选项]\n\n选项：\n  --repo <owner/name>    source_repo（缺省取 GITHUB_REPOSITORY）\n  --ref <name>           source_ref（缺省 main）\n  --cwd <dir>            跑 git 的仓库根（缺省当前目录）\n  --updated-at <ISO8601> 覆盖 updated_at（缺省取 to 的 commit 时间，绝不取 now()）\n  --existing <file>      上一次的清单：按 path + sha256 去重，并继承进本次产物（累积清单）\n  --require-existing     给了 --existing 就必须读得到：读不到记 INFRA，不静默按空清单去重\n  --retry <file>         上一次的 INFRA 记录：把其中失败的路径按当前快照重算\n  --out <file>           清单落盘（缺省 stdout）\n  --infra-out <file>     INFRA 记录落盘\n\n退出码：0 完整 / 2 用法 / 3 INFRA\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

@@ -1,0 +1,30 @@
+{
+  "suite": "d",
+  "id": "d-03",
+  "title": "两侧结论与 severity 不一致",
+  "argv": [
+    "audit-findings",
+    "--a",
+    "disagree-a.json",
+    "--b",
+    "disagree-b.json",
+    "--out",
+    "result.json"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "audit-findings a=disagree-a.json b=disagree-b.json\naudit-findings executor a 申报=\"needs_revision\" 计入=needs_revision schema=ok findings=1 evidence=github/review-a/\"deepseek-chat\"/\"req-1\"\naudit-findings executor b 申报=\"needs_revision\" 计入=needs_revision schema=ok findings=2 evidence=sandbox/review-b/\"deepseek-reasoner\"/\"req-2\"\naudit-findings compare agreed=0 onlyA=0 onlyB=1 severityMismatch=1 同步率=0.00\naudit-findings onlyB scripts/y.mjs :3 low 命名\naudit-findings severityMismatch scripts/x.mjs :12 ? a=high b=blocker 必须校验输入\naudit-findings verdict=needs_revision conclusion=failure exit=1\n",
+  "stderr": "",
+  "files": [
+    {
+      "path": "result.json",
+      "text": "{\n  \"verdict\": \"needs_revision\",\n  \"conclusion\": \"failure\",\n  \"exit_code\": 1,\n  \"exit\": 1,\n  \"executors\": [\n    {\n      \"slot\": \"a\",\n      \"declared\": \"needs_revision\",\n      \"effective\": \"needs_revision\",\n      \"valid\": true,\n      \"errors\": [],\n      \"reason\": null,\n      \"evidence\": {\n        \"executor\": \"github\",\n        \"agent\": \"review-a\",\n        \"model\": \"deepseek-chat\",\n        \"request_id\": \"req-1\"\n      },\n      \"findings\": [\n        {\n          \"path\": \"scripts/x.mjs\",\n          \"line\": 12,\n          \"severity\": \"high\",\n          \"criterion\": \"必须校验输入\",\n          \"suggestion\": \"加校验\"\n        }\n      ]\n    },\n    {\n      \"slot\": \"b\",\n      \"declared\": \"needs_revision\",\n      \"effective\": \"needs_revision\",\n      \"valid\": true,\n      \"errors\": [],\n      \"reason\": null,\n      \"evidence\": {\n        \"executor\": \"sandbox\",\n        \"agent\": \"review-b\",\n        \"model\": \"deepseek-reasoner\",\n        \"request_id\": \"req-2\"\n      },\n      \"findings\": [\n        {\n          \"path\": \"scripts/x.mjs\",\n          \"line\": 12,\n          \"severity\": \"blocker\",\n          \"criterion\": \"必须校验输入\",\n          \"suggestion\": \"加校验\"\n        },\n        {\n          \"path\": \"scripts/y.mjs\",\n          \"line\": 3,\n          \"severity\": \"low\",\n          \"criterion\": \"命名\",\n          \"suggestion\": \"改名\"\n        }\n      ]\n    }\n  ],\n  \"comparison\": {\n    \"agreed\": [],\n    \"onlyA\": [],\n    \"onlyB\": [\n      {\n        \"path\": \"scripts/y.mjs\",\n        \"line\": 3,\n        \"severity\": \"low\",\n        \"criterion\": \"命名\",\n        \"suggestion\": \"改名\"\n      }\n    ],\n    \"severityMismatch\": [\n      {\n        \"path\": \"scripts/x.mjs\",\n        \"line\": 12,\n        \"criterion\": \"必须校验输入\",\n        \"severityA\": \"high\",\n        \"severityB\": \"blocker\"\n      }\n    ],\n    \"counts\": {\n      \"agreed\": 0,\n      \"onlyA\": 0,\n      \"onlyB\": 1,\n      \"severityMismatch\": 1\n    },\n    \"agreementRate\": 0\n  },\n  \"reason\": null\n}\n"
+    }
+  ],
+  "requests": []
+}

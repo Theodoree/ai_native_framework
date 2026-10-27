@@ -1,0 +1,28 @@
+{
+  "suite": "d",
+  "id": "d-24",
+  "title": "dry-run 只打印命令，不发 run",
+  "argv": [
+    "audit-collect",
+    "--pr",
+    "7",
+    "--a",
+    "a.json",
+    "--b",
+    "b.json",
+    "--dry-run"
+  ],
+  "env": {
+    "FAKE_DIR": "<ROOT>"
+  },
+  "envSig": {
+    "text": "FAKE_DIR=<ROOT>",
+    "sig": "a80f65f05805"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "[dry-run] 只打印，未发起 workflow：PR #7 sha=abc123\nPR #7 sha=abc123 ref=feat/x state=\"OPEN\"\n预检通过：a=pass b=pass（结论仍由 workflow 产出）\n目标 sha: abc123\n将执行（未发送）: gh workflow run audit.yml --ref feat/x -f pr=7 -f findings_a={\"verdict\":\"pass\",\"findings\":[],\"evidence\":{\"executor\":\"github\",\"agent\":\"review-a\",\"model\":\"deepseek-chat\",\"request_id\":\"req-1\"}} -f findings_b={\"verdict\":\"pass\",\"findings\":[],\"evidence\":{\"executor\":\"sandbox\",\"agent\":\"review-b\",\"model\":\"deepseek-reasoner\",\"request_id\":\"req-2\"}}\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

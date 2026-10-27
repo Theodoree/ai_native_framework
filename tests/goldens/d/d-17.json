@@ -1,0 +1,20 @@
+{
+  "suite": "d",
+  "id": "d-17",
+  "title": "真源文件不存在",
+  "argv": [
+    "routing",
+    "--check"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "读不到路由声明: .agents/platform/routing.yml\nrouting FAIL 1 个问题（.agents/platform/routing.yml）\n",
+  "files": [],
+  "requests": []
+}

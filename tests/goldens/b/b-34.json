@@ -1,0 +1,25 @@
+{
+  "suite": "b",
+  "id": "b-34",
+  "title": "last-change · 缺 BASE → 报错",
+  "argv": [
+    "last-change"
+  ],
+  "env": {
+    "PATH": "<ROOT>/bin:<PATH>",
+    "HOME": "<HOME>",
+    "EVENT_NAME": "pull_request",
+    "EVENT": "{\"pull_request\":{\"number\":9,\"title\":\"加个门牌\",\"body\":\"Fixes #4\",\"user\":{\"login\":\"alice\"},\"requested_reviewers\":[{\"login\":\"bob\"},\"carol\"],\"merged\":true,\"merged_by\":{\"login\":\"dan\"},\"merged_at\":\"2024-05-06T07:08:09Z\"}}",
+    "HEAD": "5d8719f6c1e1e9f2831f4bb56360157de4568bb5"
+  },
+  "envSig": {
+    "text": "EVENT={\"pull_request\":{\"number\":9,\"title\":\"加个门牌\",\"body\":\"Fixes #4\",\"user\":{\"login\":\"alice\"},\"requested_reviewers\":[{\"login\":\"bob\"},\"carol\"],\"merged\":true,\"merged_by\":{\"login\":\"dan\"},\"merged_at\":\"2024-05-06T07:08:09Z\"}}\nEVENT_NAME=pull_request\nHEAD=5d8719f6c1e1e9f2831f4bb56360157de4568bb5\nHOME=<HOME>\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "9979544c98d6"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "门牌重算失败：门牌缺 git 区间的 base：算不出来就不写\n",
+  "files": [],
+  "requests": []
+}

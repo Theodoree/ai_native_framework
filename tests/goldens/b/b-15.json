@@ -1,0 +1,31 @@
+{
+  "suite": "b",
+  "id": "b-15",
+  "title": "build-intent · pull_request closed 合并 + 宿主标签 + 守卫证据",
+  "argv": [
+    "build-intent"
+  ],
+  "env": {
+    "EVENT_NAME": "pull_request",
+    "EVENT": "{\"action\":\"closed\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:in-progress\"}],\"merged\":true,\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}",
+    "ISSUE_STATE_FILE": "issue-state.json",
+    "GUARD_EVIDENCE_FILE": "guards.json",
+    "GITHUB_OUTPUT": "<ROOT>/gh.txt",
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "EVENT={\"action\":\"closed\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:in-progress\"}],\"merged\":true,\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}\nEVENT_NAME=pull_request\nGITHUB_OUTPUT=<ROOT>/gh.txt\nGUARD_EVIDENCE_FILE=guards.json\nISSUE_STATE_FILE=issue-state.json\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "bc22b85be4c0"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "{\n  \"issue\": 12,\n  \"to\": \"done\",\n  \"actor\": \"ci\",\n  \"actor_role\": \"ci\",\n  \"labels\": [\n    \"state:in-progress\",\n    \"state:done\",\n    \"bug\"\n  ],\n  \"comment\": \"\",\n  \"guards\": {\n    \"tests\": \"ci/test: success\",\n    \"review\": \"approved\"\n  }\n}\n",
+  "stderr": "",
+  "files": [
+    {
+      "path": "gh.txt",
+      "text": "has_intent=1\n"
+    }
+  ],
+  "requests": []
+}

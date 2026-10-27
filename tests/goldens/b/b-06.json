@@ -1,0 +1,29 @@
+{
+  "suite": "b",
+  "id": "b-06",
+  "title": "build-intent · issues.labeled 本次加的就是唯一 state 标签 → 无意图",
+  "argv": [
+    "build-intent"
+  ],
+  "env": {
+    "EVENT_NAME": "issues",
+    "EVENT": "{\"action\":\"labeled\",\"issue\":{\"number\":7,\"labels\":[\"state:done\"]},\"label\":{\"name\":\"state:done\"},\"sender\":{\"login\":\"bob\"}}",
+    "GITHUB_OUTPUT": "<ROOT>/gh.txt",
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "EVENT={\"action\":\"labeled\",\"issue\":{\"number\":7,\"labels\":[\"state:done\"]},\"label\":{\"name\":\"state:done\"},\"sender\":{\"login\":\"bob\"}}\nEVENT_NAME=issues\nGITHUB_OUTPUT=<ROOT>/gh.txt\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "3d774e3d8ed2"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "",
+  "stderr": "no-state-change issues.labeled — 该事件不需要改动 issue 状态，跳过判定与留痕\n",
+  "files": [
+    {
+      "path": "gh.txt",
+      "text": "has_intent=0\n"
+    }
+  ],
+  "requests": []
+}

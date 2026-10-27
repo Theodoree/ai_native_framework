@@ -1,0 +1,32 @@
+{
+  "suite": "d",
+  "id": "d-34",
+  "title": "没有 DEEPSEEK_API_KEY -> INFRA",
+  "argv": [
+    "audit-review",
+    "--slot",
+    "review-a",
+    "--diff",
+    "diff.txt",
+    "--out",
+    "out/record.json"
+  ],
+  "env": {
+    "DEEPSEEK_API_KEY": ""
+  },
+  "envSig": {
+    "text": "DEEPSEEK_API_KEY=",
+    "sig": "f01d38743329"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "audit-review slot=review-a verdict=INFRA findings=0 exit=3 out=<ROOT>/out/record.json\n",
+  "stderr": "audit-review 没有 DEEPSEEK_API_KEY：判不了，不是通过\n",
+  "files": [
+    {
+      "path": "out/record.json",
+      "text": "{\n  \"verdict\": \"INFRA\",\n  \"findings\": [],\n  \"evidence\": {\n    \"executor\": \"github\",\n    \"agent\": \"review-a\",\n    \"model\": \"deepseek-chat\"\n  },\n  \"reason\": \"没有 DEEPSEEK_API_KEY：判不了，不是通过\"\n}\n"
+    }
+  ],
+  "requests": []
+}

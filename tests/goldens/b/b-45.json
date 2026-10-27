@@ -1,0 +1,23 @@
+{
+  "suite": "b",
+  "id": "b-45",
+  "title": "writer-record · 未知判定结果 → 报错",
+  "argv": [
+    "writer-record",
+    "--issue",
+    "7"
+  ],
+  "env": {
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "PATH=<ROOT>/bin:<PATH>",
+    "sig": "ede8454483fb"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "留痕失败: 未知判定结果: {\"verdict\":\"weird\",\"code\":\"c\"}\n",
+  "files": [],
+  "requests": []
+}

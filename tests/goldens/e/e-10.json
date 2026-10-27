@@ -1,0 +1,22 @@
+{
+  "suite": "e",
+  "id": "e-10",
+  "title": "kb-export · 取值参数缺值 -> 报错",
+  "argv": [
+    "kb-export",
+    "--cwd",
+    "<REPO>",
+    "--repo"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 2,
+  "stdout": "",
+  "stderr": "kb-export: --repo 缺值\n",
+  "files": [],
+  "requests": []
+}

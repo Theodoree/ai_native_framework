@@ -1,0 +1,29 @@
+{
+  "suite": "b",
+  "id": "b-04",
+  "title": "build-intent · issues.opened 已带 state 标签 → 无意图",
+  "argv": [
+    "build-intent"
+  ],
+  "env": {
+    "EVENT_NAME": "issues",
+    "EVENT": "{\"action\":\"opened\",\"issue\":{\"number\":7,\"labels\":[\"state:triage\"],\"author_association\":\"CONTRIBUTOR\"},\"sender\":{\"login\":\"alice\"}}",
+    "GITHUB_OUTPUT": "<ROOT>/gh.txt",
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "EVENT={\"action\":\"opened\",\"issue\":{\"number\":7,\"labels\":[\"state:triage\"],\"author_association\":\"CONTRIBUTOR\"},\"sender\":{\"login\":\"alice\"}}\nEVENT_NAME=issues\nGITHUB_OUTPUT=<ROOT>/gh.txt\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "1f86387e09e2"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "",
+  "stderr": "no-state-change issues.opened — 该事件不需要改动 issue 状态，跳过判定与留痕\n",
+  "files": [
+    {
+      "path": "gh.txt",
+      "text": "has_intent=0\n"
+    }
+  ],
+  "requests": []
+}

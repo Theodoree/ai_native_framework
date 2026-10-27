@@ -1,0 +1,34 @@
+{
+  "suite": "d",
+  "id": "d-48",
+  "title": "连不上上游（网络栈文案已登记为例外）",
+  "argv": [
+    "audit-review",
+    "--slot",
+    "review-a",
+    "--diff",
+    "diff.txt",
+    "--out",
+    "out/record.json",
+    "--api-base",
+    "http://127.0.0.1:9"
+  ],
+  "env": {
+    "DEEPSEEK_API_KEY": "stub-key-123"
+  },
+  "envSig": {
+    "text": "DEEPSEEK_API_KEY=stub-key-123",
+    "sig": "d138feef27ff"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "audit-review slot=review-a verdict=INFRA findings=0 exit=3 out=<ROOT>/out/record.json\n",
+  "stderr": "audit-review 调用上游失败（没拿到响应）：<DETAIL>",
+  "files": [
+    {
+      "path": "out/record.json",
+      "text": "{\n  \"verdict\": \"INFRA\",\n  \"findings\": [],\n  \"evidence\": {\n    \"executor\": \"github\",\n    \"agent\": \"review-a\",\n    \"model\": \"deepseek-chat\"\n  },\n  \"reason\": \"调用上游失败（没拿到响应）：<DETAIL>"
+    }
+  ],
+  "requests": []
+}

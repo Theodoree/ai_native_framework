@@ -1,0 +1,25 @@
+{
+  "suite": "b",
+  "id": "b-49",
+  "title": "writer-record · 判定是 null → 未知判定结果",
+  "argv": [
+    "writer-record",
+    "--verdict",
+    "null.json",
+    "--issue",
+    "7"
+  ],
+  "env": {
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "PATH=<ROOT>/bin:<PATH>",
+    "sig": "ede8454483fb"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "留痕失败: 未知判定结果: null\n",
+  "files": [],
+  "requests": []
+}

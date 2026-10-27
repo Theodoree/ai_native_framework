@@ -1,0 +1,28 @@
+{
+  "suite": "d",
+  "id": "d-27",
+  "title": "conclusion 是 action_required -> 判不了",
+  "argv": [
+    "audit-collect",
+    "--pr",
+    "7",
+    "--a",
+    "a.json",
+    "--b",
+    "b.json",
+    "--json"
+  ],
+  "env": {
+    "FAKE_DIR": "<ROOT>"
+  },
+  "envSig": {
+    "text": "FAKE_DIR=<ROOT>",
+    "sig": "a80f65f05805"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "{\"pr\":7,\"sha\":\"abc123\",\"ref\":\"feat/x\",\"runId\":77,\"checkRunId\":12,\"conclusion\":\"action_required\",\"title\":\"判不了\",\"exitCode\":3}\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

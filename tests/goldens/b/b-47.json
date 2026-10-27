@@ -1,0 +1,22 @@
+{
+  "suite": "b",
+  "id": "b-47",
+  "title": "writer-record · --verdict 缺值 → 报错",
+  "argv": [
+    "writer-record",
+    "--verdict"
+  ],
+  "env": {
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "PATH=<ROOT>/bin:<PATH>",
+    "sig": "ede8454483fb"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "读不到判定结果: The \"path\" argument must be of type string or an instance of Buffer or URL. Received undefined\n",
+  "files": [],
+  "requests": []
+}

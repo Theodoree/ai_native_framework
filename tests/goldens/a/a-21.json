@@ -1,0 +1,24 @@
+{
+  "suite": "a",
+  "id": "a-21",
+  "title": "guards 形状错（数组）先于意图错",
+  "argv": [
+    "validate",
+    "--json",
+    "--intent",
+    "-"
+  ],
+  "env": {
+    "PLATFORM_LEDGER": "<ROOT>/ledger.jsonl"
+  },
+  "envSig": {
+    "text": "PLATFORM_LEDGER=<ROOT>/ledger.jsonl",
+    "sig": "591ff6170828"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "{\"verdict\":\"infra\",\"code\":\"E_GUARD_SHAPE\",\"message\":\"意图的 guards 必须是对象（{ \\\"<guard 名>\\\": \\\"<证据>\\\" }），实际是 数组\"}\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

@@ -1,0 +1,38 @@
+{
+  "suite": "e",
+  "id": "e-19",
+  "title": "cli · verdict 带两条守卫",
+  "argv": [
+    "cli",
+    "verdict",
+    "--id",
+    "issue-1",
+    "--to",
+    "in_progress",
+    "--guard",
+    "review=PR#12 approved",
+    "--guard",
+    "tests=vitest 全绿",
+    "--comment",
+    "开始做",
+    "--api",
+    "http://127.0.0.1:<PORT>"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "issue-1: todo -> in_progress（by owner）\n",
+  "stderr": "",
+  "files": [],
+  "requests": [
+    {
+      "method": "POST",
+      "url": "/api/verdict",
+      "body": "{\"id\":\"issue-1\",\"to\":\"in_progress\",\"actor_role\":\"owner\",\"comment\":\"开始做\",\"guards\":{\"review\":\"PR#12 approved\",\"tests\":\"vitest 全绿\"}}"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "suite": "e",
+  "id": "e-09",
+  "title": "kb-export · 多余的位置参数 -> 报错",
+  "argv": [
+    "kb-export",
+    "--cwd",
+    "<REPO>",
+    "--repo",
+    "owner/name",
+    "--from",
+    "e5795f9b923c93fc582bd01deb33023f603e4aa5",
+    "--to",
+    "f9c87d996af6b5ec555526b0a36e10bd2b3feb12",
+    "stray"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 2,
+  "stdout": "",
+  "stderr": "kb-export: 多余的参数: stray\n",
+  "files": [],
+  "requests": []
+}

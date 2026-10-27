@@ -1,0 +1,20 @@
+{
+  "suite": "d",
+  "id": "d-18",
+  "title": "真源不是合法 YAML（解析器文案已登记为例外）",
+  "argv": [
+    "routing",
+    "--check"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "路由声明不是合法 YAML: .agents/platform/routing.yml: <DETAIL>",
+  "files": [],
+  "requests": []
+}

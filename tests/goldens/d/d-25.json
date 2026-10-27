@@ -1,0 +1,28 @@
+{
+  "suite": "d",
+  "id": "d-25",
+  "title": "全 pass -> 结论 success",
+  "argv": [
+    "audit-collect",
+    "--pr",
+    "7",
+    "--a",
+    "a.json",
+    "--b",
+    "b.json",
+    "--json"
+  ],
+  "env": {
+    "FAKE_DIR": "<ROOT>"
+  },
+  "envSig": {
+    "text": "FAKE_DIR=<ROOT>",
+    "sig": "a80f65f05805"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "{\"pr\":7,\"sha\":\"abc123\",\"ref\":\"feat/x\",\"runId\":77,\"checkRunId\":12,\"conclusion\":\"success\",\"title\":\"审计通过\",\"exitCode\":0}\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}
