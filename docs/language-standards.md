@@ -9,17 +9,17 @@
 ## 一、Go
 
 - **格式化**：`gofmt`（官方内置，Go 语言强制标准）
-- **Lint**：`golangci-lint`（社区事实标准，19k★）
+- **Lint**：`go vet`（官方内置）。`golangci-lint`（社区事实标准）本仓未引入，需要时由产物侧自行添加并在 `docs/development.md` 回填
 - **测试**：`go test`（官方内置，`go test ./...`）
 - **Agent 初始化**：
   ```bash
-  gofmt -l .           # 检查未格式化文件
-  golangci-lint run    # 跑 lint（自动检测配置，首次可 --init 生成 .golangci.yml）
+  gofmt -l $(find . -name '*.go' -not -path './.cache/*')   # 检查未格式化文件（排除构建缓存）
+  go vet ./...         # 跑 lint
   go test ./...        # 跑测试
   ```
 - **CI 检查**：
   ```bash
-  test -z "$(gofmt -l .)" && golangci-lint run && go test ./...
+  test -z "$(gofmt -l $(find . -name '*.go' -not -path './.cache/*'))" && go vet ./... && go test ./...
   ```
 
 ## 二、Rust
