@@ -27,14 +27,39 @@ type Store interface {
 	Requirement(id string) (*Requirement, error)
 	Requirements() ([]*Requirement, error)
 
-	// 角色是 project 级的：谁有权按这个 project 的节点，由角色的权力决定。
-	// 找不到必须报错，不能返回空 Role + nil——空角色在闸门上会被当成「有角色但没权力」，
-	// 与「这个口令不认识」是两种拒绝，混起来就没人能说清为什么被挡。
-	SaveRole(r Role) error
+	// 账号：密码只存哈希。UserByName 是登录的唯一入口；CountUsers 只给「第一个注册的人是管理员」用。
+	SaveUser(User) error
+	User(id string) (*User, error)
+	UserByName(username string) (*User, error)
+	Users() ([]User, error)
+	CountUsers() (int, error)
+
+	// 会话：库里只存 token 的 sha256。找不到就报错，不返回空会话。
+	SaveSession(Session) error
+	Session(tokenHash string) (*Session, error)
+	DeleteSession(tokenHash string) error
+
+	// API 密钥：库里只存 sha256，原文只在创建那一次交给调用方。
+	SaveAPIKey(APIKey) error
+	APIKeys(userID string) ([]APIKey, error)
+	APIKeyByHash(keyHash string) (*APIKey, error)
+	DeleteAPIKey(id string) error
+	TouchAPIKey(id string, at time.Time) error
+
+	// 角色是 project 级的：它只持有权力，不再持有口令。
+	// 找不到必须报错，不能返回空 Role + nil——空角色在闸门上会被当成「有角色但没权力」。
+	SaveRole(Role) error
 	Role(id string) (Role, error)
 	Roles(projectKey string) ([]Role, error)
 	DeleteRole(id string) error
-	RoleByToken(token string) (Role, error)
+
+	// 授予：某人 / 某项目 / 某角色。删角色时要连授予一起清掉。
+	SaveAssignment(Assignment) error
+	Assignments(projectKey string) ([]Assignment, error)
+	AssignmentsForUser(projectKey, userID string) ([]Assignment, error)
+	AssignmentsOfUser(userID string) ([]Assignment, error)
+	DeleteAssignment(projectKey, roleID, userID string) error
+	DeleteAssignmentsOfRole(roleID string) error
 
 	// AppendEvent 只追加，不改不删：事件流是历史，不是快照。
 	AppendEvent(Event) error

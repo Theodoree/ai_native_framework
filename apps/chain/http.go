@@ -18,20 +18,13 @@ import (
 
 // Server 只做三件事：校验输入、调状态机、把结果落盘。它自己不下结论。
 type Server struct {
-	store      Store
-	exec       Executor
-	now        func() time.Time
-	adminToken string
+	store Store
+	exec  Executor
+	now   func() time.Time
 }
 
 func NewServer(s Store, e Executor) *Server {
 	return &Server{store: s, exec: e, now: time.Now}
-}
-
-// WithAdminToken 打开接入层的「建 project」入口；不调用它就等于接入层关闭。
-func (s *Server) WithAdminToken(token string) *Server {
-	s.adminToken = strings.TrimSpace(token)
-	return s
 }
 
 // routeEntry 是路由表里的一行。它既是 gin 的注册，也是 405 的 Allow 头与「子树补斜杠」
@@ -61,6 +54,8 @@ func (s *Server) Handler() http.Handler {
 	// ServeMux 先清洗路径再匹配，gin 不洗（请求路径原样进路由树）：
 	// 这一步把顺序对齐，否则 "//api/projects" 会从 307 退化成 404。
 	e.Use(r.cleanPathRedirect)
+	// 身份闸门：/api/** 除注册与登录外一律要有身份（whoIs 是唯一解析点）。
+	e.Use(s.requireLogin)
 	s.mount(r)
 	e.NoMethod(r.methodNotAllowed)
 	e.NoRoute(r.notFound)
@@ -89,6 +84,23 @@ func (s *Server) mount(r *ginRouter) {
 
 	handle("GET", "/", s.index)
 	handle("GET", "/assets/*filepath", s.assets)
+	// 账号与会话。signup 与 login 不要求登录（identity 闸门里放行这两条）。
+	handle("POST", "/api/signup", s.signup)
+	handle("POST", "/api/login", s.login)
+	handle("POST", "/api/logout", s.logout)
+	handle("GET", "/api/me", s.meHandler)
+	handle("PUT", "/api/me/password", s.changeOwnPassword)
+
+	// 账号管理：管理员。
+	handle("GET", "/api/users", s.listUsers)
+	handle("POST", "/api/users", s.createUser)
+	handle("POST", "/api/users/:id/password", s.resetPassword)
+
+	// API 密钥：自己的，不能替别人建也不能吊销别人的。
+	handle("GET", "/api/keys", s.listKeys)
+	handle("POST", "/api/keys", s.createKey)
+	handle("DELETE", "/api/keys/:id", s.deleteKey)
+
 	handle("GET", "/api/projects", s.listProjects)
 	handle("POST", "/api/projects", s.createProject)
 	handle("GET", "/api/requirements", s.listRequirements)
@@ -100,15 +112,15 @@ func (s *Server) mount(r *ginRouter) {
 	handle("POST", "/api/requirements/:id/nodes/:node/comment", s.nodeComment)
 	handle("POST", "/api/requirements/:id/nodes/:node/rules", s.nodeRule)
 
-	// 角色管理走 project 管理口令，不走角色权力：否则有权力的人能给自己发角色。
-	handle("POST", "/api/p/:project/roles", s.createRole)
+	// 角色与授予：管理员。角色属于项目、没有口令；做事的权力来自被授予的角色。
 	handle("GET", "/api/p/:project/roles", s.listRoles)
-	handle("POST", "/api/p/:project/roles/:id/rotate", s.rotateRole)
+	handle("POST", "/api/p/:project/roles", s.createRole)
 	handle("DELETE", "/api/p/:project/roles/:id", s.deleteRole)
+	handle("GET", "/api/p/:project/roles/:id/members", s.listMembers)
+	handle("POST", "/api/p/:project/roles/:id/members", s.addMember)
+	handle("DELETE", "/api/p/:project/roles/:id/members/:username", s.removeMember)
 
-	// 接入层：给平台外的人用。只认 project 口令，不认人。
-	handle("POST", "/api/intake/projects", s.intakeCreateProject)
-	handle("GET", "/api/intake/projects", s.intakeListProjects)
+	// 接入层：给平台外的人用。认的是登录态或 API 密钥，且要是这个项目的成员。
 	handle("POST", "/api/intake/requirements", s.intakeCreateRequirement)
 	handle("GET", "/api/intake/requirements/:id", s.intakeGetRequirement)
 }
@@ -322,22 +334,10 @@ func (s *Server) createProject(c *gin.Context) {
 		}
 		p.Chains = in.Chains
 	}
-	// 先发钥匙再挂门牌：角色表没有外键，反过来「项目落库后建角色失败」要删项目，
-	// 而 Store 没有删 project 的口子，那就只能留下「项目有了但没人能按」的半截状态。
-	owner, err := s.issueOwnerRole(key)
-	if err != nil {
-		// 项目与它的 owner 角色同生共死：这一步没成，项目就不建。
-		fail(c, 500, "建项目失败：owner 角色没有落库："+err.Error())
-		return
-	}
 	if err := s.store.SaveProject(p); err != nil {
-		// 同生共死的另一半：项目写不进去，刚发的角色也不能留着占名字。
-		_ = s.store.DeleteRole(owner.ID)
 		fail(c, 500, err.Error())
 		return
 	}
-	// 口令只在这一次响应里出现；落库的 Project 没有它，列表接口也叫不出来。
-	p.OwnerToken = owner.Token
 	writeJSON(c, 201, p)
 }
 
@@ -422,16 +422,16 @@ func (s *Server) nodeRun(c *gin.Context) {
 	if !ok {
 		return
 	}
-	role, ok := s.requirePower(c, req, n)
-	if !ok {
+	if !s.requirePower(c, req, n) {
 		return
 	}
+	me := s.me(c)
 	from := n.State
 	if err := req.BeginRun(n.Key, s.now()); err != nil {
 		fail(c, 409, err.Error())
 		return
 	}
-	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, role.Name)
+	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, me.User.Username)
 	// 整条需求被拒时才回告：回告写在落库之后。
 	rejectWhole := ""
 	if IsContainer(n.Type) {
@@ -475,13 +475,13 @@ func (s *Server) nodeAccept(c *gin.Context) {
 	if !ok {
 		return
 	}
-	role, ok := s.requirePower(c, req, n)
-	if !ok {
+	if !s.requirePower(c, req, n) {
 		return
 	}
+	me := s.me(c)
 	from := n.State
-	// 按的人是谁记成角色：过了闸门就一定有角色，不再退回到「human」这种泛称。
-	comment := Comment{ID: newID("c"), AuthorType: "role", Author: role.Name, Body: body.Comment, At: s.now()}
+	// 按的人记成账号：过了闸门一定有个登录的人，不再有「角色口令」这种匿名身份。
+	comment := Comment{ID: newID("c"), AuthorType: "user", Author: me.User.Username, Body: body.Comment, At: s.now()}
 	if err := req.Accept(n.Key, comment, s.now()); err != nil {
 		fail(c, 409, err.Error())
 		return
@@ -499,13 +499,13 @@ func (s *Server) nodeReject(c *gin.Context) {
 	if !ok {
 		return
 	}
-	role, ok := s.requirePower(c, req, n)
-	if !ok {
+	if !s.requirePower(c, req, n) {
 		return
 	}
+	me := s.me(c)
 	from := n.State
 	reason := or(body.Reason, body.Body)
-	if err := req.RejectBy(n.Key, reason, "role", role.Name, s.now()); err != nil {
+	if err := req.RejectBy(n.Key, reason, "user", me.User.Username, s.now()); err != nil {
 		fail(c, 409, err.Error())
 		return
 	}
@@ -530,10 +530,11 @@ func (s *Server) nodeComment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	// 评论不校验权力：谁都能说话。带了认得出的角色口令就记成那个角色，没带就是访客。
+	// 评论不校验权力：登录了就能说话，作者记成账号名。
+	me := s.me(c)
 	author, authorType := "visitor", "visitor"
-	if role, ok := s.roleFrom(c); ok {
-		author, authorType = role.Name, "role"
+	if me.User != nil {
+		author, authorType = me.User.Username, "user"
 	}
 	if err := req.AddCommentBy(n.Key, authorType, author, body.Body, s.now()); err != nil {
 		fail(c, 409, err.Error())

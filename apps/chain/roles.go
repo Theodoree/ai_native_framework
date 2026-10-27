@@ -1,97 +1,101 @@
 package main
 
+// roles.go —— 项目级角色：谁在这个项目里有什么权力。
+//
+// 角色属于项目，没有口令、也没有身份：身份是人（账号），授权是「某人被授予某角色」。
+// 管理的权力归管理员（建/删角色、加/减成员），做事的权力归角色本身（run/accept/reject）。
+// 权力判定只有一处：powersFor。
+
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
-	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
 
-// roles.go —— 角色：权力的载体。
-//
-// 节点说「这一站要什么权力」（见 PowerForNode），角色说「我有什么权力」。
-// 身份用口令承载，不做账号体系：拿到口令的人就是这个角色。这一层之后如果要换真账号，
-// 只需要改 roleFrom 一处——口令到角色的解析只有这一个地方。
-//
-// 建 / 列 / 删 / 换口令要的是 project 管理口令（-admin-token），不是角色权力：
-// 否则任何一个有权力的人都能给自己发新角色。
-
-// roleTokenPrefix 是角色口令的前缀，与 intake 的 pk_ 一样用来一眼看出这是什么口令。
-const roleTokenPrefix = "rl_"
-
-// powerChoices 是 400 文案里列出的可选权力。顺序固定：文案是契约。
+// powerChoices 是报错文案里那个「只能是这几个」的清单。
 const powerChoices = "review / dev / test / release"
 
-// 三种 403 的文案。文案就是契约：前端靠这三句区分「该去建角色」还是「该换口令」，
-// 所以这里不让调用方拼半句，整句都从这里出。
-const (
-	needPowerText    = "这个动作需要一个带 %s 权力的角色口令"
-	otherProjectText = "角色属于 %s，这条需求在 %s"
-	missingPowerText = "角色「%s」没有 %s 权力，不能在这个节点上确认/拒绝"
-)
-
-// newRoleToken 发一个角色口令。与 intake 的 pk_ 一样走 crypto/rand：
-// 口令是身份，用 math/rand 等于把身份交给可预测的种子。
-func newRoleToken() (string, error) {
-	b := make([]byte, 18)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return roleTokenPrefix + hex.EncodeToString(b), nil
-}
-
-// ownerRoleName 是建项目时自动发的那个角色名。它和手建角色共用同一条「同名报错」规则：
-// 重名就报错，不静默改名——名字是评论里记的那个名字，悄悄改掉等于换了一个人。
-const ownerRoleName = "owner"
-
-// issueOwnerRole 给项目发一个四权齐全的 owner 角色，返回它（含口令）。
-//
-// 为什么建项目就能拿到钥匙：POST /api/projects 本来就不需要认证，谁能建项目，
-// 谁就该能用起来——不配 -admin-token 的部署里，这是唯一的入口。
-// 这不放宽「角色管理要管理口令」那条：建 / 列 / 删 / 换口令仍然要管理口令，
-// owner 只是一个普通角色，管理员照样能删掉它、换掉它的口令。
-func (s *Server) issueOwnerRole(projectKey string) (Role, error) {
-	existing, err := s.store.Roles(projectKey)
-	if err != nil {
-		return Role{}, err
-	}
-	for _, r := range existing {
-		if r.Name == ownerRoleName {
-			return Role{}, fmt.Errorf("这个 project 里已经有同名角色：%s", ownerRoleName)
-		}
-	}
-	token, err := newRoleToken()
-	if err != nil {
-		return Role{}, err
-	}
-	role := Role{
-		ID: newID("r"), ProjectKey: projectKey, Name: ownerRoleName,
-		Powers:    []string{PowerReview, PowerDev, PowerTest, PowerRelease},
-		Token:     token,
-		CreatedAt: s.now(),
-	}
-	if err := s.store.SaveRole(role); err != nil {
-		return Role{}, err
-	}
-	return role, nil
-}
+// powerDeniedText 是节点闸门唯一的 403 文案：点名是谁、在哪个项目、缺哪个权力。
+const powerDeniedText = "「%s」在 %s 里没有 %s 权力，不能在这个节点上确认/拒绝"
 
 type createRoleReq struct {
 	Name   string   `json:"name"`
 	Powers []string `json:"powers"`
 }
 
-// createRole 建一个角色。口令只在这一次的响应里出现：之后谁也取不回来，
-// 丢了就换一个（rotate）。
+// powersFor 是唯一的权力判定点：管理员四权齐全，否则取该用户在该项目所有角色的并集。
+// 项目外的授予一律不算——跨项目越权就是从这里断掉的。
+func (s *Server) powersFor(u *User, projectKey string) []string {
+	if u == nil {
+		return nil
+	}
+	if u.Admin {
+		return []string{PowerReview, PowerDev, PowerTest, PowerRelease}
+	}
+	as, err := s.store.AssignmentsForUser(projectKey, u.ID)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range as {
+		role, err := s.store.Role(a.RoleID)
+		if err != nil || role.ProjectKey != projectKey {
+			continue
+		}
+		for _, p := range role.Powers {
+			if !containsString(out, p) {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// requirePower 是 run / accept / reject 的闸门：当前身份在这个项目里要有这一站的权力。
+func (s *Server) requirePower(c *gin.Context, req *Requirement, n *Node) bool {
+	me := s.me(c)
+	if me.User == nil {
+		fail(c, 401, needLoginText)
+		return false
+	}
+	power := PowerForNode(n)
+	if power == "" {
+		fail(c, 500, fmt.Sprintf("节点 %s 的类型给不出默认权力：%s", n.Key, n.Type))
+		return false
+	}
+	if !containsString(s.powersFor(me.User, req.ProjectKey), power) {
+		fail(c, 403, fmt.Sprintf(powerDeniedText, me.User.Username, req.ProjectKey, power))
+		return false
+	}
+	return true
+}
+
+// roleInProject 取路径上的角色，并确认它属于路径上的项目：别人的角色在这里就是不存在。
+func (s *Server) roleInProject(c *gin.Context) (Role, bool) {
+	role, err := s.store.Role(c.Param("id"))
+	if err != nil || role.ProjectKey != c.Param("project") {
+		fail(c, 404, "没有这个角色："+c.Param("id"))
+		return Role{}, false
+	}
+	return role, true
+}
+
 func (s *Server) createRole(c *gin.Context) {
-	if !s.adminGate(c) {
+	if _, ok := s.requireAdmin(c); !ok {
 		return
 	}
-	projectKey := c.Param("project")
-	if _, err := s.store.Project(projectKey); err != nil {
+	project := c.Param("project")
+	if _, err := s.store.Project(project); err != nil {
 		fail(c, 404, err.Error())
 		return
 	}
@@ -109,22 +113,17 @@ func (s *Server) createRole(c *gin.Context) {
 		fail(c, 400, "角色至少要有一个权力："+powerChoices)
 		return
 	}
-	seen := map[string]bool{}
-	powers := []string{}
+	powers := make([]string, 0, len(in.Powers))
 	for _, p := range in.Powers {
-		p = strings.TrimSpace(p)
 		if !ValidPower(p) {
-			fail(c, 400, fmt.Sprintf("不认识的权力：%s（只能是 %s）", p, powerChoices))
+			fail(c, 400, fmt.Sprintf("认不出的权力：%s（只能是 %s）", p, powerChoices))
 			return
 		}
-		if seen[p] {
-			continue
+		if !containsString(powers, p) {
+			powers = append(powers, p)
 		}
-		seen[p] = true
-		powers = append(powers, p)
 	}
-	// 同一个 project 里角色名唯一：评论里记的是角色名，重名就分不清是谁按的。
-	existing, err := s.store.Roles(projectKey)
+	existing, err := s.store.Roles(project)
 	if err != nil {
 		fail(c, 500, err.Error())
 		return
@@ -135,15 +134,7 @@ func (s *Server) createRole(c *gin.Context) {
 			return
 		}
 	}
-	token, err := newRoleToken()
-	if err != nil {
-		fail(c, 500, err.Error())
-		return
-	}
-	role := Role{
-		ID: newID("r"), ProjectKey: projectKey, Name: name, Powers: powers,
-		Token: token, CreatedAt: s.now(),
-	}
+	role := Role{ID: newID("r"), ProjectKey: project, Name: name, Powers: powers, CreatedAt: s.now()}
 	if err := s.store.SaveRole(role); err != nil {
 		fail(c, 500, err.Error())
 		return
@@ -151,113 +142,129 @@ func (s *Server) createRole(c *gin.Context) {
 	writeJSON(c, 201, role)
 }
 
-// listRoles 列出角色，不回显口令：口令只在建角色与换口令的响应里出现一次。
 func (s *Server) listRoles(c *gin.Context) {
-	if !s.adminGate(c) {
+	if _, ok := s.requireAdmin(c); !ok {
 		return
 	}
-	projectKey := c.Param("project")
-	if _, err := s.store.Project(projectKey); err != nil {
+	project := c.Param("project")
+	if _, err := s.store.Project(project); err != nil {
 		fail(c, 404, err.Error())
 		return
 	}
-	roles, err := s.store.Roles(projectKey)
+	roles, err := s.store.Roles(project)
 	if err != nil {
 		fail(c, 500, err.Error())
 		return
-	}
-	for i := range roles {
-		roles[i].Token = ""
 	}
 	writeJSON(c, 200, roles)
 }
 
-// rotateRole 换口令：旧口令立刻失效，因为令牌就是角色那一行的 token 列。
-func (s *Server) rotateRole(c *gin.Context) {
-	if !s.adminGate(c) {
-		return
-	}
-	role, ok := s.roleInProject(c)
-	if !ok {
-		return
-	}
-	token, err := newRoleToken()
-	if err != nil {
-		fail(c, 500, err.Error())
-		return
-	}
-	role.Token = token
-	if err := s.store.SaveRole(role); err != nil {
-		fail(c, 500, err.Error())
-		return
-	}
-	writeJSON(c, 200, role)
-}
-
+// deleteRole 连带删掉这个角色的所有授予：角色没了，被授予的人也就不该再拿它按节点。
 func (s *Server) deleteRole(c *gin.Context) {
-	if !s.adminGate(c) {
+	if _, ok := s.requireAdmin(c); !ok {
 		return
 	}
 	role, ok := s.roleInProject(c)
 	if !ok {
+		return
+	}
+	if err := s.store.DeleteAssignmentsOfRole(role.ID); err != nil {
+		fail(c, 500, err.Error())
 		return
 	}
 	if err := s.store.DeleteRole(role.ID); err != nil {
 		fail(c, 500, err.Error())
 		return
 	}
-	c.Status(http.StatusNoContent)
+	c.Status(204)
 }
 
-// roleInProject 取路径上的角色，并要求它属于路径上的 project：
-// 一个 project 的管理口令不该能改另一个 project 的角色。
-func (s *Server) roleInProject(c *gin.Context) (Role, bool) {
-	role, err := s.store.Role(c.Param("id"))
-	if err != nil {
-		fail(c, 404, err.Error())
-		return Role{}, false
+func (s *Server) listMembers(c *gin.Context) {
+	if _, ok := s.requireAdmin(c); !ok {
+		return
 	}
-	if role.ProjectKey != c.Param("project") {
-		fail(c, 404, "没有这个角色："+c.Param("id"))
-		return Role{}, false
-	}
-	return role, true
-}
-
-// roleFrom 是角色口令唯一的一处解析：请求里带的口令只在这里换成角色。
-func (s *Server) roleFrom(c *gin.Context) (Role, bool) {
-	token := bearerToken(c.Request)
-	if token == "" {
-		return Role{}, false
-	}
-	role, err := s.store.RoleByToken(token)
-	if err != nil {
-		return Role{}, false
-	}
-	return role, true
-}
-
-// requirePower 是节点动作（run / accept / reject）的闸门，默认拒绝：
-// 没有角色的项目，人只能看，不能按。宽进来一次就会变成常态，所以判不了就挡。
-func (s *Server) requirePower(c *gin.Context, req *Requirement, n *Node) (Role, bool) {
-	power := PowerForNode(n)
-	if power == "" {
-		// 类型给不出默认权力：这是服务端的配置问题，按拒绝处理，不按放行。
-		fail(c, 500, "节点 "+n.Key+" 的类型给不出默认权力："+n.Type)
-		return Role{}, false
-	}
-	role, ok := s.roleFrom(c)
+	role, ok := s.roleInProject(c)
 	if !ok {
-		fail(c, 403, fmt.Sprintf(needPowerText, power))
-		return Role{}, false
+		return
 	}
-	if role.ProjectKey != req.ProjectKey {
-		fail(c, 403, fmt.Sprintf(otherProjectText, role.ProjectKey, req.ProjectKey))
-		return Role{}, false
+	as, err := s.store.Assignments(role.ProjectKey)
+	if err != nil {
+		fail(c, 500, err.Error())
+		return
 	}
-	if !role.HasPower(power) {
-		fail(c, 403, fmt.Sprintf(missingPowerText, role.Name, power))
-		return Role{}, false
+	names := []string{}
+	for _, a := range as {
+		if a.RoleID != role.ID {
+			continue
+		}
+		if u, err := s.store.User(a.UserID); err == nil {
+			names = append(names, u.Username)
+		}
 	}
-	return role, true
+	writeJSON(c, 200, names)
+}
+
+// addMember 按用户名把人加进角色：管理员手上没有别人的 id，只有名字。
+func (s *Server) addMember(c *gin.Context) {
+	if _, ok := s.requireAdmin(c); !ok {
+		return
+	}
+	role, ok := s.roleInProject(c)
+	if !ok {
+		return
+	}
+	var in struct {
+		Username string `json:"username"`
+	}
+	if err := decode(c.Request, &in); err != nil {
+		fail(c, 400, err.Error())
+		return
+	}
+	name := strings.TrimSpace(in.Username)
+	if name == "" {
+		fail(c, 400, "用户名不能为空")
+		return
+	}
+	u, err := s.store.UserByName(name)
+	if err != nil {
+		fail(c, 404, "没有这个用户："+name)
+		return
+	}
+	current, err := s.store.Assignments(role.ProjectKey)
+	if err != nil {
+		fail(c, 500, err.Error())
+		return
+	}
+	for _, a := range current {
+		if a.RoleID == role.ID && a.UserID == u.ID {
+			fail(c, 409, "这个人已经在这个角色里了："+name)
+			return
+		}
+	}
+	if err := s.store.SaveAssignment(Assignment{ProjectKey: role.ProjectKey, RoleID: role.ID, UserID: u.ID}); err != nil {
+		fail(c, 500, err.Error())
+		return
+	}
+	writeJSON(c, 201, map[string]string{"project": role.ProjectKey, "role": role.Name, "username": u.Username})
+}
+
+func (s *Server) removeMember(c *gin.Context) {
+	if _, ok := s.requireAdmin(c); !ok {
+		return
+	}
+	role, ok := s.roleInProject(c)
+	if !ok {
+		return
+	}
+	name := strings.TrimSpace(c.Param("username"))
+	u, err := s.store.UserByName(name)
+	if err != nil {
+		fail(c, 404, "没有这个用户："+name)
+		return
+	}
+	if err := s.store.DeleteAssignment(role.ProjectKey, role.ID, u.ID); err != nil {
+		fail(c, 404, err.Error())
+		return
+	}
+	c.Status(204)
 }

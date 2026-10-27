@@ -123,28 +123,22 @@ type Chain struct {
 
 // Project 是一个代码仓库加若干条链条。
 type Project struct {
-	Key           string  `json:"key"`
-	Name          string  `json:"name"`
-	Repo          string  `json:"repo"`
-	DefaultBranch string  `json:"defaultBranch"`
-	Chains        []Chain `json:"chains"`
-	IntakeToken   string  `json:"intakeToken,omitempty"`
-	// OwnerToken 只在建项目那一条 201 响应里出现一次：建项目的人顺手拿到这个项目的钥匙。
-	// 它不落库、也不出现在列表里——库里存的是钥匙之外的一切。
-	OwnerToken string    `json:"ownerToken,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
+	Key           string    `json:"key"`
+	Name          string    `json:"name"`
+	Repo          string    `json:"repo"`
+	DefaultBranch string    `json:"defaultBranch"`
+	Chains        []Chain   `json:"chains"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // Role 是「谁有权按这个 project 的节点」。身份用口令承载，不做账号体系：
 // 拿到口令的人就是这个角色，将来换真账号只改解析口令那一层。
 type Role struct {
-	ID         string   `json:"id"`
-	ProjectKey string   `json:"projectKey"`
-	Name       string   `json:"name"`
-	Powers     []string `json:"powers"`
-	// Token 只在建角色与换口令的响应里出现一次：列表接口不回显。
-	Token     string    `json:"token,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID         string    `json:"id"`
+	ProjectKey string    `json:"projectKey"`
+	Name       string    `json:"name"`
+	Powers     []string  `json:"powers"`
+	CreatedAt  time.Time `json:"createdAt"`
 }
 
 // HasPower 说这个角色有没有某个权力。

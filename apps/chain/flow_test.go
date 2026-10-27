@@ -3,46 +3,52 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
-func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
+// 测试里的「人」是一个账号加一个带 cookie jar 的 http.Client：登录一次，之后
+// 请求自动带 chain_session。服务端只认 whoIs 这一处解析，所以辅助函数也不再传口令，
+// 而是传「谁」——口令那套身份已经不存在了。
+//
+// 为了不让每个用例都改成层层传客户端，按「服务地址 + 用户名」登记，call/callAs 用用户名取。
+
+// rootUser 是每个测试服务里第一个注册的账号：空库第一个注册的人自动是管理员。
+const rootUser = "root"
+const rootPass = "root-password-1"
+
+var sessions sync.Map // "服务地址|用户名" -> *http.Client
+
+func remember(ts *httptest.Server, username string, cl *http.Client) {
+	sessions.Store(ts.URL+"|"+username, cl)
+}
+
+func clientOf(t *testing.T, ts *httptest.Server, username string) *http.Client {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "chain.db")
-	store, err := OpenStore("sqlite", path)
+	v, ok := sessions.Load(ts.URL + "|" + username)
+	if !ok {
+		t.Fatalf("这个测试里没有人以 %q 登录过", username)
+	}
+	return v.(*http.Client)
+}
+
+func freshClient(t *testing.T) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { store.Close() })
-	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
-	t.Cleanup(ts.Close)
-	seedAllPowers(t, store, "demo")
-	return ts, store, path
+	return &http.Client{Jar: jar}
 }
 
-// testRoleToken 是测试里通用的角色口令。
-// 每个起服务的 helper 都会给用到的 project 发一个四权齐全的角色，口令固定成这个值，
-// 省得每条用例都把口令从头传到尾；要测「没带口令」的场景用 callAnon。
-const testRoleToken = "rl_test-all-powers"
-
-// call 发一次请求并解出需求，断言状态码。默认带着通用水口的角色口令。
-func call(t *testing.T, ts *httptest.Server, method, path string, body any, want int) *Requirement {
-	t.Helper()
-	return callAs(t, ts, method, path, testRoleToken, body, want)
-}
-
-// callAnon 是不带角色口令的请求：节点闸门与评论作者都要靠它区分「访客」。
-func callAnon(t *testing.T, ts *httptest.Server, method, path string, body any, want int) *Requirement {
-	t.Helper()
-	return callAs(t, ts, method, path, "", body, want)
-}
-
-// callAs 带指定角色口令发请求，断言状态码。
-func callAs(t *testing.T, ts *httptest.Server, method, path, token string, body any, want int) *Requirement {
+// exchange 发一次请求，返回状态码与响应体。cl 为 nil 表示匿名。
+func exchange(t *testing.T, ts *httptest.Server, cl *http.Client, method, path string, body any) (int, []byte) {
 	t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
@@ -54,25 +60,125 @@ func callAs(t *testing.T, ts *httptest.Server, method, path, token string, body 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	res, err := http.DefaultClient.Do(req)
+	client := cl
+	if client == nil {
+		client = http.DefaultClient
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	var raw json.RawMessage
-	if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
-		t.Fatalf("%s %s 响应不是 JSON：%v", method, path, err)
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if res.StatusCode != want {
-		t.Fatalf("%s %s 期望 %d，实际 %d：%s", method, path, want, res.StatusCode, raw)
+	return res.StatusCode, raw
+}
+
+// signupRoot 在空库里注册第一个账号（自动是管理员），并把它的客户端登记下来。
+func signupRoot(t *testing.T, ts *httptest.Server) *http.Client {
+	t.Helper()
+	cl := freshClient(t)
+	code, raw := exchange(t, ts, cl, "POST", "/api/signup", map[string]any{"username": rootUser, "password": rootPass})
+	if code != 201 {
+		t.Fatalf("注册第一个账号期望 201，实际 %d：%s", code, raw)
 	}
-	if res.StatusCode >= 400 {
+	// 注册即进站：signup 自己就下发会话，不必再登录一次（t42）。
+	if ck := sessionCookie(t, cl, ts); ck.Value == "" {
+		t.Fatalf("注册之后客户端应当已经有 %s", sessionCookieName)
+	}
+	remember(ts, rootUser, cl)
+	return cl
+}
+
+// loginAs 用账号密码登录，返回带着新会话的客户端并登记。
+func loginAs(t *testing.T, ts *httptest.Server, username, password string) *http.Client {
+	t.Helper()
+	cl := freshClient(t)
+	code, raw := exchange(t, ts, cl, "POST", "/api/login", map[string]any{"username": username, "password": password})
+	if code != 200 {
+		t.Fatalf("登录 %s 期望 200，实际 %d：%s", username, code, raw)
+	}
+	remember(ts, username, cl)
+	return cl
+}
+
+// addUser 让管理员建一个普通账号并登录，返回它的客户端。
+func addUser(t *testing.T, ts *httptest.Server, username, password string) *http.Client {
+	t.Helper()
+	code, raw := exchange(t, ts, clientOf(t, ts, rootUser), "POST", "/api/users",
+		map[string]any{"username": username, "password": password})
+	if code != 201 {
+		t.Fatalf("建账号 %s 期望 201，实际 %d：%s", username, code, raw)
+	}
+	return loginAs(t, ts, username, password)
+}
+
+// grantRole 让管理员建一个角色，并把 username 放进这个角色（username 为空只建角色）。
+func grantRole(t *testing.T, ts *httptest.Server, project, roleName, username string, powers ...string) Role {
+	t.Helper()
+	admin := clientOf(t, ts, rootUser)
+	code, raw := exchange(t, ts, admin, "POST", "/api/p/"+project+"/roles",
+		map[string]any{"name": roleName, "powers": powers})
+	if code != 201 {
+		t.Fatalf("建角色 %s 期望 201，实际 %d：%s", roleName, code, raw)
+	}
+	var role Role
+	if err := json.Unmarshal(raw, &role); err != nil {
+		t.Fatal(err)
+	}
+	if username != "" {
+		code, raw = exchange(t, ts, admin, "POST", "/api/p/"+project+"/roles/"+role.ID+"/members",
+			map[string]any{"username": username})
+		if code != 201 {
+			t.Fatalf("把 %s 放进角色期望 201，实际 %d：%s", username, code, raw)
+		}
+	}
+	return role
+}
+
+func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "chain.db")
+	store, err := OpenStore("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
+	t.Cleanup(ts.Close)
+	signupRoot(t, ts)
+	return ts, store, path
+}
+
+// call 以管理员身份发一次请求：管理员等同四权齐全，节点闸门一律放行。
+func call(t *testing.T, ts *httptest.Server, method, path string, body any, want int) *Requirement {
+	t.Helper()
+	return callAs(t, ts, method, path, rootUser, body, want)
+}
+
+// callAnon 是不登录的请求：用来钉「/api/** 除注册登录外一律 401」。
+func callAnon(t *testing.T, ts *httptest.Server, method, path string, body any, want int) *Requirement {
+	t.Helper()
+	return callAs(t, ts, method, path, "", body, want)
+}
+
+// callAs 以指定账号（空 = 匿名）发请求，断言状态码并把响应体解成需求。
+func callAs(t *testing.T, ts *httptest.Server, method, path, who string, body any, want int) *Requirement {
+	t.Helper()
+	var cl *http.Client
+	if who != "" {
+		cl = clientOf(t, ts, who)
+	}
+	code, raw := exchange(t, ts, cl, method, path, body)
+	if code != want {
+		t.Fatalf("%s %s 期望 %d，实际 %d：%s", method, path, want, code, raw)
+	}
+	if code >= 400 {
 		return nil
 	}
 	var r Requirement
@@ -95,13 +201,12 @@ func newNodeReq(t *testing.T, ts *httptest.Server, node, action string, body any
 
 func listReqs(t *testing.T, ts *httptest.Server) []Requirement {
 	t.Helper()
-	res, err := http.Get(ts.URL + "/api/requirements")
-	if err != nil {
-		t.Fatal(err)
+	code, raw := exchange(t, ts, clientOf(t, ts, rootUser), "GET", "/api/requirements", nil)
+	if code != 200 {
+		t.Fatalf("列需求期望 200，实际 %d：%s", code, raw)
 	}
-	defer res.Body.Close()
 	var out []Requirement
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatal(err)
 	}
 	return out
@@ -153,12 +258,12 @@ func TestFlowRejectAtFirstNodeRejectsRequirement(t *testing.T) {
 	}
 	var human *Comment
 	for i := range got.Node("assess").Comments {
-		if c := got.Node("assess").Comments[i]; c.AuthorType == "role" {
+		if c := got.Node("assess").Comments[i]; c.AuthorType == "user" {
 			human = &c
 		}
 	}
 	if human == nil || human.Verdict != "reject" || human.Body != "这不是需求" {
-		t.Fatalf("拒绝理由应落成按角色记的 reject 评论，实际 %+v", human)
+		t.Fatalf("拒绝理由应落成按账号记的 reject 评论，实际 %+v", human)
 	}
 	last := got.Node("assess").Comments[len(got.Node("assess").Comments)-1]
 	if last.AuthorType != "system" {
