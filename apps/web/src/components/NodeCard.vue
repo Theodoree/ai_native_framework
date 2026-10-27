@@ -401,6 +401,8 @@ async function act(action: NodeAction) {
   margin-top: 2px;
   color: var(--text);
   overflow-wrap: anywhere;
+  /* 容器输出是多行文本：不保留换行会被挤成一整段。 */
+  white-space: pre-wrap;
 }
 
 .node__empty {
