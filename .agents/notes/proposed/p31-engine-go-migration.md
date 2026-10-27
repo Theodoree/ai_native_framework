@@ -1,6 +1,6 @@
 # P-31 判据与门搬进 Go
 
-状态：阶段 A–D4 已完成并合入 main；E2（按模块把 Node 判据搬进 Go，搬完即删）进行中——第一批 writer-record 已完成（A/B/C 见 §六–§十，D1 §十一、D2 §十二、D3 §十三、D4 §十四）。audit.yml 判定步自 D3 起调编译产物；parity 自 D4 起只跑引擎、与冻结 golden 比对，测试路径不再执行 scripts/*.mjs。scripts/*.mjs 与钉其实现细节的 Node 套件仍在（约 690 例），删除前置已解除但须先把用例移植成 Go 单测（§14.6）；USAGE 文案仍写 Node 载体名。
+状态：阶段 A–D4 已完成并合入 main；E2（按模块把 Node 判据搬进 Go，搬完即删）进行中——第一批 writer-record、第二批 last-change 已完成（A/B/C 见 §六–§十，D1 §十一、D2 §十二、D3 §十三、D4 §十四）。audit.yml 判定步自 D3 起调编译产物；parity 自 D4 起只跑引擎、与冻结 golden 比对，测试路径不再执行 scripts/*.mjs。scripts/*.mjs 与钉其实现细节的 Node 套件仍在（约 690 例），删除前置已解除但须先把用例移植成 Go 单测（§14.6）；USAGE 文案仍写 Node 载体名。
 
 ## 一、为什么做
 
@@ -564,3 +564,45 @@ PR #95 的 `check` 红在一条只有 CI 能看见的差异上：
 ### 15.7 下一批
 
 按 CI 引用面从易到难：`last-change` / `copy-dist` / `cli` / `kb-export`（CI 已无 Node 调用点）→ `merge-gate` / `build-intent` → `routing` / `ledger` / `state-validate` → `audit-collect`/`audit-findings`/`audit-slot`/`audit-review`（最后一批，要动 `.github/workflows/audit.yml` 的 verifier 边界，单独一次带变异证据的变更）。
+
+## 十六、E2 第二批：last-change 判据搬进 Go，Node 套件删除但脚本暂留
+
+### 16.1 为什么会留下一个脚本不删
+
+`scripts/last-change.mjs` 不只是被测对象，它还是 `scripts/merge-gate.mjs` 的渲染器来源（`renderLastChange`/`BLOCK_BEGIN`/`BLOCK_END`），`tests/merge-gate.test.mjs` 也从它 import `renderSection` 造夹具。
+
+执行者给的选项里有「把渲染器逐字搬进 merge-gate.mjs、测试改冻结字面量，本批就能删干净」。我否掉了：`merge-gate.mjs` 本身就是后面要被整体删掉的 Node 载体，现在往里做一次逐字搬迁、下一批再全删，等于造一个没人验收的中间态。**判据先搬、脚本后删，删除的批次必须跟着它最后的消费者一起走。**
+
+所以这一批：12 条判据搬进 `apps/engine/lastchange_test.go`（16 个测试）、删 `tests/last-change.test.mjs`、`scripts/last-change.mjs` 保留并在 `scripts/README.md` 标 deprecated 写明「仅作为 merge-gate 的渲染器载体存活，随 merge-gate 批次一起删」。b 套 golden 继续可重冻——这是正确状态，没有提前加 `refreezeLocked`。
+
+### 16.2 (f) 三条没有搬进 Go，理由是保真度不可自证
+
+原套件里有 3 条不是模块判据而是 **workflow 接线判据**：它们把 `.github/workflows/last-change.yml` 的 render/write 两个 run 块原样执行，用假 `gh` 断言 `pr view 9 --json body --jq .body` 与 `pr edit 9 --body-file body.out.md`。
+
+执行者提议用 Go 复刻 YAML 的 `${{ }}` 插值与 `if:` 求值搬过去。我否掉了：那等于在 Go 里再实现半个 Actions 表达式引擎，成本高且**保真度自己无法证明**，最后会变成「看着在钉接线，其实在钉我自己的复刻」。
+
+替代层是新建 `tests/last-change-wiring.test.mjs`（3 条）：仍原样执行 run 块、仍走 `if: steps.render.outputs.changed == '1'` 的求值路径，`evalIf` 只支持 `==`/`!=`/`&&`，越界即 throw 而不是默认放行；并且**不 import 任何 `scripts/*.mjs`**——接线判据的对象是 workflow，与脚本无关。
+
+### 16.3 「挪走参照物还能绿」这条要求是这轮最有价值的检查
+
+要求写进 brief 并要求它在 `/tmp` 副本里当场取证；我也自己复跑了一次：`mv scripts/last-change.mjs` 之后 `npx vitest run tests/last-change-wiring.test.mjs` → **1 file / 3 tests passed, exit=0**。没有这一步，「不依赖脚本」只是注释里的一句话。
+
+### 16.4 变异（我自跑两组，执行者另跑五组）
+
+| 变异 | 结果 |
+| --- | --- |
+| `MergeDate` 返回整段时间戳（`match[1]`→`match[0]`） | 4 条红（含仓里原有的 `TestMergeDate`） |
+| `/tmp` 副本里 workflow 的 `if: … changed == '1'` 反转成 `'0'` | wiring `2 failed / 1 passed` |
+| （执行者）去掉 `--diff-filter=d` | 1 红 |
+| （执行者）`ReplaceLastChangeSection` 丢掉节后尾巴 | 2 红 |
+| （执行者）`changed` 恒 1 | 1 红 |
+
+### 16.5 数字
+
+`npm run check` exit 0；22 files / **774 tests**（783 − 12 + 3）；`gofmt` 干净、`go vet` 0、`go test -count=1` ok；`apps/engine` 下无 `.cache`。
+
+残留 grep：`scripts/last-change.mjs` 只剩 `tests/merge-gate.test.mjs:14`（禁区，随 merge-gate 批次处理）与 `tests/goldens/parity-cases.mjs:1262`（注释，说明「期望值已脱离实现独立存在」）——**可执行调用点 0**。
+
+### 16.6 记一笔操作噪声
+
+我曾误发起一个 brief 为 `noop` 的子代理（什么都没做就结束）。它无副作用，但它说明「派单前先读一遍自己写的 prompt」这件事对调度方同样成立。
