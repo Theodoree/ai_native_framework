@@ -1,6 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ENGINE, ensureEngine } from "./engine.mjs";
-import { checkFixture, checkGolden, readGolden, readIndex } from "./parity-golden.mjs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { checkFixture, checkGolden, readGolden, readIndex, scanGoldenHygiene } from "./parity-golden.mjs";
+import { normalizeMachinePaths } from "../goldens/parity-cases.mjs";
 
 // 五个 parity suite 的公共驱动。默认测试路径只做两件事：
 //   1. 跑 Go 引擎（.cache/bin/engine，唯一构建入口 npm run build:engine）；
@@ -38,13 +42,37 @@ export function defineParitySuite(suite) {
       if (ctx) await suite.disposeContext(ctx);
     });
 
-    it("golden 索引与本文件的夹具一一对应（少一条是红，不是跳过）", () => {
+    it("golden 索引与夹具一一对应，且 golden 里没有机器绝对路径", () => {
       const index = readIndex();
       const want = index.suites[suite.id];
       expect(want, "tests/goldens/index.json 里没有 suite " + suite.id).toBeDefined();
       expect(want.count).toBe(suite.cases.length);
       expect(want.cases).toEqual(suite.cases.map((one) => one.id));
       expect(index.total).toBeGreaterThanOrEqual(suite.cases.length);
+
+      // golden 里出现任何机器绝对路径都算红：期望值必须换台机器、换个 checkout 目录都同样成立。
+      const hits = scanGoldenHygiene();
+      expect(
+        hits,
+        "golden 里混进了机器绝对路径（归一化没兜住）：\n" +
+          hits.map((one) => one.file + " ← " + one.label + "：" + one.snippet).join("\n"),
+      ).toEqual([]);
+
+      // 单元级证明：同一个目录的「未解析写法」与「解析后写法」（macOS 的 /var → /private/var 就是这种关系，
+      // 也可能来自 symlink 化的 TMPDIR）必须归到同一个占位符，且 /private 那层前缀两侧都不留。
+      expect(normalizeMachinePaths("/private/var/folders/x/y/a.json", [["/var/folders/x/y", "<ROOT>"]])).toBe("<ROOT>/a.json");
+      expect(normalizeMachinePaths("out=/var/folders/x/y/a.json", [["/var/folders/x/y", "<ROOT>"]])).toBe("out=<ROOT>/a.json");
+      const base = mkdtempSync(join(tmpdir(), "parity-normalize-"));
+      const link = base + "-link";
+      symlinkSync(base, link);
+      try {
+        const resolved = realpathSync(base);
+        expect(normalizeMachinePaths("out=" + join(resolved, "x.json"), [[link, "<ROOT>"]])).toBe("out=<ROOT>/x.json");
+        expect(normalizeMachinePaths("out=" + join(link, "x.json"), [[link, "<ROOT>"]])).toBe("out=<ROOT>/x.json");
+      } finally {
+        rmSync(link, { force: true });
+        rmSync(base, { recursive: true, force: true });
+      }
     });
 
     for (const fixture of suite.cases) {

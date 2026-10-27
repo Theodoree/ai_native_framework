@@ -501,3 +501,24 @@ B 套 5 条 `KNOWN_DIVERGENCES`（Node 侧抛未捕获异常）改成 `pattern` 
 ### 14.6 仍未关
 
 `scripts/*.mjs` 与钉它们实现细节的 Node 套件仍在（约 690 例）。**删脚本的前提已解除，但删之前必须先把这些用例移植成 Go 单测**——直接删等于同时删掉 690 条验证，只剩 95 条 golden 对照与 24 条 Go 单测，那是撤闸不是清场。移植按模块增量做，每移植完一个模块才删它对应的那一份。
+
+### 14.7 第一轮 CI 就红了：本地全绿不等于跨机器绿
+
+PR #95 的 `check` 红在一条只有 CI 能看见的差异上：
+
+```text
+期望: ... out=/private<ROOT>/out/record.json
+实际: ... out=<ROOT>/out/record.json
+```
+
+根因：旧归一化按 `[dir, realpath(dir)]` 顺序替换。macOS 上临时目录经 realpath 是 `/private/var/folders/…`，先吃掉 `/var/folders/…` 那一截，就只剩 `/private<ROOT>`；Linux 上没有这层前缀，于是同一份 golden 在两台机器上要求两种输出。
+
+**「换一个 checkout 重冻、`diff -r` 一致」为什么没挡住它**：那是在同一台 macOS 上做的，只能证明路径无关，证明不了操作系统无关。同一台机器上的两类路径形态必须同时被覆盖，才是可移植。
+
+修法：`pathVariants` 对每个根取 `[root, realpath(root)]`，每种再补一个 `/private` 孪生（双向：去前缀 / 加前缀），合并成一张映射并**按长度降序**替换，长的先吃，前缀不会残留。
+
+永久判据（默认在测试路径上，五个 suite 每次都跑）：`scanGoldenHygiene()` 扫 `tests/goldens/**/*.json`，命中 `/private`、`/var/folders/`、`/Users/`、`/home/`、`/tmp/`、Windows 用户目录即红并点名文件与片段；同一用例内另有单元级断言（`/var/folders/x` 与 `/private/var/folders/x` 必须归到同一占位符、symlink 化的 TMPDIR 两种写法必须等价）。
+
+独立性验证：把 `pathVariants` 打回旧行为 → 单元断言立刻红（`expected '/private<ROOT>/a.json' to be '<ROOT>/a.json'`）；把 `TMPDIR` 指到 symlink 目录（`/tmp/tmplink -> /tmp/tmpreal`，与 macOS 上 `/tmp -> /private/tmp` 同形）全量重冻 → 与仓库内 golden `diff -rq` **零差异**。
+
+重冻 diff 只动了 16 个 `d/` 文件，差异只有 `/private<ROOT>` → `<ROOT>` 一类；`a/b/c/e` 与 `index.json` 零变化——说明修的是漏掉的那类形态，不是顺手改期望值。

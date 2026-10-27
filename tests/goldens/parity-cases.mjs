@@ -74,10 +74,45 @@ export const normalizeTree = (entries, normalize) =>
 const POSITION_SUFFIX = / ?\(line \d+ column \d+\)/g;
 export const withoutPosition = (text) => String(text).replace(POSITION_SUFFIX, "");
 
-export function normalizePaths(text, dir, label) {
+const safeRealpath = (path) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+};
+
+// 同一个目录在磁盘上不止一种写法：macOS 的 /var/folders/... 解析后是 /private/var/folders/...，
+// TMPDIR 也可能是指向别处的 symlink。归一化必须把「解析后」和「未解析」两种形态都吃掉，
+// 否则 golden 里会留下 "/private<ROOT>" 这种半截 —— macOS 冻结、Linux 跑就必红。
+// 另外替换必须长的先做：先用短前缀吃掉一半，长前缀就再也匹配不上了。
+export function pathVariants(roots) {
+  const out = new Set();
+  for (const root of [].concat(roots)) {
+    if (typeof root !== "string" || root.length < 2) continue;
+    for (const form of [root, safeRealpath(root)]) {
+      if (!form) continue;
+      out.add(form);
+      out.add(form.startsWith("/private") ? form.slice("/private".length) : "/private" + form);
+    }
+  }
+  return [...out].filter((one) => one.length > 1).sort((left, right) => right.length - left.length);
+}
+
+// pairs: [[root, <占位符>], ...]。一次替换掉三类根（工作目录 / 仓库根 / tmpdir）及其全部形态，
+// 长变体优先，所以 /private 这层前缀两侧都不会残留。
+export function normalizeMachinePaths(text, pairs) {
   let out = String(text === undefined || text === null ? "" : text);
-  for (const variant of new Set([dir, realpathSync(dir)])) out = out.split(variant).join(label);
+  const mapping = [];
+  for (const [root, label] of pairs) for (const variant of pathVariants(root)) mapping.push([variant, label]);
+  mapping.sort((left, right) => right[0].length - left[0].length);
+  for (const [variant, label] of mapping) out = out.split(variant).join(label);
   return out;
+}
+
+// 单根的老形状，保留给只关心一个目录的调用点。
+export function normalizePaths(text, dir, label) {
+  return normalizeMachinePaths(text, [[dir, label]]);
 }
 
 // =====================================================================
@@ -392,9 +427,7 @@ export const suiteA = {
     });
     // stack trace 里会带仓库绝对路径：按 repoRoot 归一，golden 才跟 checkout 位置无关。
     const normalize = (text) =>
-      withoutPosition(normalizePaths(String(text ?? ""), dir, "<ROOT>"))
-        .split(repoRoot)
-        .join("<REPO>")
+      withoutPosition(normalizeMachinePaths(String(text ?? ""), [[dir, "<ROOT>"], [repoRoot, "<REPO>"]]))
         // 写临时文件失败时 Node 把随机后缀带进文案（.tmp-93329）：golden 里换成占位符。
         .replace(/\.tmp-\d+/g, ".tmp-<N>");
     return {
@@ -1162,9 +1195,7 @@ export const suiteB = {
     });
     // stack trace 里会带仓库绝对路径：按 repoRoot 归一，golden 才跟 checkout 位置无关。
     const normalize = (text) =>
-      withoutPosition(normalizePaths(String(text ?? ""), dir, "<ROOT>"))
-        .split(repoRoot)
-        .join("<REPO>")
+      withoutPosition(normalizeMachinePaths(String(text ?? ""), [[dir, "<ROOT>"], [repoRoot, "<REPO>"]]))
         // 写临时文件失败时 Node 把随机后缀带进文案（.tmp-93329）：golden 里换成占位符。
         .replace(/\.tmp-\d+/g, ".tmp-<N>");
     // undefined 的变量等于没有这个变量（JSON 也存不住它）：meta 里一并滤掉。
@@ -1578,9 +1609,13 @@ export const suiteC = {
       timeout: 60000,
     });
     if (result.status === null) throw new Error("子进程没跑起来: " + result.signal);
-    const raw = (text) => normalizePaths(String(text ?? ""), prepared.dir, "<ROOT>");
     const normalize = (text) =>
-      raw(text).split(repoRoot).join("<REPO_ROOT>").split(tmpdir()).join("<TMP>");
+      normalizeMachinePaths(String(text ?? ""), [
+        [prepared.dir, "<ROOT>"],
+        [C.workDir, "<WORK>"],
+        [repoRoot, "<REPO_ROOT>"],
+        [tmpdir(), "<TMP>"],
+      ]);
     return {
       exitCode: result.status,
       stdout: withoutPosition(normalize(result.stdout.toString())),
@@ -2286,7 +2321,7 @@ export const suiteD = {
     const env = { ...process.env, ...extra };
     const mode = fixture.normalize ?? "none";
     const normalize = (text) =>
-      dNormalizeDetail(normalizePaths(String(text ?? ""), dir, "<ROOT>"), mode).split("127.0.0.1:" + D.port).join("127.0.0.1:<PORT>");
+      dNormalizeDetail(normalizeMachinePaths(String(text ?? ""), [[dir, "<ROOT>"], [tmpdir(), "<TMP>"]]), mode).split("127.0.0.1:" + D.port).join("127.0.0.1:<PORT>");
     const before = snapshotTree(dir);
     const bodiesBefore = dReadBodies().length;
     const result = spawnSync(invoke.bin, [...invoke.prefix, ...args], { cwd: dir, env, encoding: "utf8", timeout: 120000 });
@@ -2734,8 +2769,12 @@ export const suiteE = {
     const extra = typeof fixture.env === "function" ? fixture.env(dir) : (fixture.env ?? {});
     const env = { ...process.env, ...extra };
     const normalize = (text) => {
-      let out = normalizePaths(String(text === undefined || text === null ? "" : text), dir, "<DIR>");
-      out = out.split(E.gitRepo).join("<REPO>").split("127.0.0.1:" + E.port).join("127.0.0.1:<PORT>");
+      let out = normalizeMachinePaths(String(text === undefined || text === null ? "" : text), [
+        [dir, "<DIR>"],
+        [E.gitRepo, "<REPO>"],
+        [tmpdir(), "<TMP>"],
+      ]);
+      out = out.split("127.0.0.1:" + E.port).join("127.0.0.1:<PORT>");
       const at = out.indexOf(NET_MARK);
       if (at === -1) return out;
       const lineEnd = out.indexOf("\n", at);

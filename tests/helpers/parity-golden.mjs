@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
 // golden 的读写与比对。本文件不 import vitest：
@@ -38,6 +38,45 @@ export function readIndex() {
 export function writeIndex(index) {
   writeFileSync(indexPath(), JSON.stringify(index, null, 2) + "\n");
   return indexPath();
+}
+
+// golden 是期望值：它必须跟 checkout 位置、跟谁的机器无关。这条是回归闸门 ——
+// macOS 上 tmpdir 解析后是 /private/var/...，归一化只吃掉 /var/... 那一段，
+// golden 里就会留下 "/private<ROOT>"，Linux CI 上同一条命令是 "<ROOT>"，必红。
+export const MACHINE_PATH_PATTERNS = [
+  { label: "/private 前缀", pattern: /\/private/ },
+  { label: "/var/folders", pattern: /\/var\/folders\// },
+  { label: "/Users/", pattern: /\/Users\// },
+  { label: "/home/", pattern: /\/home\// },
+  { label: "/tmp/", pattern: /\/tmp\// },
+  { label: "Windows 用户目录", pattern: /[A-Za-z]:\\+Users\\+/ },
+];
+
+export function scanGoldenHygiene(root = GOLDEN_ROOT) {
+  const hits = [];
+  const visit = (dir) => {
+    for (const name of readdirSync(dir).sort()) {
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) {
+        visit(full);
+        continue;
+      }
+      if (!name.endsWith(".json")) continue;
+      const text = readFileSync(full, "utf8");
+      for (const { label, pattern } of MACHINE_PATH_PATTERNS) {
+        const match = pattern.exec(text);
+        if (!match) continue;
+        const at = Math.max(0, match.index - 40);
+        hits.push({
+          file: relative(process.cwd(), full),
+          label,
+          snippet: text.slice(at, Math.min(text.length, match.index + 40)).replace(/\n/g, "⏎"),
+        });
+      }
+    }
+  };
+  visit(root);
+  return hits;
 }
 
 // env 归一后签名：只记本 case 显式追加的变量（不记整份 process.env，否则换台机器就变），

@@ -22,7 +22,7 @@
   },
   "assertMode": "bytes",
   "exitCode": 3,
-  "stdout": "audit-review slot=review-a verdict=INFRA findings=0 exit=3 out=/private<ROOT>/out/record.json\n",
+  "stdout": "audit-review slot=review-a verdict=INFRA findings=0 exit=3 out=<ROOT>/out/record.json\n",
   "stderr": "audit-review 上游响应里没有 choices[0].message.content\n",
   "files": [
     {
