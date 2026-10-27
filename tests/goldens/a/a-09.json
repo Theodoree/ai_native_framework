@@ -1,0 +1,24 @@
+{
+  "suite": "a",
+  "id": "a-09",
+  "title": "拒绝：多个 state 标签",
+  "argv": [
+    "validate",
+    "--json",
+    "--intent",
+    "-"
+  ],
+  "env": {
+    "PLATFORM_LEDGER": "<ROOT>/ledger.jsonl"
+  },
+  "envSig": {
+    "text": "PLATFORM_LEDGER=<ROOT>/ledger.jsonl",
+    "sig": "591ff6170828"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "{\"verdict\":\"infra\",\"code\":\"E_STATE_LABEL_COUNT\",\"message\":\"issue 上最多只能有一个 state:* 标签，实际 2 个\",\"labels\":[\"state:triage\",\"state:accepted\"]}\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

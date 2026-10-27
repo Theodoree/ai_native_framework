@@ -1,0 +1,35 @@
+{
+  "suite": "c",
+  "id": "c-43",
+  "title": "输入：没有事件输入",
+  "argv": [
+    "merge-gate",
+    "--repo",
+    "<ROOT>/repo",
+    "--pr",
+    "<ROOT>/pr.json",
+    "--issue",
+    "<ROOT>/issue.json",
+    "--checks",
+    "<ROOT>/checks.json",
+    "--infra",
+    "<ROOT>/infra.json",
+    "--config",
+    "<REPO_ROOT>/.agents/platform/state-machine.yml"
+  ],
+  "env": {
+    "PATH": "<WORK>/bin:/usr/bin:/bin",
+    "HOME": "/tmp",
+    "FAKE_GIT_ROOT": "<ROOT>/repo"
+  },
+  "envSig": {
+    "text": "FAKE_GIT_ROOT=<ROOT>/repo\nHOME=/tmp\nPATH=<WORK>/bin:/usr/bin:/bin",
+    "sig": "2da79e94185d"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "merge-gate E_EVENT_MISSING 没有事件输入：--event <file> 或 EVENT 环境变量\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

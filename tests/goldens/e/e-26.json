@@ -1,0 +1,28 @@
+{
+  "suite": "e",
+  "id": "e-26",
+  "title": "cli · outbox 有积压",
+  "argv": [
+    "cli",
+    "outbox",
+    "--api",
+    "http://127.0.0.1:<PORT>"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "ATTEMPT    ITEM     FROM    TO           STATUS   ATTEMPTS\n---------  -------  ------  -----------  -------  --------\nattempt-1  issue-1  todo    in_progress  running  2\nattempt-2  issue-2  verify  done         queued   1\n下次巡检: 2026-10-27T00:00:00Z\n",
+  "stderr": "",
+  "files": [],
+  "requests": [
+    {
+      "method": "GET",
+      "url": "/api/outbox",
+      "body": ""
+    }
+  ]
+}

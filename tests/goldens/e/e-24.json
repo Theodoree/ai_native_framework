@@ -1,0 +1,28 @@
+{
+  "suite": "e",
+  "id": "e-24",
+  "title": "cli · verify 变红",
+  "argv": [
+    "cli",
+    "verify",
+    "--api",
+    "http://127.0.0.1:<PORT>"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 4,
+  "stdout": "exitCode: 1\n--- 输出尾部（最多 20 行，--json 看全文）---\nline-6\nline-7\nline-8\nline-9\nline-10\nline-11\nline-12\nline-13\nline-14\nline-15\nline-16\nline-17\nline-18\nline-19\nline-20\nline-21\nline-22\nline-23\nline-24\nline-25\n",
+  "stderr": "",
+  "files": [],
+  "requests": [
+    {
+      "method": "POST",
+      "url": "/api/verify",
+      "body": ""
+    }
+  ]
+}

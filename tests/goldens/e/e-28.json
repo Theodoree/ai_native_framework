@@ -1,0 +1,32 @@
+{
+  "suite": "e",
+  "id": "e-28",
+  "title": "cli · 后端拒绝（rejected）",
+  "argv": [
+    "cli",
+    "verdict",
+    "--id",
+    "issue-1",
+    "--to",
+    "done",
+    "--api",
+    "http://127.0.0.1:<PORT>"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "cli: 后端拒绝（HTTP 400）: ILLEGAL_TRANSITION: 这条转换不允许\n",
+  "files": [],
+  "requests": [
+    {
+      "method": "POST",
+      "url": "/api/verdict",
+      "body": "{\"id\":\"issue-1\",\"to\":\"done\",\"actor_role\":\"owner\",\"comment\":\"\"}"
+    }
+  ]
+}

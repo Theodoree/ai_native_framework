@@ -1,0 +1,26 @@
+{
+  "suite": "b",
+  "id": "b-33",
+  "title": "last-change · 零引用 → 报错",
+  "argv": [
+    "last-change"
+  ],
+  "env": {
+    "PATH": "<ROOT>/bin:<PATH>",
+    "HOME": "<HOME>",
+    "EVENT_NAME": "pull_request",
+    "EVENT": "{\"pull_request\":{\"number\":9,\"title\":\"x\",\"body\":\"no refs\",\"user\":{\"login\":\"alice\"},\"merged\":false}}",
+    "BASE": "781a78d873775bf572b27727830b3453924f47d7",
+    "HEAD": "5d8719f6c1e1e9f2831f4bb56360157de4568bb5"
+  },
+  "envSig": {
+    "text": "BASE=781a78d873775bf572b27727830b3453924f47d7\nEVENT={\"pull_request\":{\"number\":9,\"title\":\"x\",\"body\":\"no refs\",\"user\":{\"login\":\"alice\"},\"merged\":false}}\nEVENT_NAME=pull_request\nHEAD=5d8719f6c1e1e9f2831f4bb56360157de4568bb5\nHOME=<HOME>\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "116224c3ceb6"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "门牌重算失败：PR 必须引用恰好一个 issue（如 Fixes #4），实际 0 个：[]\n",
+  "files": [],
+  "requests": []
+}

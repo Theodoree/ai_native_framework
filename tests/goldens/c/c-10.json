@@ -1,0 +1,37 @@
+{
+  "suite": "c",
+  "id": "c-10",
+  "title": "G1 无法判定：两个状态标签",
+  "argv": [
+    "merge-gate",
+    "--repo",
+    "<ROOT>/repo",
+    "--event",
+    "<ROOT>/event.json",
+    "--pr",
+    "<ROOT>/pr.json",
+    "--issue",
+    "<ROOT>/issue.json",
+    "--checks",
+    "<ROOT>/checks.json",
+    "--infra",
+    "<ROOT>/infra.json",
+    "--config",
+    "<REPO_ROOT>/.agents/platform/state-machine.yml"
+  ],
+  "env": {
+    "PATH": "<WORK>/bin:/usr/bin:/bin",
+    "HOME": "/tmp",
+    "FAKE_GIT_ROOT": "<ROOT>/repo"
+  },
+  "envSig": {
+    "text": "FAKE_GIT_ROOT=<ROOT>/repo\nHOME=/tmp\nPATH=<WORK>/bin:/usr/bin:/bin",
+    "sig": "2da79e94185d"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "merge-gate PR #7 @ aaaaaaa\nmerge-gate G1 issue-state INFRA E_STATE_LABEL_COUNT 未就绪：issue 上最多只能有一个 state:* 标签，实际 2 个\nmerge-gate G2 refs-and-files PASS OK issue #4，门牌 1 个文件在 aaaaaaa 上存在\nmerge-gate G3 checks PASS OK 2 项别人家的检查全绿（同名取最新，自己不算），无未结 INFRA\nmerge-gate G4 last-change PASS OK 门牌 PR #7 = 本 PR #7\nmerge-gate INFRA 1/4 真失败=0 未就绪=1(G1)\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

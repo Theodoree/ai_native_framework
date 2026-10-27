@@ -1,0 +1,23 @@
+{
+  "suite": "d",
+  "id": "d-05",
+  "title": "输入申报 INFRA -> 判不了",
+  "argv": [
+    "audit-findings",
+    "--a",
+    "infra.json",
+    "--b",
+    "b.json"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "audit-findings a=infra.json b=b.json\naudit-findings executor a 申报=\"INFRA\" 计入=INFRA schema=不合格 findings=0 evidence=github/review-a/null/null\naudit-findings schema a evidence.model: 占位符 null 不算证据 —— 没跑到不能写成跑到并通过\naudit-findings schema a evidence.request_id: 占位符 null 不算证据 —— 没有上游 request_id 就无法追溯\naudit-findings reason a 没有 DEEPSEEK_API_KEY：判不了，不是通过\naudit-findings executor b 申报=\"pass\" 计入=pass schema=ok findings=0 evidence=sandbox/review-b/\"deepseek-reasoner\"/\"req-2\"\naudit-findings compare agreed=0 onlyA=0 onlyB=0 severityMismatch=0 同步率=n/a\naudit-findings verdict=INFRA conclusion=action_required exit=3\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

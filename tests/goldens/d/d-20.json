@@ -1,0 +1,20 @@
+{
+  "suite": "d",
+  "id": "d-20",
+  "title": "routes 是空数组",
+  "argv": [
+    "routing",
+    "--check"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": ".agents/platform/routing.yml: 空表 —— 一条路由都没有的声明没有意义\nrouting FAIL 1 个问题（.agents/platform/routing.yml）\n",
+  "files": [],
+  "requests": []
+}

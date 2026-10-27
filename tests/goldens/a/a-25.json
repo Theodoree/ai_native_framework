@@ -1,0 +1,22 @@
+{
+  "suite": "a",
+  "id": "a-25",
+  "title": "默认声明自洽（文本）",
+  "argv": [
+    "validate",
+    "--check-config"
+  ],
+  "env": {
+    "PLATFORM_LEDGER": "<ROOT>/ledger.jsonl"
+  },
+  "envSig": {
+    "text": "PLATFORM_LEDGER=<ROOT>/ledger.jsonl",
+    "sig": "591ff6170828"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "ALLOWED OK_CONFIG 配置自洽: 9 个状态 / 14 条转换\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

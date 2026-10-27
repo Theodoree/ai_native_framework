@@ -1,0 +1,23 @@
+{
+  "suite": "d",
+  "id": "d-06",
+  "title": "输入文件不存在",
+  "argv": [
+    "audit-findings",
+    "--a",
+    "missing.json",
+    "--b",
+    "b.json"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "audit-findings a=missing.json b=b.json\naudit-findings executor a 申报=null 计入=INFRA schema=不合格 findings=0 evidence=无 evidence\naudit-findings schema a 读不到输入：missing.json: ENOENT\naudit-findings executor b 申报=\"pass\" 计入=pass schema=ok findings=0 evidence=sandbox/review-b/\"deepseek-reasoner\"/\"req-2\"\naudit-findings compare agreed=0 onlyA=0 onlyB=0 severityMismatch=0 同步率=n/a\naudit-findings verdict=INFRA conclusion=action_required exit=3\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

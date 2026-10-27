@@ -1,0 +1,23 @@
+{
+  "suite": "b",
+  "id": "b-43",
+  "title": "writer-record · rejected 留痕且退出 0",
+  "argv": [
+    "writer-record",
+    "--issue",
+    "7"
+  ],
+  "env": {
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "PATH=<ROOT>/bin:<PATH>",
+    "sig": "ede8454483fb"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "gh-args: issue comment 7 --body 状态未被修改：REJECTED E_GUARD — 守卫缺失\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

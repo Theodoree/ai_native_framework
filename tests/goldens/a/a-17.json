@@ -1,0 +1,22 @@
+{
+  "suite": "a",
+  "id": "a-17",
+  "title": "--help 输出用法",
+  "argv": [
+    "validate",
+    "--help"
+  ],
+  "env": {
+    "PLATFORM_LEDGER": "<ROOT>/ledger.jsonl"
+  },
+  "envSig": {
+    "text": "PLATFORM_LEDGER=<ROOT>/ledger.jsonl",
+    "sig": "591ff6170828"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "用法: state-validate [--config <path>] [--intent <file|->] [--json] [--check-config]\n\n  --config <path>   状态机声明，默认 .agents/platform/state-machine.yml\n  --intent <file>   意图 JSON（- 或缺省 = stdin）\n  --json            机器可读输出（allowed 带 from/to/by/flow/event/guards）\n  --check-config    只校验声明自洽\n  --help            打印本用法\n\nguards: 转换声明了 guards 时，意图必须在 guards 里给非空证据 —— 缺一个就拒绝。\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

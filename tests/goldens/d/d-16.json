@@ -1,0 +1,19 @@
+{
+  "suite": "d",
+  "id": "d-16",
+  "title": "没有 --check -> 用法错",
+  "argv": [
+    "routing"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 2,
+  "stdout": "",
+  "stderr": "用法: node scripts/routing.mjs --check\n",
+  "files": [],
+  "requests": []
+}

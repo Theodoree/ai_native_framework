@@ -1,6 +1,6 @@
 # P-31 判据与门搬进 Go
 
-状态：阶段 A–D3 已完成，交付均未提交（工作树内）。`audit.yml` 的判定步自阶段 D3 起调编译产物（§十三）；`scripts/*.mjs` 本轮一份不删（用户裁决，引擎在 `main` 上跑稳之前仍作 parity 黄金基准），`USAGE` 文案仍写 Node 载体名。
+状态：阶段 A–D4 已完成并合入 main（A/B/C 见 §六–§十，D1 §十一、D2 §十二、D3 §十三、D4 §十四）。audit.yml 判定步自 D3 起调编译产物；parity 自 D4 起只跑引擎、与冻结 golden 比对，测试路径不再执行 scripts/*.mjs。scripts/*.mjs 与钉其实现细节的 Node 套件仍在（约 690 例），删除前置已解除但须先把用例移植成 Go 单测（§14.6）；USAGE 文案仍写 Node 载体名。
 
 ## 一、为什么做
 
@@ -459,3 +459,45 @@ B1 尤其关键：`source` 不是抄死的常量，是被真读出来再对仓�
 验收方法学有一条值得固化：本轮探针**两次假绿**（B1 首版嵌套引号导致替换未落盘、B3 首版 `\n` 变成真换行导致 SyntaxError，两次都读到 204 passed）。规则因此定为「改后行必须与改前不同（grep 打印 + `cmp` 还原），否则不算变异」——与 13.5 的「判据没被变异咬过就不算判据」是同一条教训的两面。
 
 证据：`/tmp/p31d3-verify.md`（166 行，含逐组日志路径）、`/tmp/v4-check.log`、`/tmp/v4-mut-{A1..A4,B1..B3,D1,D2,E1}.log`。
+
+## 十四、阶段 D4 落地记录（parity 与冻结 golden 比对）
+
+### 14.1 为什么先做这一步
+
+计划表里「D：删已迁移的 `.mjs`」一直没做，真实原因不是没空，而是**验收闸门自己依赖被删的对象**：五个 parity 套件那时是「同一 fixture 同时跑 Node 入口与 Go 入口，逐字节比」。只要 parity 还要执行 `scripts/*.mjs`，删脚本就等于删掉自己的参照物。所以顺序必须是：先把期望值**变成数据**，再谈删载体。
+
+### 14.2 落成了什么
+
+| 件 | 说明 |
+| --- | --- |
+| `tests/goldens/{a,b,c,d,e}/*.json` | 235 条冻结期望（46/59/50/48/32），单条含 argv、env 归一签名、断言口径、exitCode、stdout、stderr、写出的文件、上游请求 |
+| `tests/goldens/index.json` | suite → 条数与 case id 列表，不含时间戳（重冻必须逐字节相同） |
+| `tests/goldens/parity-cases.mjs` | 五套夹具的唯一来源（97KB） |
+| `tests/goldens/freeze.mjs` | **唯一**显式冻结入口，也是全仓唯一还知道 `scripts/*.mjs` 路径的地方 |
+| `tests/helpers/parity-golden.mjs`、`parity-suite.mjs` | golden 读写比对 / vitest 驱动 |
+| 五个 `tests/engine-parity*.test.mjs` | 各缩成 8 行 driver（E 另留 2 条调用点接线断言） |
+
+测试路径**不再执行任何 `scripts/*.mjs`**：期望值入库即数据，`grep process.execPath tests/engine-parity*.mjs` 零命中。
+
+### 14.3 冻结时最容易被忽略的一步：归一化
+
+第一版 golden 把机器指纹冻进去了——`PATH`/`HOME`/tmpdir 的绝对路径、仓库绝对路径、Node 栈里的 `file://…`、随机 `.tmp-N` 后缀、索引里的时间戳。这样的期望值换一台机器就红，而且红得没有信息。归一化（`<REPO>`/`<WORK>`/`<PATH>`/`<HOME>`/`<TMP>`、`.tmp-N → .tmp-<N>`、去掉时间戳）之后才做到**在另一个 checkout 全量重冻与仓库内 golden `diff -r` 逐字节一致**——这条是 golden 能不能当数据的关键，不是洁癖。
+
+### 14.4 唯一实质降级点（登记）
+
+B 套 5 条 `KNOWN_DIVERGENCES`（Node 侧抛未捕获异常）改成 `pattern` 口径：仍钉退出码与 Go 侧 stderr 前缀，但「Node 侧 stderr 必须含 `SyntaxError`/`TypeError`」这半边不再断言——Node 侧已不在测试路径上，没有可比对象。补偿是 `freeze.mjs` 的 Node 侧自检（`nodeStderrContains`）在冻结时确认参照物真的打中了它声称的分支，冻结产物本身不依赖运行时。
+
+### 14.5 变异表（均在与仓库无关的 `/tmp` 副本）
+
+| 变异 | 结果 |
+| --- | --- |
+| `mergegate.go` 的 `Verdict: "PASS"` → `"PASSED"` | C 套 39 红 |
+| `auditfindings.go` 的 `action_required` → `action-needed` | D 套 4 红 |
+| 篡改 `goldens/d/d-05.json` 一个字节 | 1 红 |
+| 删掉某条 golden | 1 红，报「golden 不存在…确需重冻请显式运行 node tests/goldens/freeze.mjs」 |
+| 删掉整套 golden 后跑测试 | 240 红，且跑完**没有任何文件被补回来**（默认路径不写 golden） |
+| `kbexport.go` 清单头改一个字符 | E 套 5 红 |
+
+### 14.6 仍未关
+
+`scripts/*.mjs` 与钉它们实现细节的 Node 套件仍在（约 690 例）。**删脚本的前提已解除，但删之前必须先把这些用例移植成 Go 单测**——直接删等于同时删掉 690 条验证，只剩 95 条 golden 对照与 24 条 Go 单测，那是撤闸不是清场。移植按模块增量做，每移植完一个模块才删它对应的那一份。

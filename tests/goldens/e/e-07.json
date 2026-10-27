@@ -1,0 +1,27 @@
+{
+  "suite": "e",
+  "id": "e-07",
+  "title": "kb-export · 没有仓库名 -> 报错",
+  "argv": [
+    "kb-export",
+    "--cwd",
+    "<REPO>",
+    "--from",
+    "e5795f9b923c93fc582bd01deb33023f603e4aa5",
+    "--to",
+    "f9c87d996af6b5ec555526b0a36e10bd2b3feb12"
+  ],
+  "env": {
+    "GITHUB_REPOSITORY": ""
+  },
+  "envSig": {
+    "text": "GITHUB_REPOSITORY=",
+    "sig": "54728c6107e3"
+  },
+  "assertMode": "bytes",
+  "exitCode": 2,
+  "stdout": "",
+  "stderr": "kb-export: 缺 source_repo：给 --repo 或设 GITHUB_REPOSITORY\n",
+  "files": [],
+  "requests": []
+}

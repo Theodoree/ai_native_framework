@@ -1,0 +1,28 @@
+{
+  "suite": "a",
+  "id": "a-41",
+  "title": "append 回显与落盘字节",
+  "argv": [
+    "ledger",
+    "append",
+    "--json"
+  ],
+  "env": {
+    "PLATFORM_LEDGER": "<ROOT>/ledger.jsonl"
+  },
+  "envSig": {
+    "text": "PLATFORM_LEDGER=<ROOT>/ledger.jsonl",
+    "sig": "591ff6170828"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "{\"id\":\"REQ-9\",\"at\":\"2024-02-01T00:00:00Z\",\"from\":\"none\",\"to\":\"triage\",\"by\":\"ci\",\"flow\":\"manual\",\"comment\":\"\"}\n",
+  "stderr": "",
+  "files": [
+    {
+      "path": "ledger.jsonl",
+      "text": "{\"id\":\"REQ-9\",\"at\":\"2024-02-01T00:00:00Z\",\"from\":\"none\",\"to\":\"triage\",\"by\":\"ci\",\"flow\":\"manual\",\"comment\":\"\"}\n"
+    }
+  ],
+  "requests": []
+}

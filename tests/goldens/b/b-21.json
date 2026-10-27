@@ -1,0 +1,23 @@
+{
+  "suite": "b",
+  "id": "b-21",
+  "title": "build-intent · --resolve-issue 解出 issue 号",
+  "argv": [
+    "build-intent",
+    "--resolve-issue"
+  ],
+  "env": {
+    "EVENT": "{\"action\":\"opened\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:triage\"}],\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}",
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "EVENT={\"action\":\"opened\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:triage\"}],\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "acbb83e18bb4"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "12\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

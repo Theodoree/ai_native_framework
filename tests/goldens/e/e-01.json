@@ -1,0 +1,32 @@
+{
+  "suite": "e",
+  "id": "e-01",
+  "title": "copy-dist · 把 dist 铺进目标目录",
+  "argv": [
+    "copy-dist"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "copy-dist: apps/web-vue/dist → apps/api-go/dist\n",
+  "stderr": "",
+  "files": [
+    {
+      "path": "apps/api-go/dist/assets/app.css",
+      "text": "body{}\n"
+    },
+    {
+      "path": "apps/api-go/dist/assets/app.js",
+      "text": "console.log(1)\n"
+    },
+    {
+      "path": "apps/api-go/dist/index.html",
+      "text": "<html>hi</html>\n"
+    }
+  ],
+  "requests": []
+}

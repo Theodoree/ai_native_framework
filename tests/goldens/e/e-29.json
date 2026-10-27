@@ -1,0 +1,28 @@
+{
+  "suite": "e",
+  "id": "e-29",
+  "title": "cli · 后端故障（infra）",
+  "argv": [
+    "cli",
+    "board",
+    "--api",
+    "http://127.0.0.1:<PORT>"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "",
+  "stderr": "cli: 后端故障（HTTP 500）: 账本读不动\n",
+  "files": [],
+  "requests": [
+    {
+      "method": "GET",
+      "url": "/api/board",
+      "body": ""
+    }
+  ]
+}
