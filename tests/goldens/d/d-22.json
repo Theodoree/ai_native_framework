@@ -1,0 +1,19 @@
+{
+  "suite": "d",
+  "id": "d-22",
+  "title": "无参 -> 用法错",
+  "argv": [
+    "audit-collect"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 2,
+  "stdout": "",
+  "stderr": "audit-collect --pr 必填（要审计的 PR 号）\n用法: node scripts/audit-collect.mjs --pr <数字> --a <findings-a.json> --b <findings-b.json> [--ref <分支>] [--dry-run] [--json] [--timeout <秒>]\n",
+  "files": [],
+  "requests": []
+}

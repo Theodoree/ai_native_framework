@@ -1,0 +1,25 @@
+{
+  "suite": "e",
+  "id": "e-08",
+  "title": "kb-export · --range 形状不对 -> 报错",
+  "argv": [
+    "kb-export",
+    "--cwd",
+    "<REPO>",
+    "--repo",
+    "owner/name",
+    "--range",
+    "abc"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 2,
+  "stdout": "",
+  "stderr": "kb-export: --range 要写成 A..B，收到 abc\n",
+  "files": [],
+  "requests": []
+}

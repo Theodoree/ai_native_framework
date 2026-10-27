@@ -1,0 +1,29 @@
+{
+  "suite": "e",
+  "id": "e-16",
+  "title": "cli · board --json",
+  "argv": [
+    "cli",
+    "board",
+    "--json",
+    "--api",
+    "http://127.0.0.1:<PORT>"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "{\n  \"items\": [\n    {\n      \"id\": \"issue-1\",\n      \"state\": \"todo\",\n      \"title\": \"甲\",\n      \"divergence\": true\n    },\n    {\n      \"id\": \"issue-2\",\n      \"state\": null,\n      \"title\": \"\"\n    },\n    {\n      \"id\": \"issue-3\",\n      \"state\": \"verify\",\n      \"title\": \"乙 issue\"\n    }\n  ]\n}\n",
+  "stderr": "",
+  "files": [],
+  "requests": [
+    {
+      "method": "GET",
+      "url": "/api/board",
+      "body": ""
+    }
+  ]
+}

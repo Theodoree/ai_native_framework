@@ -1,0 +1,28 @@
+{
+  "suite": "e",
+  "id": "e-15",
+  "title": "cli · board 渲染看板",
+  "argv": [
+    "cli",
+    "board",
+    "--api",
+    "http://127.0.0.1:<PORT>"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "ID       STATE   TITLE     漂移\n-------  ------  --------  --------\nissue-1  todo    甲        远端漂移\nissue-2  none    -         -\nissue-3  verify  乙 issue  -\n",
+  "stderr": "",
+  "files": [],
+  "requests": [
+    {
+      "method": "GET",
+      "url": "/api/board",
+      "body": ""
+    }
+  ]
+}

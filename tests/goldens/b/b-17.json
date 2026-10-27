@@ -1,0 +1,29 @@
+{
+  "suite": "b",
+  "id": "b-17",
+  "title": "build-intent · 认不出的事件 → 无意图",
+  "argv": [
+    "build-intent"
+  ],
+  "env": {
+    "EVENT_NAME": "push",
+    "EVENT": "{\"ref\":\"refs/heads/main\"}",
+    "GITHUB_OUTPUT": "<ROOT>/gh.txt",
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "EVENT={\"ref\":\"refs/heads/main\"}\nEVENT_NAME=push\nGITHUB_OUTPUT=<ROOT>/gh.txt\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "1b45722487f5"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "",
+  "stderr": "no-state-change push. — 该事件不需要改动 issue 状态，跳过判定与留痕\n",
+  "files": [
+    {
+      "path": "gh.txt",
+      "text": "has_intent=0\n"
+    }
+  ],
+  "requests": []
+}

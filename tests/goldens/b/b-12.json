@@ -1,0 +1,29 @@
+{
+  "suite": "b",
+  "id": "b-12",
+  "title": "build-intent · pull_request opened 无宿主标签 → issue-state-unavailable",
+  "argv": [
+    "build-intent"
+  ],
+  "env": {
+    "EVENT_NAME": "pull_request",
+    "EVENT": "{\"action\":\"opened\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:triage\"}],\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}",
+    "GITHUB_OUTPUT": "<ROOT>/gh.txt",
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "EVENT={\"action\":\"opened\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:triage\"}],\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}\nEVENT_NAME=pull_request\nGITHUB_OUTPUT=<ROOT>/gh.txt\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "21728f992526"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "{\n  \"issue\": 12,\n  \"to\": \"in-progress\",\n  \"actor\": \"ci\",\n  \"actor_role\": \"ci\",\n  \"labels\": [],\n  \"comment\": \"\",\n  \"unresolved\": {\n    \"reason\": \"issue-state-unavailable\",\n    \"candidates\": [\n      12\n    ]\n  }\n}\n",
+  "stderr": "issue-unresolved issue-state-unavailable [12]\n",
+  "files": [
+    {
+      "path": "gh.txt",
+      "text": "has_intent=1\n"
+    }
+  ],
+  "requests": []
+}

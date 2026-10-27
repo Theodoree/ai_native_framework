@@ -1,0 +1,23 @@
+{
+  "suite": "a",
+  "id": "a-11",
+  "title": "文本输出：拒绝一行（不带 --json）",
+  "argv": [
+    "validate",
+    "--intent",
+    "-"
+  ],
+  "env": {
+    "PLATFORM_LEDGER": "<ROOT>/ledger.jsonl"
+  },
+  "envSig": {
+    "text": "PLATFORM_LEDGER=<ROOT>/ledger.jsonl",
+    "sig": "591ff6170828"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "REJECTED E_AGENT_CANNOT_WRITE agent 只能评论并建议，不能改状态\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

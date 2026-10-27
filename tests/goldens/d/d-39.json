@@ -1,0 +1,36 @@
+{
+  "suite": "d",
+  "id": "d-39",
+  "title": "只有 high -> needs_revision",
+  "argv": [
+    "audit-review",
+    "--slot",
+    "review-a",
+    "--diff",
+    "diff.txt",
+    "--out",
+    "out/record.json",
+    "--api-base",
+    "http://127.0.0.1:<PORT>/high"
+  ],
+  "env": {
+    "DEEPSEEK_API_KEY": "stub-key-123"
+  },
+  "envSig": {
+    "text": "DEEPSEEK_API_KEY=stub-key-123",
+    "sig": "d138feef27ff"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "audit-review slot=review-a verdict=needs_revision findings=1 exit=0 out=<ROOT>/out/record.json\n",
+  "stderr": "",
+  "files": [
+    {
+      "path": "out/record.json",
+      "text": "{\n  \"verdict\": \"needs_revision\",\n  \"findings\": [\n    {\n      \"path\": \"scripts/x.mjs\",\n      \"line\": 3,\n      \"severity\": \"high\",\n      \"criterion\": \"必须校验输入\",\n      \"suggestion\": \"加校验\"\n    }\n  ],\n  \"evidence\": {\n    \"executor\": \"github\",\n    \"agent\": \"review-a\",\n    \"model\": \"deepseek-chat\",\n    \"request_id\": \"req-3\"\n  }\n}\n"
+    }
+  ],
+  "requests": [
+    "{\"url\":\"/high/chat/completions\",\"body\":\"{\\\"model\\\":\\\"deepseek-chat\\\",\\\"messages\\\":[{\\\"role\\\":\\\"system\\\",\\\"content\\\":\\\"你是代码审计器：只审查给出的 git diff，不猜 diff 以外的文件。\\\\n只输出一个 JSON 对象：{\\\\\\\"findings\\\\\\\":[{\\\\\\\"path\\\\\\\",\\\\\\\"line\\\\\\\",\\\\\\\"severity\\\\\\\",\\\\\\\"criterion\\\\\\\",\\\\\\\"suggestion\\\\\\\"}]}，不要输出任何解释文字。\\\\npath 用 diff 里的仓库相对路径（去掉 a/ b/ 前缀）；line 用变更后（+ 侧）的行号，必须是 ≥1 的整数。\\\\nseverity 只能是 blocker / high / medium / low。\\\\ncriterion 写违反了哪条判据，suggestion 写怎么改；两者都不能为空。\\\\n没有缺陷就输出 {\\\\\\\"findings\\\\\\\":[]}。\\\"},{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"```diff\\\\ndiff --git a/scripts/x.mjs b/scripts/x.mjs\\\\n--- a/scripts/x.mjs\\\\n+++ b/scripts/x.mjs\\\\n@@ -1 +1 @@\\\\n-const old = 1;\\\\n+const next = 2;\\\\n\\\\n```\\\"}],\\\"stream\\\":false,\\\"temperature\\\":0}\"}"
+  ]
+}

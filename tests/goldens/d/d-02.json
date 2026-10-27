@@ -1,0 +1,30 @@
+{
+  "suite": "d",
+  "id": "d-02",
+  "title": "写出 result.json",
+  "argv": [
+    "audit-findings",
+    "--a",
+    "a.json",
+    "--b",
+    "b.json",
+    "--out",
+    "result.json"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "audit-findings a=a.json b=b.json\naudit-findings executor a 申报=\"pass\" 计入=pass schema=ok findings=0 evidence=github/review-a/\"deepseek-chat\"/\"req-1\"\naudit-findings executor b 申报=\"pass\" 计入=pass schema=ok findings=0 evidence=sandbox/review-b/\"deepseek-reasoner\"/\"req-2\"\naudit-findings compare agreed=0 onlyA=0 onlyB=0 severityMismatch=0 同步率=n/a\naudit-findings verdict=pass conclusion=success exit=0\n",
+  "stderr": "",
+  "files": [
+    {
+      "path": "result.json",
+      "text": "{\n  \"verdict\": \"pass\",\n  \"conclusion\": \"success\",\n  \"exit_code\": 0,\n  \"exit\": 0,\n  \"executors\": [\n    {\n      \"slot\": \"a\",\n      \"declared\": \"pass\",\n      \"effective\": \"pass\",\n      \"valid\": true,\n      \"errors\": [],\n      \"reason\": null,\n      \"evidence\": {\n        \"executor\": \"github\",\n        \"agent\": \"review-a\",\n        \"model\": \"deepseek-chat\",\n        \"request_id\": \"req-1\"\n      },\n      \"findings\": []\n    },\n    {\n      \"slot\": \"b\",\n      \"declared\": \"pass\",\n      \"effective\": \"pass\",\n      \"valid\": true,\n      \"errors\": [],\n      \"reason\": null,\n      \"evidence\": {\n        \"executor\": \"sandbox\",\n        \"agent\": \"review-b\",\n        \"model\": \"deepseek-reasoner\",\n        \"request_id\": \"req-2\"\n      },\n      \"findings\": []\n    }\n  ],\n  \"comparison\": {\n    \"agreed\": [],\n    \"onlyA\": [],\n    \"onlyB\": [],\n    \"severityMismatch\": [],\n    \"counts\": {\n      \"agreed\": 0,\n      \"onlyA\": 0,\n      \"onlyB\": 0,\n      \"severityMismatch\": 0\n    },\n    \"agreementRate\": null\n  },\n  \"reason\": null\n}\n"
+    }
+  ],
+  "requests": []
+}

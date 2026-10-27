@@ -1,0 +1,42 @@
+{
+  "suite": "e",
+  "id": "e-11",
+  "title": "kb-export · 继承已有清单",
+  "argv": [
+    "kb-export",
+    "--cwd",
+    "<REPO>",
+    "--repo",
+    "owner/name",
+    "--from",
+    "e5795f9b923c93fc582bd01deb33023f603e4aa5",
+    "--to",
+    "f9c87d996af6b5ec555526b0a36e10bd2b3feb12",
+    "--existing",
+    "existing.yml",
+    "--out",
+    "manifest.yml",
+    "--infra-out",
+    "infra.yml"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "",
+  "stderr": "kb-export: --existing 有 1 条缺 path/sha256，已忽略\nkb-export: denied node_modules/pkg/README.md (build-artifact-dir:node_modules)\nkb-export: included=3 inherited=0 duplicates=0 denied=1 infra=0\n",
+  "files": [
+    {
+      "path": "infra.yml",
+      "text": "kind: ok\nsource_repo: owner/name\nsource_ref: main\nrange: e5795f9b923c93fc582bd01deb33023f603e4aa5..f9c87d996af6b5ec555526b0a36e10bd2b3feb12\nretry_paths: []\nfailures: []\n"
+    },
+    {
+      "path": "manifest.yml",
+      "text": "# 知识库汇入清单 · source_repo=owner/name source_ref=main range=e5795f9b923c93fc582bd01deb33023f603e4aa5..f9c87d996af6b5ec555526b0a36e10bd2b3feb12\n# 累积清单：本次区间新增 3 条、继承 0 条、共 3 条\n# 每条固定头见 docs/knowledge-base.md；sha256 取 git blob（commit 内的内容字节），不是工作区。\n- source_repo: owner/name\n  source_ref: main\n  commit: f9c87d996af6b5ec555526b0a36e10bd2b3feb12\n  path: .agents/notes/implemented/n1.md\n  sha256: 796d69756fed56097e4d40d4b3f46c568b8df28f2f27da3e170992badb5eadc2\n  updated_at: 2024-01-01T00:00:00Z\n- source_repo: owner/name\n  source_ref: main\n  commit: f9c87d996af6b5ec555526b0a36e10bd2b3feb12\n  path: docs/architecture.md\n  sha256: 6660d9f204ee143e9f7c507e2e4b7fa9128a84cf4af997589d9049839b3e0378\n  updated_at: 2024-01-01T00:00:00Z\n- source_repo: owner/name\n  source_ref: main\n  commit: f9c87d996af6b5ec555526b0a36e10bd2b3feb12\n  path: docs/postmortem/p1.md\n  sha256: 2dc43a466a3fb5896dace477dcf43876b5ff20c59d83a45c26229b743987893e\n  updated_at: 2024-01-01T00:00:00Z\n"
+    }
+  ],
+  "requests": []
+}

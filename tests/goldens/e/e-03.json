@@ -1,0 +1,19 @@
+{
+  "suite": "e",
+  "id": "e-03",
+  "title": "copy-dist · 没有 dist 时走占位分支",
+  "argv": [
+    "copy-dist"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "copy-dist: 没有 apps/web-vue/dist，保留占位文件（go build 仍可跑，页面不进二进制）\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}

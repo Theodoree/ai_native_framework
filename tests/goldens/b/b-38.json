@@ -1,0 +1,26 @@
+{
+  "suite": "b",
+  "id": "b-38",
+  "title": "last-change · 合并信息只补一半 → 报错",
+  "argv": [
+    "last-change"
+  ],
+  "env": {
+    "PATH": "<ROOT>/bin:<PATH>",
+    "HOME": "<HOME>",
+    "EVENT_NAME": "pull_request",
+    "EVENT": "{\"pull_request\":{\"number\":9,\"title\":\"x\",\"body\":\"Fixes #4\",\"user\":{\"login\":\"alice\"},\"merged\":true,\"merged_by\":{\"login\":\"dan\"}}}",
+    "BASE": "781a78d873775bf572b27727830b3453924f47d7",
+    "HEAD": "5d8719f6c1e1e9f2831f4bb56360157de4568bb5"
+  },
+  "envSig": {
+    "text": "BASE=781a78d873775bf572b27727830b3453924f47d7\nEVENT={\"pull_request\":{\"number\":9,\"title\":\"x\",\"body\":\"Fixes #4\",\"user\":{\"login\":\"alice\"},\"merged\":true,\"merged_by\":{\"login\":\"dan\"}}}\nEVENT_NAME=pull_request\nHEAD=5d8719f6c1e1e9f2831f4bb56360157de4568bb5\nHOME=<HOME>\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "1e889dc8b7e4"
+  },
+  "assertMode": "bytes",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "门牌重算失败：合并人与合并日期必须成对出现：只补一半会让门牌自相矛盾\n",
+  "files": [],
+  "requests": []
+}

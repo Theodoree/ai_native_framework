@@ -1,0 +1,40 @@
+{
+  "suite": "e",
+  "id": "e-02",
+  "title": "copy-dist · 清掉上一轮残留产物",
+  "argv": [
+    "copy-dist"
+  ],
+  "env": {},
+  "envSig": {
+    "text": "",
+    "sig": "e3b0c44298fc"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "copy-dist: apps/web-vue/dist → apps/api-go/dist\n",
+  "stderr": "",
+  "files": [
+    {
+      "path": "apps/api-go/dist/assets/app.css",
+      "text": "body{}\n"
+    },
+    {
+      "path": "apps/api-go/dist/assets/app.js",
+      "text": "console.log(1)\n"
+    },
+    {
+      "path": "apps/api-go/dist/index.html",
+      "text": "<html>hi</html>\n"
+    },
+    {
+      "path": "apps/api-go/dist/old/gone.js",
+      "deleted": true
+    },
+    {
+      "path": "apps/api-go/dist/stale.txt",
+      "deleted": true
+    }
+  ],
+  "requests": []
+}

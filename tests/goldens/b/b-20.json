@@ -1,0 +1,30 @@
+{
+  "suite": "b",
+  "id": "b-20",
+  "title": "build-intent · GUARD_EVIDENCE_FILE 有空值 → 整份丢弃",
+  "argv": [
+    "build-intent"
+  ],
+  "env": {
+    "EVENT_NAME": "pull_request",
+    "EVENT": "{\"action\":\"opened\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:triage\"}],\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}",
+    "GUARD_EVIDENCE_FILE": "guards.json",
+    "GITHUB_OUTPUT": "<ROOT>/gh.txt",
+    "PATH": "<ROOT>/bin:<PATH>"
+  },
+  "envSig": {
+    "text": "EVENT={\"action\":\"opened\",\"pull_request\":{\"number\":3,\"body\":\"Fixes #12\",\"labels\":[{\"name\":\"state:triage\"}],\"author_association\":\"OWNER\"},\"sender\":{\"login\":\"ci\"}}\nEVENT_NAME=pull_request\nGITHUB_OUTPUT=<ROOT>/gh.txt\nGUARD_EVIDENCE_FILE=guards.json\nPATH=<ROOT>/bin:<PATH>",
+    "sig": "4f3014f0e353"
+  },
+  "assertMode": "bytes",
+  "exitCode": 0,
+  "stdout": "{\n  \"issue\": 12,\n  \"to\": \"in-progress\",\n  \"actor\": \"ci\",\n  \"actor_role\": \"ci\",\n  \"labels\": [],\n  \"comment\": \"\",\n  \"unresolved\": {\n    \"reason\": \"issue-state-unavailable\",\n    \"candidates\": [\n      12\n    ]\n  }\n}\n",
+  "stderr": "issue-unresolved issue-state-unavailable [12]\n",
+  "files": [
+    {
+      "path": "gh.txt",
+      "text": "has_intent=1\n"
+    }
+  ],
+  "requests": []
+}

@@ -1,0 +1,23 @@
+{
+  "suite": "a",
+  "id": "a-44",
+  "title": "append 不是合法 JSON",
+  "argv": [
+    "ledger",
+    "append",
+    "--json"
+  ],
+  "env": {
+    "PLATFORM_LEDGER": "<ROOT>/ledger.jsonl"
+  },
+  "envSig": {
+    "text": "PLATFORM_LEDGER=<ROOT>/ledger.jsonl",
+    "sig": "591ff6170828"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "",
+  "stderr": "{\"kind\":\"infra\",\"code\":\"E_EVENT_UNPARSABLE\",\"message\":\"stdin 不是合法 JSON: Expected property name or '}' in JSON at position 1\",\"extra\":{}}\n",
+  "files": [],
+  "requests": []
+}

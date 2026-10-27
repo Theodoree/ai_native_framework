@@ -1,0 +1,37 @@
+{
+  "suite": "c",
+  "id": "c-42",
+  "title": "G3 无法判定：check runs 形状不对",
+  "argv": [
+    "merge-gate",
+    "--repo",
+    "<ROOT>/repo",
+    "--event",
+    "<ROOT>/event.json",
+    "--pr",
+    "<ROOT>/pr.json",
+    "--issue",
+    "<ROOT>/issue.json",
+    "--checks",
+    "<ROOT>/checks.json",
+    "--infra",
+    "<ROOT>/infra.json",
+    "--config",
+    "<REPO_ROOT>/.agents/platform/state-machine.yml"
+  ],
+  "env": {
+    "PATH": "<WORK>/bin:/usr/bin:/bin",
+    "HOME": "/tmp",
+    "FAKE_GIT_ROOT": "<ROOT>/repo"
+  },
+  "envSig": {
+    "text": "FAKE_GIT_ROOT=<ROOT>/repo\nHOME=/tmp\nPATH=<WORK>/bin:/usr/bin:/bin",
+    "sig": "2da79e94185d"
+  },
+  "assertMode": "bytes",
+  "exitCode": 3,
+  "stdout": "merge-gate PR #7 @ aaaaaaa\nmerge-gate G1 issue-state PASS OK issue #4 in-progress → done（ci）\nmerge-gate G2 refs-and-files INFRA E_CHECKS_SHAPE 未就绪：check runs 输入应为数组或 { check_runs: [...] }\nmerge-gate G3 checks INFRA E_CHECKS_SHAPE 未就绪：check runs 输入应为数组或 { check_runs: [...] }\nmerge-gate G4 last-change INFRA E_CHECKS_SHAPE 未就绪：check runs 输入应为数组或 { check_runs: [...] }\nmerge-gate INFRA 3/4 真失败=0 未就绪=3(G2,G3,G4)\n",
+  "stderr": "",
+  "files": [],
+  "requests": []
+}
