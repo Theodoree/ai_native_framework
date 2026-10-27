@@ -109,6 +109,7 @@ func (s *Server) mount(r *ginRouter) {
 	handle("POST", "/api/requirements/:id/nodes/:node/run", s.nodeRun)
 	handle("POST", "/api/requirements/:id/nodes/:node/accept", s.nodeAccept)
 	handle("POST", "/api/requirements/:id/nodes/:node/reject", s.nodeReject)
+	handle("POST", "/api/requirements/:id/nodes/:node/restart", s.nodeRestart)
 	handle("POST", "/api/requirements/:id/nodes/:node/comment", s.nodeComment)
 	handle("POST", "/api/requirements/:id/nodes/:node/rules", s.nodeRule)
 
@@ -426,39 +427,108 @@ func (s *Server) nodeRun(c *gin.Context) {
 		return
 	}
 	me := s.me(c)
-	from := n.State
-	if err := req.BeginRun(n.Key, s.now()); err != nil {
+	// 整条需求被拒时才回告：回告写在落库之后。
+	rejectWhole, err := s.runNode(req, n, me.User.Username)
+	if err != nil {
 		fail(c, 409, err.Error())
 		return
 	}
-	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, me.User.Username)
-	// 整条需求被拒时才回告：回告写在落库之后。
+	if rejectWhole != "" {
+		s.recordRejection(req, n.Key, rejectWhole)
+	}
+	if err := s.store.SaveRequirement(req); err != nil {
+		fail(c, 500, err.Error())
+		return
+	}
+	if rejectWhole != "" {
+		s.deliverCallback(req, n.Key, rejectWhole)
+	}
+	writeJSON(c, 200, req)
+}
+
+// runNode 让一站真的跑一次并把结果落定，返回整条需求被拒时的理由（空串=没被整条拒）。
+//
+// 手动跑（nodeRun）和重启后的重跑（nodeRestart）共用这一段：重启容器站就是「退回待开始再跑一次」，
+// 跑法必须与手动点一次完全一致，否则同一站的两个入口会各自演化出不同的状态机。
+func (s *Server) runNode(req *Requirement, n *Node, author string) (string, error) {
+	from := req.Node(n.Key).State
+	if err := req.BeginRun(n.Key, s.now()); err != nil {
+		return "", err
+	}
+	s.logEvent(req, n.Key, "run", from, req.Node(n.Key).State, author)
+	if !IsContainer(n.Type) {
+		// 空节点没有容器可跑：退到 running 等人自己动手。
+		return "", nil
+	}
+	attempt, comment, artifacts := s.exec.Run(req, n, s.now())
+	if err := req.FinishRun(n.Key, attempt, comment, artifacts, s.now()); err != nil {
+		return "", err
+	}
+	s.logEvent(req, n.Key, "finish", StateRunning, StateAwaitingReview, attempt.Template)
+	// 容器自审只有 review=ai 的节点会自动定案；人审节点在这里停住等人按。
+	applied, err := req.ApplyReview(n.Key, attempt.Verdict, attempt.VerdictReason, s.now())
+	if err != nil {
+		return "", err
+	}
+	rejectWhole := ""
+	switch applied {
+	case "accepted":
+		s.logEvent(req, n.Key, "accept", StateAwaitingReview, StateAccepted, "AI 自审通过")
+	case "rejected":
+		s.logEvent(req, n.Key, "reject", StateAwaitingReview, req.Node(n.Key).State, attempt.VerdictReason)
+		if req.State == ReqRejected {
+			rejectWhole = attempt.VerdictReason
+		}
+	}
+	return rejectWhole, nil
+}
+
+// nodeRestart 把一站退回待开始。用户说的是「重启这一站的工作」：容器站退回后立刻重跑，
+// 空节点（dev / merge）没有活可跑，退回待开始等人自己在分支上重做。
+// 拒绝与确认是另外两组动作，这里一概不做。
+func (s *Server) nodeRestart(c *gin.Context) {
+	req, n, body, ok := s.prepare(c)
+	if !ok {
+		return
+	}
+	if !s.requirePower(c, req, n) {
+		return
+	}
+	me := s.me(c)
+	from := n.State
+	reason := strings.TrimSpace(or(body.Reason, body.Body))
+	// 已通过的站重启是破坏性的（后面基于它的站都要退），理由必须留痕。
+	if from == StateAccepted && reason == "" {
+		fail(c, 400, "重启已通过的站必须说明理由")
+		return
+	}
+	rolled, err := req.RestartNode(n.Key, s.now())
+	if err != nil {
+		fail(c, 409, err.Error())
+		return
+	}
+	detail := fmt.Sprintf("重启第 %d 站（%s）", n.Index+1, n.Key)
+	if reason != "" {
+		detail += "：" + reason
+	}
+	if rolled > 0 {
+		detail += fmt.Sprintf("；后面的 %d 站一起退回待开始", rolled)
+	}
+	if err := req.AddSystemComment(n.Key, detail, s.now()); err != nil {
+		fail(c, 409, err.Error())
+		return
+	}
+	s.logEvent(req, n.Key, "restart", from, req.Node(n.Key).State, detail)
 	rejectWhole := ""
 	if IsContainer(n.Type) {
-		attempt, comment, artifacts := s.exec.Run(req, n, s.now())
-		if err := req.FinishRun(n.Key, attempt, comment, artifacts, s.now()); err != nil {
-			fail(c, 409, err.Error())
-			return
-		}
-		s.logEvent(req, n.Key, "finish", StateRunning, StateAwaitingReview, attempt.Template)
-		// 容器自审只有 review=ai 的节点会自动定案；人审节点在这里停住等人按。
-		applied, err := req.ApplyReview(n.Key, attempt.Verdict, attempt.VerdictReason, s.now())
+		rejectWhole, err = s.runNode(req, n, me.User.Username)
 		if err != nil {
 			fail(c, 409, err.Error())
 			return
 		}
-		switch applied {
-		case "accepted":
-			s.logEvent(req, n.Key, "accept", StateAwaitingReview, StateAccepted, "AI 自审通过")
-		case "rejected":
-			s.logEvent(req, n.Key, "reject", StateAwaitingReview, req.Node(n.Key).State, attempt.VerdictReason)
-			if req.State == ReqRejected {
-				rejectWhole = attempt.VerdictReason
-			}
+		if rejectWhole != "" {
+			s.recordRejection(req, n.Key, rejectWhole)
 		}
-	}
-	if rejectWhole != "" {
-		s.recordRejection(req, n.Key, rejectWhole)
 	}
 	if err := s.store.SaveRequirement(req); err != nil {
 		fail(c, 500, err.Error())

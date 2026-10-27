@@ -355,6 +355,44 @@ func (r *Requirement) FinishRun(key string, a Attempt, comment Comment, artifact
 	return nil
 }
 
+// RestartNode 把某一站退回「待开始」。它只改状态，不负责开跑：要不要重跑由人再点一次。
+//
+// 三种叫法在同一处收口：
+//   - 目标站是当前站或更早的站（index <= CurrentIndex），否则 409 —— 还没走到的站没有「重启」可言；
+//   - 整条需求已被拒时不允许单站重启，回滚整条内容易，退回一站却讲不清楚；
+//   - 目标是已通过的站时，它后面的站一起退回（它们都是基于这一站的产出通过的），返回被退回的站数。
+//
+// 历史一律不清：attempts / comments / rules / artifacts 都留着，重启只是把状态位往回拨。
+func (r *Requirement) RestartNode(key string, now time.Time) (int, error) {
+	n := r.Node(key)
+	if n == nil {
+		return 0, fmt.Errorf("没有这个节点：%s", key)
+	}
+	if r.State == ReqRejected {
+		return 0, errors.New("整条需求已被拒，重启单站没有意义：请重新提一条")
+	}
+	// 「还没到」只对没被动过的站成立：被驳回过、退回过重做的站状态不是 pending，
+	// 它们确实走过一遭（驳回会把上一站重置成 running，位置随之往回退，不能因此就不许重启它）。
+	if cur := r.CurrentIndex(); n.Index > cur && n.State == StatePending {
+		return 0, fmt.Errorf("还没到这一站：%s 是第 %d 站，当前走到第 %d 站（%s）", key, n.Index+1, cur+1, r.Nodes[cur].Key)
+	}
+	n.State = StatePending
+	n.Rev++
+	// 后面本来就是 pending 的站不算「被退回」：它们没被动到。
+	rolled := 0
+	for _, later := range r.Nodes[n.Index+1:] {
+		if later.State == StatePending {
+			continue
+		}
+		later.State = StatePending
+		later.Rev++
+		rolled++
+	}
+	r.State = ReqActive
+	r.touch(now)
+	return rolled, nil
+}
+
 // Accept 是审核通过：本节点定案，位置前移。
 func (r *Requirement) Accept(key string, comment Comment, now time.Time) error {
 	n, err := r.actionable(key)
