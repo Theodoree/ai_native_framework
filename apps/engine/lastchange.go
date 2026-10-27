@@ -1,6 +1,6 @@
 package engine
 
-// last-change：门牌的幂等重算（判据见 scripts/last-change.mjs 与 docs/last-change.md）。
+// last-change：门牌的幂等重算（判据见 lastchange_test.go 与 docs/last-change.md）。
 // 派生物只有一张表：同一份输入重算任意次输出逐字相同，所以覆盖写是安全的。
 // 算不出来一律报错退出（fail-closed），绝不输出空表当成功。
 
