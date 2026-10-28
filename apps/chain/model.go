@@ -63,8 +63,9 @@ var powerNames = map[string]bool{
 // 写进一个认不出的权力，只会造出一站谁也按不动。
 func ValidPower(power string) bool { return powerNames[power] }
 
-// defaultPower 是「不声明就按节点类型给」的那张表。
-// 逐站覆盖是给人的：同一类站在不同链上可能是不同的人把关。
+// defaultPower 是「权力只由节点类型决定」的那张表。
+// 节点类型在进链时就已经定死，所以权力不需要也不允许逐站声明：
+// 一条链上写 assess，那一站就是 review 权力；想换人按，换的是角色的权力，不是节点的。
 // create 不在设计给的五行里，按「动手造东西的人」归给 dev——这一条是我的判断。
 var defaultPower = map[string]string{
 	TypeCreate:    PowerDev,
@@ -78,14 +79,12 @@ var defaultPower = map[string]string{
 // DefaultPower 返回一类节点的默认权力；不认识的类型给空串（调用方按判不了处理）。
 func DefaultPower(nodeType string) string { return defaultPower[nodeType] }
 
-// PowerForNode 说这个节点要哪个权力：节点上声明的优先，否则按类型默认。
-// 改动之前建的库里节点没有 power 列，这里落回类型默认——升级不该把已有需求变成谁也按不动。
+// PowerForNode 说这个节点要哪个权力：只看类型，没有第二种来源。
+// 老库里 nodes 表还留着 power 列（不删列，免得破坏性迁移），但代码不读它：
+// 逐站覆盖权力这件事已经去掉，留着读只会让「配置里写的那份」与「真正生效的那份」分家。
 func PowerForNode(n *Node) string {
 	if n == nil {
 		return ""
-	}
-	if n.Power != "" {
-		return n.Power
 	}
 	return DefaultPower(n.Type)
 }
@@ -109,8 +108,11 @@ type ChainNode struct {
 	Key    string `json:"key"`
 	Type   string `json:"type"`
 	Review string `json:"review"`
-	// Power 是可选的逐站覆盖：不写就按节点类型的默认权力。
-	Power string `json:"power,omitempty"`
+	// Harness 与 Version 是「这一站用哪个 agent 运行时、哪个版本」的逐站覆盖：
+	// 不写 Harness 就按节点类型的默认模板（deploy/nodes.yaml 的 nodes 段），
+	// 不写 Version 就用模板自己的 version。进链时定成快照，链条改版不影响已进链的需求。
+	Harness string `json:"harness,omitempty"`
+	Version string `json:"version,omitempty"`
 }
 
 // Chain 是一条链条，版本随定义变化而递增。
@@ -180,16 +182,24 @@ type Node struct {
 	Key    string `json:"key"`
 	Type   string `json:"type"`
 	Review string `json:"review"`
-	// Power 是这个节点要的权力。进链时按声明与类型默认定下来存进快照：
-	// 链条后来加了新版本，已经进链的需求不该被改判。
-	Power     string    `json:"power,omitempty"`
-	Index     int       `json:"index"`
-	State     string    `json:"state"`
-	Attempts  []Attempt `json:"attempts"`
-	Comments  []Comment `json:"comments"`
-	Rules     []string  `json:"rules"`
-	Artifacts []string  `json:"artifacts"`
-	Rev       int       `json:"rev"`
+	// 权力不再是这个节点的字段：它由 Type 推出来（见 PowerForNode）。
+	// 老库里 nodes 表的 power 列还在，但不读也不写，所以这里没有对应字段。
+	// Harness / Version 同样是进链时定下的快照：这一站选了哪个 agent 运行时、哪个版本。
+	// 空串表示「按节点类型的默认模板」与「模板自己的 version」。
+	Harness  string    `json:"harness,omitempty"`
+	Version  string    `json:"version,omitempty"`
+	Index    int       `json:"index"`
+	State    string    `json:"state"`
+	Attempts []Attempt `json:"attempts"`
+	Comments []Comment `json:"comments"`
+	// Agents 是这一站自定义的 AGENTS.md：正文在文件里，库里只有路径与摘要。
+	// 每次执行前都会重算摘要比对，对不上这一站就不跑（见 agents.go）。
+	Agents *AgentsDoc `json:"agents,omitempty"`
+	// Rules 是旧形状（一行一条规则），只为把老数据搬进 Agents 而留着读；
+	// 代码不再往它写，搬完就一直是空数组。
+	Rules     []string `json:"rules,omitempty"`
+	Artifacts []string `json:"artifacts"`
+	Rev       int      `json:"rev"`
 }
 
 // Requirement 是一条需求。它没有「当前位置」字段：位置由各节点状态推导。
@@ -244,9 +254,14 @@ func ValidateChain(c Chain) error {
 		if n.Review == ReviewAI && !IsContainer(n.Type) {
 			return fmt.Errorf("节点 %s 是空节点（%s），没有容器可以自审，审核方只能是 human", n.Key, n.Type)
 		}
-		// 覆盖的权力必须认识：写错一个字母就等于这一站没人按得动。
-		if n.Power != "" && !ValidPower(n.Power) {
-			return fmt.Errorf("节点 %s 的 power 不认识：%s（只能是 review / dev / test / release）", n.Key, n.Power)
+		// 空节点不跑容器，声明 harness / version 只会让人以为它跑了什么。
+		if !IsContainer(n.Type) {
+			if h := strings.TrimSpace(n.Harness); h != "" {
+				return fmt.Errorf("节点 %s 是空节点（%s），不跑容器，不能声明 harness：%s", n.Key, n.Type, h)
+			}
+			if v := strings.TrimSpace(n.Version); v != "" {
+				return fmt.Errorf("节点 %s 是空节点（%s），不跑容器，不能声明 version：%s", n.Key, n.Type, v)
+			}
 		}
 	}
 	if c.Nodes[0].Type != TypeAssess {
@@ -256,6 +271,20 @@ func ValidateChain(c Chain) error {
 		return fmt.Errorf("链条的尾必须是上线，得到 %s", c.Nodes[len(c.Nodes)-1].Type)
 	}
 	return nil
+}
+
+// normalizeChain 把声明里的空白去掉再存：校验是纯函数、不改入参，
+// 所以「存干净值」这件事放在这里，由调用方在 ValidateChain 之前调一次。
+// 只动可选项（harness / version），不动 key / type——那是标识，改它等于改声明。
+func normalizeChain(c Chain) Chain {
+	out := c
+	out.Nodes = make([]ChainNode, len(c.Nodes))
+	for i, n := range c.Nodes {
+		n.Harness = strings.TrimSpace(n.Harness)
+		n.Version = strings.TrimSpace(n.Version)
+		out.Nodes[i] = n
+	}
+	return out
 }
 
 // NewRequirement 把一条需求放进链条：一进链就有分支，所有节点从 pending 开始。
@@ -281,7 +310,10 @@ func NewRequirement(id string, p *Project, c Chain, context string, images []str
 	for i, n := range c.Nodes {
 		r.Nodes = append(r.Nodes, &Node{
 			Key: n.Key, Type: n.Type, Review: n.Review, Index: i, State: StatePending,
-			Power:    or(n.Power, DefaultPower(n.Type)),
+			Harness: strings.TrimSpace(n.Harness),
+			// version 是 agent CLI 的版本，不是镜像 tag；不写就定成 latest，
+			// 让需求快照自己说清楚这一站跑的到底是哪个版本。
+			Version:  or(strings.TrimSpace(n.Version), defaultAgentVersion),
 			Attempts: []Attempt{}, Comments: []Comment{}, Rules: []string{}, Artifacts: []string{},
 		})
 	}
@@ -544,22 +576,6 @@ func (r *Requirement) AddSystemComment(key, body string, now time.Time) error {
 		return errors.New("平台留言不能为空")
 	}
 	n.Comments = append(n.Comments, Comment{ID: newID("c"), AuthorType: "system", Author: "平台", Body: body, At: now})
-	n.Rev++
-	r.touch(now)
-	return nil
-}
-
-// AddRule 往这一站的规则上追加一条：默认的 AGENTS.md 文件本身不改。
-func (r *Requirement) AddRule(key, rule string, now time.Time) error {
-	n := r.Node(key)
-	if n == nil {
-		return fmt.Errorf("没有这个节点：%s", key)
-	}
-	rule = strings.TrimSpace(rule)
-	if rule == "" {
-		return errors.New("追加的规则不能为空")
-	}
-	n.Rules = append(n.Rules, rule)
 	n.Rev++
 	r.touch(now)
 	return nil

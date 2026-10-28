@@ -92,11 +92,8 @@ func (s *Server) mount(r *ginRouter) {
 
 	handle("GET", "/", s.index)
 	handle("GET", "/assets/*filepath", s.assets)
-	// 账号与会话。signup 与 login 不要求登录（identity 闸门里放行这两条）。
-	handle("POST", "/api/signup", s.signup)
+	// 账号与会话。login 是唯一免登录的一条（identity 闸门里只放行它）。
 	handle("POST", "/api/login", s.login)
-	// bootstrap 不要求登录：前端开页第一件事就是问「这里还能不能注册」。
-	handle("GET", "/api/bootstrap", s.bootstrap)
 	handle("POST", "/api/logout", s.logout)
 	handle("GET", "/api/me", s.meHandler)
 	handle("PUT", "/api/me/password", s.changeOwnPassword)
@@ -111,6 +108,8 @@ func (s *Server) mount(r *ginRouter) {
 	handle("POST", "/api/keys", s.createKey)
 	handle("DELETE", "/api/keys/:id", s.deleteKey)
 
+	// 平台能力：有哪些 agent 运行时、各有哪些版本。登录即可，不含项目数据。
+	handle("GET", "/api/templates", s.listTemplates)
 	handle("GET", "/api/projects", s.listProjects)
 	handle("POST", "/api/projects", s.createProject)
 	handle("GET", "/api/requirements", s.listRequirements)
@@ -126,6 +125,7 @@ func (s *Server) mount(r *ginRouter) {
 	handle("POST", "/api/requirements/:id/nodes/:node/reject", s.nodeReject)
 	handle("POST", "/api/requirements/:id/nodes/:node/restart", s.nodeRestart)
 	handle("POST", "/api/requirements/:id/nodes/:node/comment", s.nodeComment)
+	handle("GET", "/api/requirements/:id/nodes/:node/rules", s.getNodeRule)
 	handle("POST", "/api/requirements/:id/nodes/:node/rules", s.nodeRule)
 
 	// 角色与授予：管理员。角色属于项目、没有口令；做事的权力来自被授予的角色。
@@ -206,6 +206,12 @@ func (r *ginRouter) notFound(c *gin.Context) {
 			http.Redirect(c.Writer, c.Request, target, http.StatusTemporaryRedirect)
 			return
 		}
+		http.NotFound(c.Writer, c.Request)
+		return
+	}
+	// /api/** 下面没有 SPA 兜底：请求落在这里说明这个接口不存在，
+	// 与方法无关都该是 404 —— 「这条路已经删了」不该被说成「方法不对」。
+	if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 		http.NotFound(c.Writer, c.Request)
 		return
 	}
@@ -354,8 +360,16 @@ func (s *Server) createProject(c *gin.Context) {
 		p.Chains = []Chain{DefaultChain()}
 	} else {
 		for i := range in.Chains {
+			// 先去掉空白再校验：校验是纯函数，不改入参，存进去的必须是干净值。
+			in.Chains[i] = normalizeChain(in.Chains[i])
 			in.Chains[i].Version = 1
 			if err := ValidateChain(in.Chains[i]); err != nil {
+				fail(c, 400, err.Error())
+				return
+			}
+			// 「harness 认不认识」要问模板表，所以不放在 ValidateChain 里（它是纯函数）。
+			// 在写库之前拦下：一条带错 harness 的链，等于某一站永远跑不起来。
+			if err := s.validateHarness(in.Chains[i]); err != nil {
 				fail(c, 400, err.Error())
 				return
 			}
@@ -481,8 +495,10 @@ type nodeBody struct {
 	Author  string `json:"author"`
 	Body    string `json:"body"`
 	Reason  string `json:"reason"`
-	Rule    string `json:"rule"`
 	Comment string `json:"comment"`
+	// Content 是自定义 AGENTS.md 的**整份正文**（读写共用，空＝清除）。
+	// 不再是「追加一条规则」：整份覆盖才说得清「现在这一站的策略是什么」。
+	Content string `json:"content"`
 }
 
 func (s *Server) nodeRun(c *gin.Context) {
@@ -518,6 +534,14 @@ func (s *Server) nodeRun(c *gin.Context) {
 // 手动跑（nodeRun）和重启后的重跑（nodeRestart）共用这一段：重启容器站就是「退回待开始再跑一次」，
 // 跑法必须与手动点一次完全一致，否则同一站的两个入口会各自演化出不同的状态机。
 func (s *Server) runNode(req *Requirement, n *Node, author string) (string, error) {
+	// 自定义 AGENTS.md 对不上就这一站不跑：先验再动状态机。
+	// 不一致的内容绝不注入容器，而且要在站上留一句话，否则人只看到「跑失败」。
+	if _, err := ReadNodeAgents(n); err != nil {
+		if err := req.AddSystemComment(n.Key, agentsDriftComment(err), s.now()); err == nil {
+			_ = s.store.SaveRequirement(req)
+		}
+		return "", err
+	}
 	from := req.Node(n.Key).State
 	if err := req.BeginRun(n.Key, s.now()); err != nil {
 		return "", err
@@ -691,29 +715,84 @@ func (s *Server) nodeComment(c *gin.Context) {
 	writeJSON(c, 200, req)
 }
 
+// getNodeRule 读回这一站自定义 AGENTS.md 的整份正文。
+// 每次读都重算摘要与库里比对：文件被人手改过就直接拒绝，而不是把改动后的内容
+// 当成「用户新写的」交出去——那会让「库里记的那份」失去意义。
+func (s *Server) getNodeRule(c *gin.Context) {
+	req, n, _, ok := s.prepare(c)
+	if !ok {
+		return
+	}
+	if _, ok := s.requireMember(c, req.ProjectKey, actionRuleRequirement); !ok {
+		return
+	}
+	content, err := ReadNodeAgents(n)
+	if err != nil {
+		fail(c, 409, err.Error())
+		return
+	}
+	writeJSON(c, 200, agentsView(n, content))
+}
+
+// agentsView 是读写两侧共用的响应形状：正文 + 库里的四个字段。
+func agentsView(n *Node, content string) map[string]any {
+	out := map[string]any{"content": content, "path": "", "checksum": "", "size": 0, "updatedAt": ""}
+	if n.Agents != nil {
+		updated := ""
+		if !n.Agents.UpdatedAt.IsZero() {
+			updated = formatTime(n.Agents.UpdatedAt)
+		}
+		out["path"] = n.Agents.Path
+		out["checksum"] = n.Agents.Checksum
+		out["size"] = n.Agents.Size
+		out["updatedAt"] = updated
+	}
+	return out
+}
+
+// nodeRule 整份覆盖这一站的自定义 AGENTS.md（沿用原路径，语义换成整份文档）。
+//
+// 自定义内容比评论危险得多：评论只留一句话，这份文档会被整份注入容器的工作区、
+// 在下一站真正执行——陌生人的一句话就变成别人 agent 的指令。所以同一道成员门，
+// 但文案点明这次动的是「这一站的规则」。
 func (s *Server) nodeRule(c *gin.Context) {
 	req, n, body, ok := s.prepare(c)
 	if !ok {
 		return
 	}
-	// 追加规则比评论危险得多：评论只留一句话，规则会被拼进容器注入的 AGENTS.md、
-	// 在下一站真正执行——陌生人的一句话就变成别人 agent 的指令。所以同一道成员门，
-	// 但文案点明这次动的是「这一站的规则」。
 	if _, ok := s.requireMember(c, req.ProjectKey, actionRuleRequirement); !ok {
 		return
 	}
-	rule := or(body.Rule, body.Body)
-	if err := req.AddRule(n.Key, rule, s.now()); err != nil {
-		fail(c, 409, err.Error())
+	added := !isBlank(body.Content)
+	if err := SetNodeAgents(n, req.ID, n.Key, body.Content, s.now()); err != nil {
+		// 超长是用户的输入问题（400），写不下去是这台机器的问题（500）。
+		code := 409
+		if strings.Contains(err.Error(), "太大") {
+			code = 400
+		}
+		fail(c, code, err.Error())
 		return
 	}
-	s.logEvent(req, n.Key, "rule", n.State, n.State, rule)
+	n.Rev++
+	req.touch(s.now())
+	detail := "清除自定义 AGENTS.md"
+	if added {
+		detail = fmt.Sprintf("自定义 AGENTS.md 整份覆盖（%d 字节）", len(body.Content))
+	}
+	s.logEvent(req, n.Key, "rule", n.State, n.State, detail)
 	if err := s.store.SaveRequirement(req); err != nil {
 		fail(c, 500, err.Error())
 		return
 	}
-	writeJSON(c, 200, req)
+	stored := body.Content
+	if !added {
+		stored = ""
+	}
+	writeJSON(c, 200, agentsView(n, stored))
 }
+
+// isBlank 只认「整份都是空白」：正文里换行、缩进都算内容。
+func isBlank(s string) bool { return strings.TrimSpace(s) == "" }
 
 // prepare 取需求、取节点、读 body；任何一步不成立就直接回错。
 func (s *Server) prepare(c *gin.Context) (*Requirement, *Node, nodeBody, bool) {

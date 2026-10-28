@@ -202,10 +202,15 @@ func (s *Server) me(c *gin.Context) Identity {
 	return s.whoIs(c)
 }
 
-// requireLogin 是 /api/** 的统一闸门：除注册与登录外，一律要有身份。
+// requireLogin 是 /api/** 的统一闸门：除登录外，一律要有身份。
 func (s *Server) requireLogin(c *gin.Context) {
 	id := s.whoIs(c)
 	c.Set(identityKey, id)
+	// 没有匹配到路由的路径交给 NoRoute 给 404：路由不存在就是不存在，
+	// 不该先被「没登录」拦成 401 —— 那会把「这条路已经删了」说成「你先登录」。
+	if c.FullPath() == "" {
+		return
+	}
 	if !apiNeedsLogin(c.Request.URL.Path) {
 		return
 	}
@@ -215,28 +220,14 @@ func (s *Server) requireLogin(c *gin.Context) {
 	}
 }
 
-// apiNeedsLogin 说这个路径要不要登录：/api/** 里除 signup/login 全要，静态页面不要。
+// apiNeedsLogin 说这个路径要不要登录：/api/** 里除 login 全要，静态页面不要。
+// 登录是唯一一条免登录入口：没有「首次注册」这回事了（账号一律由管理员在「用户」页建，
+// 第一个管理员来自命令行 chain user add），所以也不再需要「这里还能不能注册」那种问句。
 func apiNeedsLogin(p string) bool {
 	if !strings.HasPrefix(p, "/api/") {
 		return false
 	}
-	switch p {
-	case "/api/signup", "/api/login", "/api/bootstrap":
-		// 这三条是「还没有身份时也必须能拿到的信息」：注册、登录、以及「这里还能不能注册」。
-		return false
-	}
-	return true
-}
-
-// bootstrap 只回答一件事：这个库还能不能注册（注册只在空库时可用）。
-// 前端开页先问它，才知道该显示「注册」还是「登录」。
-func (s *Server) bootstrap(c *gin.Context) {
-	n, err := s.store.CountUsers()
-	if err != nil {
-		fail(c, 500, err.Error())
-		return
-	}
-	writeJSON(c, 200, map[string]any{"signupAvailable": n == 0})
+	return p != "/api/login"
 }
 
 // requireAdmin 是管理员闸门：不是管理员就 403，不往下走。
@@ -259,7 +250,14 @@ type credentials struct {
 }
 
 // newUser 校验并落一个账号。返回的第二个值非空就是给调用方的错误文案。
+// 口令规则与哈希只在这一处实现：HTTP 的建账号与命令行的 chain user add 共用它，
+// 免得两侧各有一套「几个字符算够」。
 func (s *Server) newUser(username, password string, admin bool) (*User, string) {
+	return createUser(s.store, username, password, admin, s.now())
+}
+
+// createUser 是 newUser 的实现，只依赖 Store 与时钟，所以命令行也能直接调。
+func createUser(st Store, username, password string, admin bool, now time.Time) (*User, string) {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return nil, "用户名不能为空"
@@ -267,48 +265,18 @@ func (s *Server) newUser(username, password string, admin bool) (*User, string) 
 	if len([]rune(password)) < 8 {
 		return nil, "密码至少 8 位"
 	}
-	if _, err := s.store.UserByName(username); err == nil {
+	if _, err := st.UserByName(username); err == nil {
 		return nil, "这个用户名已经被用了：" + username
 	}
 	hash, err := hashPassword(password)
 	if err != nil {
 		return nil, "密码哈希失败：" + err.Error()
 	}
-	u := &User{ID: newID("u"), Username: username, PasswordHash: hash, Admin: admin, CreatedAt: s.now()}
-	if err := s.store.SaveUser(*u); err != nil {
+	u := &User{ID: newID("u"), Username: username, PasswordHash: hash, Admin: admin, CreatedAt: now}
+	if err := st.SaveUser(*u); err != nil {
 		return nil, err.Error()
 	}
 	return u, ""
-}
-
-// signup 只在库里一个账号都没有时可用：第一个注册的人就是管理员。
-func (s *Server) signup(c *gin.Context) {
-	n, err := s.store.CountUsers()
-	if err != nil {
-		fail(c, 500, err.Error())
-		return
-	}
-	if n > 0 {
-		// 409 这条路径绝不建会话：注册通道一旦关掉，它就是纯粹的拒绝，不能留半条腿。
-		fail(c, 409, "已经有账号了：注册只在第一次开库时可用，其余账号请管理员建")
-		return
-	}
-	var in credentials
-	if err := decode(c.Request, &in); err != nil {
-		fail(c, 400, err.Error())
-		return
-	}
-	u, why := s.newUser(in.Username, in.Password, true)
-	if why != "" {
-		fail(c, 400, why)
-		return
-	}
-	// 注册即进站：刚验过同一套口令规则，再让人登录一次只是摩擦。会话下发与 login 同一处实现。
-	if err := s.issueSession(c, u.ID); err != nil {
-		fail(c, 500, err.Error())
-		return
-	}
-	writeJSON(c, 201, u)
 }
 
 // startSession 发一条会话，返回 Cookie 里的原文。
@@ -325,7 +293,7 @@ func (s *Server) startSession(userID string) (string, error) {
 	return raw, nil
 }
 
-// issueSession 是「建会话 + 下发 Cookie」的唯一实现：signup 与 login 都调它，
+// issueSession 是「建会话 + 下发 Cookie」的唯一实现：login（以及它自己签发的续期）都调它，
 // Cookie 属性（HttpOnly、SameSite=Lax、Path=/、Secure=false 本机口径）只能在这里写一次。
 func (s *Server) issueSession(c *gin.Context, userID string) error {
 	raw, err := s.startSession(userID)

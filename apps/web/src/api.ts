@@ -5,12 +5,14 @@ import type {
   Me,
   NewProjectInput,
   NewRequirementInput,
+  Node,
   NodeAction,
   Project,
   Requirement,
   RequirementDetail,
   Role,
   SessionUser,
+  TemplateView,
   UserRow,
 } from './types'
 
@@ -34,7 +36,7 @@ export class ApiError extends Error {
  */
 type UnauthorizedHandler = () => void
 let unauthorizedHandler: UnauthorizedHandler | null = null
-const SELF_401_PATHS = new Set(['/login', '/signup', '/me'])
+const SELF_401_PATHS = new Set(['/login', '/me'])
 
 export function onUnauthorized(fn: UnauthorizedHandler): void {
   unauthorizedHandler = fn
@@ -96,15 +98,42 @@ export function createProject(input: NewProjectInput): Promise<Project> {
         key: n.key.trim(),
         type: n.type,
         review: n.review,
-        ...(n.power ? { power: n.power } : {}),
+        // harness / version 只在人真的选了才发：不选就让后端按类型默认与 latest 定，
+        // 前端不替后端猜默认值（猜错会把后端默认覆盖成一份过时的快照）。
+        ...(n.harness ? { harness: n.harness.trim() } : {}),
+        ...(n.version ? { version: n.version.trim() } : {}),
       })),
     }))
   }
   return request<Project>('/projects', { method: 'POST', body: JSON.stringify(body) })
 }
 
+/** GET /api/templates：平台能力（有哪些 agent 运行时、哪些版本），登录即可，不含项目数据。 */
+export function listTemplates(): Promise<TemplateView[]> {
+  return request<TemplateView[]>('/templates')
+}
+
+/**
+ * 后端用 omitempty 表示「空」：attempts / comments / rules / artifacts 为空时字段整个不出现。
+ * 组件里到处写 .length，少一个字段就会让 Vue 的渲染抛错——整个节点卡子树一起消失，
+ * 界面上只剩上半张链路图。所以在唯一的数据入口补成空数组，别让每个组件各自防一遍。
+ */
+function fillNode(node: Node): Node {
+  return {
+    ...node,
+    attempts: node.attempts ?? [],
+    comments: node.comments ?? [],
+    rules: node.rules ?? [],
+    artifacts: node.artifacts ?? [],
+  }
+}
+
+function fillRequirement(r: Requirement): Requirement {
+  return { ...r, images: r.images ?? [], nodes: (r.nodes ?? []).map(fillNode) }
+}
+
 export function listRequirements(): Promise<Requirement[]> {
-  return request<Requirement[]>('/requirements')
+  return request<Requirement[]>('/requirements').then((list) => list.map(fillRequirement))
 }
 
 export function createRequirement(projectKey: string, input: NewRequirementInput): Promise<Requirement> {
@@ -116,11 +145,15 @@ export function createRequirement(projectKey: string, input: NewRequirementInput
       source: input.source?.trim() || 'web',
       images: [],
     }),
-  })
+  }).then(fillRequirement)
 }
 
 export function getRequirement(id: string): Promise<RequirementDetail> {
-  return request<RequirementDetail>(`/requirements/${encodeURIComponent(id)}`)
+  return request<RequirementDetail>(`/requirements/${encodeURIComponent(id)}`).then((d) => ({
+    ...d,
+    requirement: fillRequirement(d.requirement),
+    events: d.events ?? [],
+  }))
 }
 
 /** 每个动作的 body 形状是后端定死的；多传字段会被 400（DisallowUnknownFields）。 */
@@ -136,7 +169,7 @@ export function nodeAction(
   else if (action === 'reject') body = { reason: text }
   else if (action === 'comment') body = { body: text }
   else if (action === 'rules') body = { rule: text }
-  return request<Requirement>(path, { method: 'POST', body: JSON.stringify(body) })
+  return request<Requirement>(path, { method: 'POST', body: JSON.stringify(body) }).then(fillRequirement)
 }
 
 /**
@@ -149,7 +182,7 @@ export function restartNode(requirementId: string, nodeKey: string, reason: stri
   return request<Requirement>(path, {
     method: 'POST',
     body: JSON.stringify(trimmed === '' ? {} : { reason: trimmed }),
-  })
+  }).then(fillRequirement)
 }
 
 // ---------- 需求图片 ----------
@@ -164,24 +197,17 @@ export function uploadRequirementImages(requirementId: string, files: File[]): P
   return request<Requirement>(`/requirements/${encodeURIComponent(requirementId)}/images`, {
     method: 'POST',
     body: form,
-  })
+  }).then(fillRequirement)
 }
 
 /** 删一张图：传后端给的相对路径（/api/requirements/<id>/images/<文件名>），request 自己补 /api 前缀。 */
 export function deleteRequirementImage(path: string): Promise<Requirement> {
   const suffix = path.startsWith('/api/') ? path.slice(4) : path
-  return request<Requirement>(suffix, { method: 'DELETE' })
+  return request<Requirement>(suffix, { method: 'DELETE' }).then(fillRequirement)
 }
 
 // ---------- 账号与会话 ----------
 // 全部同源：fetch 默认就带 Cookie（credentials 默认 same-origin），这里不要写 omit。
-
-export function signup(input: Credentials): Promise<SessionUser> {
-  return request<SessionUser>('/signup', {
-    method: 'POST',
-    body: JSON.stringify({ username: input.username.trim(), password: input.password }),
-  })
-}
 
 export function login(input: Credentials): Promise<SessionUser> {
   return request<SessionUser>('/login', {

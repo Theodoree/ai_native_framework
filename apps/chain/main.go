@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -13,11 +14,22 @@ import (
 var webFS embed.FS
 
 func main() {
+	// 子命令有两条：chain assets（把内嵌的部署资产展开到磁盘）与 chain user add（建账号）。
+	// 放在 flag.Parse 之前，是因为子命令各有自己的 flag 集合。
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "assets":
+			os.Exit(runAssetsCommand(os.Args[2:]))
+		case "user":
+			os.Exit(runUserCommand(os.Args[2:]))
+		}
+	}
 	addr := flag.String("addr", "127.0.0.1:8099", "监听地址")
 	driver := flag.String("db-driver", "sqlite", "存储驱动（目前只有 sqlite）")
 	dbPath := flag.String("db", "data/chain.db", "数据库：sqlite 是文件路径")
 	execKind := flag.String("exec", "fake", "执行器：fake（不连外部）或 docker（本机 docker）")
-	templates := flag.String("templates", DefaultTemplateFile, "节点模板表（.yaml/.yml 按 YAML 读，其余按老 JSON；文件不存在回落内嵌默认表）")
+	templates := flag.String("templates", "", "节点模板表；空 = 按三级回落找（仓库 deploy/nodes.yaml → $HOME/.<项目名>/nodes.yaml → 内嵌默认表）")
+	app := flag.String("app", "", "项目名（覆盖 "+appEnvVar+" 与编译期默认）：决定镜像前缀与展开目录 $HOME/.<项目名>")
 	dockerBin := flag.String("docker", "docker", "docker 可执行文件")
 	timeout := flag.Duration("timeout", 10*time.Minute, "单次容器执行上限")
 	uploads := flag.String("uploads", "data/uploads", "需求图片落盘目录（不存在会按需创建）")
@@ -25,19 +37,35 @@ func main() {
 	model := flag.String("model", "", "注入容器的 model")
 	flag.Parse()
 
+	// 项目名要在任何路径/镜像名的计算之前定下来（-app > CHAIN_APP > 编译期默认）。
+	log.Printf("项目名：%s（展开目录 %s）", ResolveAppName(*app), orNone(AppHome(), "（拿不到家目录）"))
+
 	store, err := OpenStore(*driver, *dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer store.Close()
 
-	var exec Executor = FakeExecutor{}
-	if *execKind == "docker" {
-		table, err := LoadTemplatesOrFallback(*templates, log.Printf)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("节点模板表：%s（模板 %s）", orNone(table.Source, "内嵌默认"), strings.Join(sortedKeys(table.Templates), "、"))
+	// 空库没有任何账号，也就没人能登录调建账号的接口：把出路直接打在启动日志里。
+	if n, err := store.CountUsers(); err == nil && n == 0 {
+		log.Printf("还没有任何账号：用 ./chain user add -username admin -password <密码> -admin 建第一个管理员")
+	}
+
+	// 模板表与执行器种类无关：假执行器也要照声明回镜像与版本（前端下拉框与建链校验共用）。
+	// 三级回落：仓库里的 → 家目录展开的 → 内嵌默认表。ResolveTemplateFile 会说清楚用了哪个。
+	path := strings.TrimSpace(*templates)
+	if path == "" {
+		path = ResolveTemplateFile(log.Printf)
+	}
+	table, err := LoadTemplatesOrFallback(path, log.Printf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("节点模板表：%s（模板 %s）", orNone(table.Source, "内嵌默认"), strings.Join(sortedKeys(table.Templates), "、"))
+
+	var exec Executor
+	switch *execKind {
+	case "docker":
 		exec = DockerExecutor{
 			Templates: table.Templates,
 			Nodes:     table.Nodes,
@@ -53,7 +81,9 @@ func main() {
 				return strings.TrimSpace(p.Repo)
 			},
 		}
-	} else if *execKind != "fake" {
+	case "fake":
+		exec = FakeExecutor{Templates: table.Templates, Nodes: table.Nodes}
+	default:
 		log.Fatalf("不认识的执行器：%s（只有 fake 与 docker）", *execKind)
 	}
 

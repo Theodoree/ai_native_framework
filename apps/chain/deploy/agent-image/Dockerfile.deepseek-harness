@@ -1,0 +1,26 @@
+# agent 镜像 —— deepseek-harness
+# 由 build-images.sh 构建：docker build -f Dockerfile.deepseek-harness -t <前缀>/agent-deepseek-harness:<tag> .
+#
+# 这个镜像里**不预装 agent CLI**：版本是数据，不是构建产物。CLI 由 entrypoint 按
+# CHAIN_AGENT + CHAIN_AGENT_VERSION 在运行时解析（npx -y @deepseek-ai/dsh@<version>），
+# 所以换 CLI 版本不需要重烘镜像（见 ./README.md「换 CLI 版本不需要重烘镜像」）。
+FROM node:22-slim
+
+# git 是硬需求：clone 模式下 entrypoint 要自己把仓库拉下来。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 想把镜像钉死在某一个 CLI 版本上（离线或自带 CLI 的部署）时，打开下面两行：
+# 预装之后 entrypoint 会优先用 AGENT_CMD，不再看 CHAIN_AGENT_VERSION。
+#   RUN npm i -g @deepseek-ai/dsh@0.2.1-rc.2
+#   ENV AGENT_CMD="dsh"
+# 换 agent 或换版本时先跑 <agent> --help 确认真实子命令，不要照着猜（见 README「已知边界」）。
+
+COPY entrypoint.sh /opt/agent/entrypoint.sh
+RUN chmod +x /opt/agent/entrypoint.sh
+
+ENV AGENT_NAME=deepseek-harness
+
+WORKDIR /work
+ENTRYPOINT ["/opt/agent/entrypoint.sh"]

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// 需求带图的后端：上传 / 读取 / 删除，外加 GET /api/bootstrap。
+// 需求带图的后端：上传 / 读取 / 删除。
 
 var (
 	pngBytes  = append([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, bytes.Repeat([]byte{0x01}, 32)...)
@@ -34,7 +34,7 @@ func newImageServer(t *testing.T) (*httptest.Server, Store, string) {
 	t.Cleanup(func() { store.Close() })
 	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).WithUploadDir(dir).Handler())
 	t.Cleanup(ts.Close)
-	signupRoot(t, ts)
+	seedRoot(t, ts, store)
 	p := Project{Key: "demo", Name: "Demo", Repo: "o/r", DefaultBranch: "main",
 		Chains: []Chain{roleChain()}, CreatedAt: time.Now()}
 	if err := store.SaveProject(&p); err != nil {
@@ -334,32 +334,5 @@ func TestImagesNeedLogin(t *testing.T) {
 	code, raw := exchange(t, ts, nil, "GET", got.Images[0], nil)
 	if code != 401 || !strings.Contains(string(raw), needLoginText) {
 		t.Fatalf("未登录读图应 401 needLoginText，实际 %d：%s", code, raw)
-	}
-}
-
-// bootstrap：空库 true，注册过之后 false，且不登录也能拿到。
-func TestBootstrapSignupAvailability(t *testing.T) {
-	store, err := OpenStore("sqlite", filepath.Join(t.TempDir(), "chain.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
-	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
-	t.Cleanup(ts.Close)
-
-	code, raw := exchange(t, ts, nil, "GET", "/api/bootstrap", nil)
-	if code != 200 {
-		t.Fatalf("空库 bootstrap 期望 200，实际 %d：%s", code, raw)
-	}
-	if !strings.Contains(string(raw), `"signupAvailable":true`) {
-		t.Fatalf("空库应当还能注册，实际 %s", raw)
-	}
-	signupRoot(t, ts)
-	code, raw = exchange(t, ts, nil, "GET", "/api/bootstrap", nil)
-	if code != 200 {
-		t.Fatalf("建过用户后 bootstrap 期望 200，实际 %d：%s", code, raw)
-	}
-	if !strings.Contains(string(raw), `"signupAvailable":false`) {
-		t.Fatalf("建过用户后不该还能注册，实际 %s", raw)
 	}
 }

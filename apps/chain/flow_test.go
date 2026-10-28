@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // 测试里的「人」是一个账号加一个带 cookie jar 的 http.Client：登录一次，之后
@@ -19,7 +20,7 @@ import (
 //
 // 为了不让每个用例都改成层层传客户端，按「服务地址 + 用户名」登记，call/callAs 用用户名取。
 
-// rootUser 是每个测试服务里第一个注册的账号：空库第一个注册的人自动是管理员。
+// rootUser 是每个测试服务里第一个管理员：真实部署里由命令行的 chain user add -admin 造出来。
 const rootUser = "root"
 const rootPass = "root-password-1"
 
@@ -79,20 +80,15 @@ func exchange(t *testing.T, ts *httptest.Server, cl *http.Client, method, path s
 	return res.StatusCode, raw
 }
 
-// signupRoot 在空库里注册第一个账号（自动是管理员），并把它的客户端登记下来。
-func signupRoot(t *testing.T, ts *httptest.Server) *http.Client {
+// seedRoot 在空库里造第一个管理员，再走登录拿会话。
+// 真实部署里「第一个管理员」这一步是命令行的 chain user add -admin（库里没有账号时
+// 没有任何人能登录，也就没人能调建账号的接口），所以测试也照现实走，不再伪造注册。
+func seedRoot(t *testing.T, ts *httptest.Server, store Store) *http.Client {
 	t.Helper()
-	cl := freshClient(t)
-	code, raw := exchange(t, ts, cl, "POST", "/api/signup", map[string]any{"username": rootUser, "password": rootPass})
-	if code != 201 {
-		t.Fatalf("注册第一个账号期望 201，实际 %d：%s", code, raw)
+	if _, why := createUser(store, rootUser, rootPass, true, time.Now()); why != "" {
+		t.Fatalf("造第一个管理员：%s", why)
 	}
-	// 注册即进站：signup 自己就下发会话，不必再登录一次（t42）。
-	if ck := sessionCookie(t, cl, ts); ck.Value == "" {
-		t.Fatalf("注册之后客户端应当已经有 %s", sessionCookieName)
-	}
-	remember(ts, rootUser, cl)
-	return cl
+	return loginAs(t, ts, rootUser, rootPass)
 }
 
 // loginAs 用账号密码登录，返回带着新会话的客户端并登记。
@@ -143,6 +139,8 @@ func grantRole(t *testing.T, ts *httptest.Server, project, roleName, username st
 
 func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
 	t.Helper()
+	// 自定义 AGENTS.md 落在 $HOME/.<项目名>/agents 下：不隔离的话测试会往真家目录写。
+	t.Setenv("HOME", t.TempDir())
 	path := filepath.Join(t.TempDir(), "chain.db")
 	store, err := OpenStore("sqlite", path)
 	if err != nil {
@@ -151,7 +149,7 @@ func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
 	t.Cleanup(func() { store.Close() })
 	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
 	t.Cleanup(ts.Close)
-	signupRoot(t, ts)
+	seedRoot(t, ts, store)
 	return ts, store, path
 }
 
@@ -161,7 +159,7 @@ func call(t *testing.T, ts *httptest.Server, method, path string, body any, want
 	return callAs(t, ts, method, path, rootUser, body, want)
 }
 
-// callAnon 是不登录的请求：用来钉「/api/** 除注册登录外一律 401」。
+// callAnon 是不登录的请求：用来钉「/api/** 除登录外一律 401」。
 func callAnon(t *testing.T, ts *httptest.Server, method, path string, body any, want int) *Requirement {
 	t.Helper()
 	return callAs(t, ts, method, path, "", body, want)

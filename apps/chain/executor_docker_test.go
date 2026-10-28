@@ -44,7 +44,7 @@ func fakeDockerSaying(t *testing.T, lines ...string) string {
 
 func dockerFixture() (*Requirement, *Node) {
 	r := &Requirement{ID: "REQ-1", ProjectKey: "demo", Branch: "req/demo/REQ-1", Context: "把登录页做出来"}
-	n := &Node{Key: "assess", Type: TypeAssess, Review: ReviewAI, Rules: []string{"先看测试覆盖率"}}
+	n := &Node{Key: "assess", Type: TypeAssess, Review: ReviewAI}
 	return r, n
 }
 
@@ -72,7 +72,7 @@ func TestDockerExecutorInjectsContextAndReportsSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(b)
-	for _, want := range []string{"run", "--rm", "BASE_URL=https://api.example.com", "CHAIN_MODEL=deepseek-v4", "CHAIN_REQUIREMENT=REQ-1", "CHAIN_BRANCH=req/demo/REQ-1", "先看测试覆盖率", "ai-native/agent-deepseek-harness:dev", "/opt/agent/entrypoint.sh", "CHAIN_WORKSPACE_MODE=clone"} {
+	for _, want := range []string{"run", "--rm", "BASE_URL=https://api.example.com", "CHAIN_MODEL=deepseek-v4", "CHAIN_REQUIREMENT=REQ-1", "CHAIN_BRANCH=req/demo/REQ-1", "ai_native_framework/agent-deepseek-harness:latest", "/opt/agent/entrypoint.sh", "CHAIN_WORKSPACE_MODE=clone", "CHAIN_SOURCE=repo", "CHAIN_AGENTS_MD=", "仓库自带的策略在 repo/AGENTS.md"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("docker 参数里缺 %q：%s", want, got)
 		}

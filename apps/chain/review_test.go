@@ -25,6 +25,8 @@ func cn(key, typ, review string) ChainNode {
 // newReviewServer 起一个用指定链条与执行器的服务，省掉「先建 project」那一步。
 func newReviewServer(t *testing.T, c Chain, exec Executor) (*httptest.Server, Store) {
 	t.Helper()
+	// 同 newTestServer：把家目录隔离掉，别往真家目录写自定义 AGENTS.md。
+	t.Setenv("HOME", t.TempDir())
 	store, err := OpenStore("sqlite", filepath.Join(t.TempDir(), "chain.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +41,7 @@ func newReviewServer(t *testing.T, c Chain, exec Executor) (*httptest.Server, St
 	if err := store.SaveProject(&p); err != nil {
 		t.Fatal(err)
 	}
-	signupRoot(t, ts)
+	seedRoot(t, ts, store)
 	return ts, store
 }
 
@@ -197,6 +199,9 @@ func TestReviewRejectWithoutReasonFallsBackToHuman(t *testing.T) {
 // alwaysVerdict 是不听话的容器：不管节点声明谁审，它都自称通过。
 type alwaysVerdict struct{ verdict string }
 
+// TemplateKeys：这个替身只关心结论，模板键跟假执行器一致即可。
+func (a alwaysVerdict) TemplateKeys() []string { return fakeTemplateKeys() }
+
 func (a alwaysVerdict) Run(r *Requirement, n *Node, now time.Time) (Attempt, Comment, []string) {
 	att, c, arts := FakeExecutor{}.Run(r, n, now)
 	att.Verdict = a.verdict
@@ -278,7 +283,7 @@ func newRoleServer(t *testing.T) (*httptest.Server, Store) {
 	t.Cleanup(func() { store.Close() })
 	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
 	t.Cleanup(ts.Close)
-	signupRoot(t, ts)
+	seedRoot(t, ts, store)
 	p := Project{Key: "demo", Name: "Demo", Repo: "o/r", DefaultBranch: "main",
 		Chains: []Chain{roleChain()}, CreatedAt: time.Now()}
 	if err := store.SaveProject(&p); err != nil {
@@ -388,31 +393,6 @@ func TestCommentRecordsUsernameWithoutPower(t *testing.T) {
 	}
 }
 
-func TestRoleNodePowerOverride(t *testing.T) {
-	// 链条作者把 dev 站要的权力改成 test：这一站就认 test，不认 dev。
-	c := chainOf(
-		cn("assess", TypeAssess, ReviewHuman),
-		ChainNode{Key: "dev", Type: TypeDev, Review: ReviewHuman, Power: PowerTest},
-		cn("release", TypeRelease, ReviewHuman),
-	)
-	ts, _ := newReviewServer(t, c, FakeExecutor{})
-	addUser(t, ts, "只懂测试", "only-test-pass")
-	addUser(t, ts, "只懂开发", "only-dev-pass")
-	grantRole(t, ts, "demo", "测试员", "只懂测试", PowerTest)
-	grantRole(t, ts, "demo", "开发员", "只懂开发", PowerDev)
-	req := submit(t, ts, "加个按钮")
-	callRaw(t, ts, rootUser, "POST", nodePath(req.ID, "assess", "run"), map[string]any{}, 200)
-	callRaw(t, ts, rootUser, "POST", nodePath(req.ID, "assess", "accept"), map[string]any{"comment": "评估通过"}, 200)
-	// dev 站覆盖成 test：只有 dev 权力的人被挡，只有 test 权力的人能按。
-	if errText := runAt(t, ts, req.ID, "dev", "run", "只懂开发"); !strings.Contains(errText, "没有 test 权力") {
-		t.Fatalf("覆盖权力后应当按 test 判，实际 %s", errText)
-	}
-	got := callAs(t, ts, "POST", nodePath(req.ID, "dev", "run"), "只懂测试", map[string]any{}, 200)
-	if nodeOf(t, got, "dev").State != StateRunning {
-		t.Fatalf("有 test 权力的人应当能动手，实际 %s", nodeOf(t, got, "dev").State)
-	}
-}
-
 func TestRoleCreateChecksInput(t *testing.T) {
 	ts, _ := newRoleServer(t)
 	path := "/api/p/demo/roles"
@@ -507,31 +487,6 @@ func submitWithKey(t *testing.T, ts *httptest.Server, secret string, body any, w
 }
 
 // sessionCookie 取这个客户端手里的会话 Cookie 原文——登出用例要拿它再试一次。
-// signupRaw 发一次注册并原样返回响应（不带 cookie jar），
-// 因为要验的就是 Set-Cookie 头本身：jar 会把属性抹平，看不到 HttpOnly / SameSite。
-func signupRaw(t *testing.T, ts *httptest.Server, username, password string) (*http.Response, []byte) {
-	t.Helper()
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(map[string]any{"username": username, "password": password}); err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest("POST", ts.URL+"/api/signup", &buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return res, body
-}
-
 func sessionCookie(t *testing.T, cl *http.Client, ts *httptest.Server) *http.Cookie {
 	t.Helper()
 	u, err := url.Parse(ts.URL)
@@ -642,7 +597,10 @@ func TestStoreRolesRoundTrip(t *testing.T) {
 
 // ---- 账号、会话与密钥 ----
 
-func TestSignupOnlyOnceAndFirstIsAdmin(t *testing.T) {
+// TestNoSelfSignupRoutes 钉「没有首次注册这回事」：注册与「还能不能注册」两条入口都不存在了，
+// 账号一律由管理员建（第一个管理员来自命令行的 chain user add）。
+// 这两条留在路由表里会让人以为还能自助开号，所以必须是 404，不是 403 也不是 409。
+func TestNoSelfSignupRoutes(t *testing.T) {
 	store, err := OpenStore("sqlite", filepath.Join(t.TempDir(), "chain.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -650,44 +608,18 @@ func TestSignupOnlyOnceAndFirstIsAdmin(t *testing.T) {
 	defer store.Close()
 	ts := httptest.NewServer(NewServer(store, FakeExecutor{}).Handler())
 	defer ts.Close()
-	// 空库第一个注册的人是管理员，而且注册即进站：201 的响应里必须带着会话 Cookie，
-	// 属性一处实现（HttpOnly、SameSite=Lax、Path=/），Secure=false 是本机开发口径。
-	res, raw := signupRaw(t, ts, rootUser, rootPass)
-	if res.StatusCode != 201 {
-		t.Fatalf("第一个账号注册期望 201，实际 %d：%s", res.StatusCode, raw)
-	}
-	sc := res.Header.Get("Set-Cookie")
-	for _, want := range []string{sessionCookieName + "=", "HttpOnly", "SameSite=Lax", "Path=/"} {
-		if !strings.Contains(sc, want) {
-			t.Fatalf("注册下发的 Cookie 应当带 %q，实际 %q", want, sc)
+	for _, path := range []string{"/api/signup", "/api/bootstrap"} {
+		if code, raw := exchange(t, ts, nil, "POST", path, map[string]any{"username": rootUser, "password": rootPass}); code != 404 {
+			t.Fatalf("POST %s 应当 404（没有这条路），实际 %d：%s", path, code, raw)
+		}
+		if code, raw := exchange(t, ts, nil, "GET", path, nil); code != 404 {
+			t.Fatalf("GET %s 应当 404（没有这条路），实际 %d：%s", path, code, raw)
 		}
 	}
-	var sess *http.Cookie
-	for _, ck := range (&http.Response{Header: res.Header}).Cookies() {
-		if ck.Name == sessionCookieName {
-			sess = ck
-		}
+	if n, err := store.CountUsers(); err != nil || n != 0 {
+		t.Fatalf("打不存在的注册入口不该落账号，库里应当 0 个，实际 %d（err=%v）", n, err)
 	}
-	if sess == nil || sess.Value == "" {
-		t.Fatalf("注册响应里没有 %s 这条 Cookie：%q", sessionCookieName, sc)
-	}
-	// 拿这条 Cookie 立刻就是登录态，而且第一个账号是管理员。
-	code, body := sendWithCookie(t, ts, sess, "GET", "/api/me", nil)
-	if code != 200 || !strings.Contains(string(body), "\"admin\":true") {
-		t.Fatalf("注册后应当已是登录态且是管理员，实际 %d %s", code, body)
-	}
-	// 第二个自助注册一律 409：而且拒绝路径不建会话、不下发 Cookie。
-	res2, raw2 := signupRaw(t, ts, "李四", "lisi-password")
-	if res2.StatusCode != 409 {
-		t.Fatalf("重复注册应当 409，实际 %d %s", res2.StatusCode, raw2)
-	}
-	if sc2 := res2.Header.Get("Set-Cookie"); sc2 != "" {
-		t.Fatalf("被拒的注册不该下发任何 Cookie，实际 %q", sc2)
-	}
-	if n, err := store.CountUsers(); err != nil || n != 1 {
-		t.Fatalf("被拒的注册不该落账号，库里应当 1 个，实际 %d（err=%v）", n, err)
-	}
-	// 未登录访问任何 /api 都要 401（signup / login 例外）。
+	// 未登录访问任何 /api 都要 401（只有 login 例外）。
 	if code, raw := exchange(t, ts, nil, "GET", "/api/requirements", nil); code != 401 || !strings.Contains(string(raw), "没有登录") {
 		t.Fatalf("未登录应当 401 并说明要先登录，实际 %d %s", code, raw)
 	}
@@ -810,7 +742,7 @@ func TestAccountsEndToEnd(t *testing.T) {
 	if n, err := store.CountUsers(); err != nil || n != 0 {
 		t.Fatalf("新库不该有账号，实际 %d 个（%v）", n, err)
 	}
-	signupRoot(t, ts)
+	seedRoot(t, ts, store)
 	call(t, ts, "POST", "/api/projects", map[string]any{"key": "demo", "repo": "o/r"}, 201)
 	grantRole(t, ts, "demo", "审核员", "", PowerReview)
 	addUser(t, ts, "审核员小李", "auditor-pass-1")

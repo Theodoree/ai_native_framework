@@ -128,9 +128,12 @@ const DEFAULT_POWER: Record<string, string> = {
   release: 'release',
 }
 
-/** 一站要哪个权力，与后端 PowerForNode 同判据；判不出来给空串（调用方按「判不了」处理）。 */
-export function powerForNode(type: string, declared?: string): string {
-  if (declared && declared.trim() !== '') return declared
+/**
+ * 一站要哪个权力：只看节点类型，与后端 PowerForNode 同判据。
+ * 逐站覆盖已被后端删除，所以这里不接受第二个参数——权力不是用户能选的东西。
+ * 判不出来给空串（调用方按「判不了」处理）。
+ */
+export function powerForNode(type: string): string {
   return DEFAULT_POWER[type] ?? ''
 }
 
