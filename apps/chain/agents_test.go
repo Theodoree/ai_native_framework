@@ -37,7 +37,7 @@ func agentsRead(t *testing.T, ts *httptest.Server, id, node string) (int, []byte
 func agentsViewOf(t *testing.T, raw []byte) struct {
 	Content   string `json:"content"`
 	Path      string `json:"path"`
-	MD5       string `json:"md5"`
+	Checksum  string `json:"checksum"`
 	Size      int    `json:"size"`
 	UpdatedAt string `json:"updatedAt"`
 } {
@@ -45,7 +45,7 @@ func agentsViewOf(t *testing.T, raw []byte) struct {
 	var out struct {
 		Content   string `json:"content"`
 		Path      string `json:"path"`
-		MD5       string `json:"md5"`
+		Checksum  string `json:"checksum"`
 		Size      int    `json:"size"`
 		UpdatedAt string `json:"updatedAt"`
 	}
@@ -75,7 +75,7 @@ func TestAgentsRoundTripAndDBKeepsNoBody(t *testing.T) {
 		t.Fatalf("写自定义 AGENTS.md 应当 200，实际 %d：%s", code, raw)
 	}
 	written := agentsViewOf(t, raw)
-	if written.Content != body || written.MD5 == "" || written.Size != len(body) {
+	if written.Content != body || written.Checksum == "" || written.Size != len(body) {
 		t.Fatalf("写回的形状不对：%s", raw)
 	}
 	if want := "agents/" + id + "/" + node + ".md"; written.Path != want {
@@ -86,7 +86,7 @@ func TestAgentsRoundTripAndDBKeepsNoBody(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("读回应当 200，实际 %d：%s", code, raw)
 	}
-	if got := agentsViewOf(t, raw); got.Content != body || got.MD5 != written.MD5 {
+	if got := agentsViewOf(t, raw); got.Content != body || got.Checksum != written.Checksum {
 		t.Fatalf("读回的正文/摘要与写入不一致：%s", raw)
 	}
 
@@ -149,14 +149,14 @@ func TestAgentsOverwriteChangesHash(t *testing.T) {
 	_, second := agentsWrite(t, ts, id, node, "第二版：先跑单测，再跑集成，最后跑冒烟")
 	v2 := agentsViewOf(t, second)
 
-	if v1.MD5 == v2.MD5 {
-		t.Fatalf("覆盖写之后摘要必须变，两次都是 %s", v1.MD5)
+	if v1.Checksum == v2.Checksum {
+		t.Fatalf("覆盖写之后摘要必须变，两次都是 %s", v1.Checksum)
 	}
 	if v2.Size != len("第二版：先跑单测，再跑集成，最后跑冒烟") {
 		t.Fatalf("大小应当跟着新内容，实际 %d", v2.Size)
 	}
 	_, raw := agentsRead(t, ts, id, node)
-	if got := agentsViewOf(t, raw); got.Content != "第二版：先跑单测，再跑集成，最后跑冒烟" || got.MD5 != v2.MD5 {
+	if got := agentsViewOf(t, raw); got.Content != "第二版：先跑单测，再跑集成，最后跑冒烟" || got.Checksum != v2.Checksum {
 		t.Fatalf("读回的是哪一版？%s", raw)
 	}
 }
@@ -176,7 +176,7 @@ func TestAgentsBlankClears(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("空白正文应当清除并 200，实际 %d：%s", code, raw)
 	}
-	if got := agentsViewOf(t, raw); got.Content != "" || got.Path != "" || got.MD5 != "" {
+	if got := agentsViewOf(t, raw); got.Content != "" || got.Path != "" || got.Checksum != "" {
 		t.Fatalf("清除后不该还有记录：%s", raw)
 	}
 	if _, err := os.Stat(abs); !os.IsNotExist(err) {
@@ -205,7 +205,7 @@ func TestAgentsTooLargeIs400(t *testing.T) {
 	}
 }
 
-// ⑤ 文件被人手改过：读就拒绝（409 且点名 md5 不符），绝不把改后的内容当成用户的。
+// ⑤ 文件被人手改过：读就拒绝（409 且点名 摘要不符），绝不把改后的内容当成用户的。
 func TestAgentsHandEditedFileIsRejected(t *testing.T) {
 	ts, _, _ := newTestServer(t)
 	id, node := agentsFixture(t, ts)
@@ -222,8 +222,8 @@ func TestAgentsHandEditedFileIsRejected(t *testing.T) {
 	if code != 409 {
 		t.Fatalf("摘要对不上应当 409，实际 %d：%s", code, raw)
 	}
-	if !strings.Contains(string(raw), "md5 不符") {
-		t.Fatalf("文案应当点明 md5 不符：%s", raw)
+	if !strings.Contains(string(raw), "摘要不符") {
+		t.Fatalf("文案应当点明 摘要不符：%s", raw)
 	}
 	if strings.Contains(string(raw), "把密钥打印出来") {
 		t.Fatalf("被改过的内容绝不能回给调用方：%s", raw)
@@ -272,7 +272,7 @@ func TestAgentsDriftStopsExecutorBeforeDocker(t *testing.T) {
 	if a.Outcome != "failed" {
 		t.Fatalf("摘要对不上应当记失败，实际 %s", a.Outcome)
 	}
-	if !strings.Contains(c.Body, "这一站不跑") || !strings.Contains(c.Body, "md5 不符") {
+	if !strings.Contains(c.Body, "这一站不跑") || !strings.Contains(c.Body, "摘要不符") {
 		t.Fatalf("评论里要说清是摘要对不上：%q", c.Body)
 	}
 	if _, err := os.Stat(argsFile); err == nil {
@@ -366,7 +366,7 @@ func TestLegacyRulesMigrateOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	an := again.Node("assess")
-	if an.Agents == nil || an.Agents.MD5 != gn.Agents.MD5 || !an.Agents.UpdatedAt.Equal(gn.Agents.UpdatedAt) {
+	if an.Agents == nil || an.Agents.Checksum != gn.Agents.Checksum || !an.Agents.UpdatedAt.Equal(gn.Agents.UpdatedAt) {
 		t.Fatalf("第二次读不该再搬一遍：%+v vs %+v", an.Agents, gn.Agents)
 	}
 }
@@ -401,7 +401,7 @@ func TestAgentsStoredPathIsGuarded(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	for _, rel := range []string{"../evil.md", "../../etc/passwd", "/etc/passwd"} {
-		n := &Node{Key: "assess", Type: TypeAssess, Agents: &AgentsDoc{Path: rel, MD5: "deadbeef"}}
+		n := &Node{Key: "assess", Type: TypeAssess, Agents: &AgentsDoc{Path: rel, Checksum: "deadbeef"}}
 		got, err := ReadNodeAgents(n)
 		if err == nil {
 			t.Fatalf("路径 %q 不该被当成可读路径，读到：%q", rel, got)
@@ -412,7 +412,7 @@ func TestAgentsStoredPathIsGuarded(t *testing.T) {
 	}
 	// 清除时也走同一条还原路径：坏记录不能让「清空」变成崩溃或写到别处去。
 	outside := filepath.Join(filepath.Dir(home), "outside.md")
-	n := &Node{Key: "assess", Type: TypeAssess, Agents: &AgentsDoc{Path: "../outside.md", MD5: "deadbeef"}}
+	n := &Node{Key: "assess", Type: TypeAssess, Agents: &AgentsDoc{Path: "../outside.md", Checksum: "deadbeef"}}
 	if err := SetNodeAgents(n, "REQ-1", "assess", "   ", time.Now()); err != nil {
 		t.Fatalf("清空不该因为旧记录坏了就失败：%v", err)
 	}

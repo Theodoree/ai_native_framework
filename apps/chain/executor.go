@@ -153,11 +153,11 @@ func agentsLine(n *Node) string {
 	if n == nil || n.Agents == nil || strings.TrimSpace(n.Agents.Path) == "" {
 		return "自定义 AGENTS.md：无（只有平台的默认职责与仓库策略指针）"
 	}
-	md5 := n.Agents.MD5
-	if len(md5) > 12 {
-		md5 = md5[:12]
+	checksum := n.Agents.Checksum
+	if len(checksum) > 12 {
+		checksum = checksum[:12]
 	}
-	return fmt.Sprintf("自定义 AGENTS.md：%d 字节，%s…（%s）", n.Agents.Size, md5, n.Agents.Path)
+	return fmt.Sprintf("自定义 AGENTS.md：%d 字节，%s…（%s）", n.Agents.Size, checksum, n.Agents.Path)
 }
 
 func oneLine(s string) string {

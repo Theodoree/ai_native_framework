@@ -229,7 +229,7 @@ func newTemplatesServer(t *testing.T) *httptest.Server {
 	t.Cleanup(func() { store.Close() })
 	ts := httptest.NewServer(NewServer(store, DockerExecutor{Templates: table.Templates, Nodes: table.Nodes}).Handler())
 	t.Cleanup(ts.Close)
-	signupRoot(t, ts)
+	seedRoot(t, ts, store)
 	return ts
 }
 
@@ -313,5 +313,56 @@ func TestTemplateFileRejectsBadVersions(t *testing.T) {
 		if _, err := LoadTemplateFile(path); err == nil {
 			t.Fatalf("%s：应当报错停下，不静默忽略", name)
 		}
+	}
+}
+
+// TestRequirementKeepsNodeHarness 钉「运行时快照要进库、读得回来」：
+// 建链时声明的 harness/version 提需求后必须出现在 GET 详情的节点里。
+// 漏了这两列的落库，前端节点卡永远显示「默认运行时 · latest」，而且看不出来。
+func TestRequirementKeepsNodeHarness(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	body := map[string]any{
+		"key": "demo", "repo": "o/r",
+		"chains": []any{map[string]any{
+			"key": "main", "type": "feature",
+			"nodes": []any{
+				map[string]any{"key": "assess-1", "type": TypeAssess, "review": ReviewHuman},
+				map[string]any{"key": "crosstest", "type": TypeCrossTest, "review": ReviewAI, "harness": "codex", "version": "latest"},
+				map[string]any{"key": "release-1", "type": TypeRelease, "review": ReviewHuman},
+			},
+		}},
+	}
+	if code, raw := exchange(t, ts, clientOf(t, ts, rootUser), "POST", "/api/projects", body); code != 201 {
+		t.Fatalf("建项目期望 201，实际 %d：%s", code, raw)
+	}
+	created := call(t, ts, "POST", "/api/p/demo/requirements", map[string]any{"context": "看运行时快照"}, 201)
+
+	code, raw := exchange(t, ts, clientOf(t, ts, rootUser), "GET", "/api/requirements/"+created.ID, nil)
+	if code != 200 {
+		t.Fatalf("读需求详情期望 200，实际 %d：%s", code, raw)
+	}
+	// 详情是 {requirement: …, events: …} 的包，节点在 requirement 里面。
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var got Requirement
+	if err := json.Unmarshal(envelope["requirement"], &got); err != nil {
+		t.Fatalf("详情里没有 requirement：%v（%s）", err, raw)
+	}
+	n := got.Node("crosstest")
+	if n == nil {
+		keys := []string{}
+		for _, x := range got.Nodes {
+			keys = append(keys, x.Key)
+		}
+		t.Fatalf("详情里没有 crosstest 站：%v", keys)
+	}
+	if n.Harness != "codex" || n.Version != "latest" {
+		t.Fatalf("节点要带上进链时定下的运行时快照，实际 harness=%q version=%q", n.Harness, n.Version)
+	}
+	// 没声明的站不能凭空长出 harness（空 = 按类型映射），但 version 有默认值。
+	if a := got.Node("assess-1"); a == nil || a.Harness != "" {
+		t.Fatalf("没声明 harness 的站应当是空，实际 %+v", a)
 	}
 }

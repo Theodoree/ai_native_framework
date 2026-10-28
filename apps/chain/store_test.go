@@ -62,7 +62,7 @@ func TestStoreKeepsNodeOrderAndChildren(t *testing.T) {
 		t.Fatalf("评论丢了或顺序乱了：%+v", g.Comments)
 	}
 	// 库里只有路径与摘要：正文在文件里，读的时候要能从同一份文件取回来。
-	if g.Agents == nil || g.Agents.Path == "" || g.Agents.MD5 == "" {
+	if g.Agents == nil || g.Agents.Path == "" || g.Agents.Checksum == "" {
 		t.Fatalf("自定义 AGENTS.md 的记录丢了：%+v", g.Agents)
 	}
 	if len(g.Rules) != 0 {

@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- power 已废弃：权力只由 type 推导（见 model.go 的 PowerForNode），这里不读也不写。
   -- 列留着不删：DROP COLUMN 是破坏性迁移，老库回滚过一次就得重建整张表。
   power     TEXT NOT NULL DEFAULT '',
+  -- 进链时定下的运行时快照：用哪个 agent 模板、哪个 CLI 版本（见 model.go 的 ChainNode）。
+  -- 不落这两列的话，前端节点卡永远显示「默认运行时 · latest」。
+  harness   TEXT NOT NULL DEFAULT '',
+  version   TEXT NOT NULL DEFAULT '',
   idx       INTEGER NOT NULL,
   state     TEXT NOT NULL,
   rules     TEXT NOT NULL,
@@ -71,7 +75,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- 自定义 AGENTS.md：正文不在这里，这里只有「哪份、多大、什么时候写的、摘要」。
   -- 路径相对 AppHome（项目改名后绝对路径就废了，见 agents.go）。
   agents_path       TEXT NOT NULL DEFAULT '',
-  agents_md5        TEXT NOT NULL DEFAULT '',
+  agents_checksum   TEXT NOT NULL DEFAULT '',
   agents_size       INTEGER NOT NULL DEFAULT 0,
   agents_updated_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (req_id, key)
@@ -190,9 +194,13 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE nodes ADD COLUMN power TEXT NOT NULL DEFAULT ''`,
 		// 自定义 AGENTS.md 的四列：老库靠这四条补上，CREATE TABLE IF NOT EXISTS 不会改动老表。
 		`ALTER TABLE nodes ADD COLUMN agents_path TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE nodes ADD COLUMN agents_md5 TEXT NOT NULL DEFAULT ''`,
+		// 摘要列叫 checksum（算的是 sha256）：老库补的是新列，旧的 agents_md5 留成死列不读。
+		`ALTER TABLE nodes ADD COLUMN agents_checksum TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE nodes ADD COLUMN agents_size INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE nodes ADD COLUMN agents_updated_at TEXT NOT NULL DEFAULT ''`,
+		// 运行时快照（哪个 agent、哪个 CLI 版本）：老库补空串，读到空即「按默认运行时」。
+		`ALTER TABLE nodes ADD COLUMN harness TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE nodes ADD COLUMN version TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("补列失败：%w", err)
@@ -371,13 +379,15 @@ ON CONFLICT(id) DO UPDATE SET
 		if err != nil {
 			return err
 		}
-		agentsPath, agentsMD5, agentsSize, agentsUpdated := agentsColumns(n)
+		agentsPath, agentsChecksum, agentsSize, agentsUpdated := agentsColumns(n)
 		if _, err := tx.Exec(`
 INSERT INTO nodes (req_id, key, type, review, idx, state, rules, artifacts, rev,
-                   agents_path, agents_md5, agents_size, agents_updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                   harness, version,
+                   agents_path, agents_checksum, agents_size, agents_updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			r.ID, n.Key, n.Type, n.Review, n.Index, n.State, rules, artifacts, n.Rev,
-			agentsPath, agentsMD5, agentsSize, agentsUpdated); err != nil {
+			n.Harness, n.Version,
+			agentsPath, agentsChecksum, agentsSize, agentsUpdated); err != nil {
 			return err
 		}
 		for _, a := range n.Attempts {
@@ -448,7 +458,7 @@ FROM requirements WHERE id = ?`, id).
 }
 
 // agentsColumns 把节点上的自定义文档摊成四列；没有文档就是四个空值。
-func agentsColumns(n *Node) (path, md5 string, size int, updated string) {
+func agentsColumns(n *Node) (path, checksum string, size int, updated string) {
 	if n.Agents == nil {
 		return "", "", 0, ""
 	}
@@ -456,14 +466,15 @@ func agentsColumns(n *Node) (path, md5 string, size int, updated string) {
 	if !n.Agents.UpdatedAt.IsZero() {
 		updated = formatTime(n.Agents.UpdatedAt)
 	}
-	return n.Agents.Path, n.Agents.MD5, n.Agents.Size, updated
+	return n.Agents.Path, n.Agents.Checksum, n.Agents.Size, updated
 }
 
 // loadNodes 一次把节点、执行、评论都取回来再在内存里拼，避免每站一次查询。
 func (s *sqliteStore) loadNodes(reqID string) ([]*Node, error) {
 	rows, err := s.db.Query(`
 SELECT key, type, review, idx, state, rules, artifacts, rev,
-       agents_path, agents_md5, agents_size, agents_updated_at
+       harness, version,
+       agents_path, agents_checksum, agents_size, agents_updated_at
 FROM nodes WHERE req_id = ? ORDER BY idx`, reqID)
 	if err != nil {
 		return nil, err
@@ -473,10 +484,11 @@ FROM nodes WHERE req_id = ? ORDER BY idx`, reqID)
 	for rows.Next() {
 		n := &Node{}
 		var rules, artifacts string
-		var agentsPath, agentsMD5, agentsUpdated string
+		var agentsPath, agentsChecksum, agentsUpdated string
 		var agentsSize int
 		if err := rows.Scan(&n.Key, &n.Type, &n.Review, &n.Index, &n.State, &rules, &artifacts, &n.Rev,
-			&agentsPath, &agentsMD5, &agentsSize, &agentsUpdated); err != nil {
+			&n.Harness, &n.Version,
+			&agentsPath, &agentsChecksum, &agentsSize, &agentsUpdated); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -499,7 +511,7 @@ FROM nodes WHERE req_id = ? ORDER BY idx`, reqID)
 		if strings.TrimSpace(agentsPath) != "" {
 			n.Agents = &AgentsDoc{
 				Path:      agentsPath,
-				MD5:       agentsMD5,
+				Checksum:  agentsChecksum,
 				Size:      agentsSize,
 				UpdatedAt: parseTime(agentsUpdated),
 			}

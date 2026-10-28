@@ -14,10 +14,15 @@ import (
 var webFS embed.FS
 
 func main() {
-	// 子命令只有一条：chain assets —— 把内嵌的部署资产展开到磁盘。
-	// 放在 flag.Parse 之前，是因为子命令有自己的 flag 集合（-dir / --dry-run）。
-	if len(os.Args) > 1 && os.Args[1] == "assets" {
-		os.Exit(runAssetsCommand(os.Args[2:]))
+	// 子命令有两条：chain assets（把内嵌的部署资产展开到磁盘）与 chain user add（建账号）。
+	// 放在 flag.Parse 之前，是因为子命令各有自己的 flag 集合。
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "assets":
+			os.Exit(runAssetsCommand(os.Args[2:]))
+		case "user":
+			os.Exit(runUserCommand(os.Args[2:]))
+		}
 	}
 	addr := flag.String("addr", "127.0.0.1:8099", "监听地址")
 	driver := flag.String("db-driver", "sqlite", "存储驱动（目前只有 sqlite）")
@@ -40,6 +45,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer store.Close()
+
+	// 空库没有任何账号，也就没人能登录调建账号的接口：把出路直接打在启动日志里。
+	if n, err := store.CountUsers(); err == nil && n == 0 {
+		log.Printf("还没有任何账号：用 ./chain user add -username admin -password <密码> -admin 建第一个管理员")
+	}
 
 	// 模板表与执行器种类无关：假执行器也要照声明回镜像与版本（前端下拉框与建链校验共用）。
 	// 三级回落：仓库里的 → 家目录展开的 → 内嵌默认表。ResolveTemplateFile 会说清楚用了哪个。

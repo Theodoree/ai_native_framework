@@ -6,7 +6,7 @@ package main
 //   - 目录：$HOME/.<项目名>/agents/<需求 id>/<站 key>.md —— 只建 agents 这一个文件夹
 //   - 库里存的是**相对 AppHome 的路径**：项目名是变量，改名后 AppHome 跟着变，
 //     存绝对路径的话老记录一律失效（见 project.go 里「改名不迁移」那段）
-//   - 字段名沿用 md5（用户原话），算的是 sha256 —— 同一个职责、更强的摘要
+//   - 字段名是 checksum，算的是 sha256 —— 名字说的是「摘要」，不承诺用哪种算法
 //
 // 为什么不把正文也塞进库：正文会长到几十 KB，每次执行都要整份喂给容器；
 // 存两处就有两处不一致的机会，而这里要判的恰恰是「两者一致不一致」。
@@ -25,7 +25,7 @@ import (
 const (
 	// agentsDirName 是家目录下唯一新增的文件夹名。
 	agentsDirName = "agents"
-	// agentsHashName 只是写给人看的算法名（字段叫 md5，算的是它）。
+	// agentsHashName 是写给人看的算法名（字段叫 checksum，算的就是它）。
 	agentsHashName = "sha256"
 	// maxAgentsBytes 是单份文档的上限。256 KiB 足够写一本小册子；
 	// 再大就说明有人在往 agent 上下文里塞整本手册，那是文档该拆，不是这个接口的事。
@@ -37,8 +37,8 @@ const (
 type AgentsDoc struct {
 	// Path 是相对 AppHome 的路径（如 agents/REQ-1/assess.md），不是绝对路径。
 	Path string `json:"path"`
-	// MD5 是正文的 sha256（十六进制）。名字沿用 md5，算法见 agentsHashName。
-	MD5       string    `json:"md5"`
+	// Checksum 是正文的 sha256（十六进制）。名字只承诺「摘要」，算法见 agentsHashName。
+	Checksum  string    `json:"checksum"`
 	Size      int       `json:"size"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -52,7 +52,7 @@ func agentsDriftText(reason, rel string) string {
 // agentsDriftComment 是留在站点上的那句系统评论：人打开这一站要一眼看懂发生了什么。
 // 固定的那半句是契约（前端与用例都认它），后半句带上具体是哪一种不符。
 func agentsDriftComment(err error) string {
-	return "自定义 AGENTS.md 与库里记录不符（md5 不符 / 文件缺失），这一站不跑。详情：" + err.Error()
+	return "自定义 AGENTS.md 与库里记录不符（摘要不符 / 文件缺失），这一站不跑。详情：" + err.Error()
 }
 
 // agentsSegment 检查一个标识能不能当路径的一段用：需求 id 与站 key 都来自外部输入，
@@ -162,7 +162,7 @@ func SetNodeAgents(n *Node, reqID, nodeKey, content string, now time.Time) error
 	if err := writeAgentsFile(abs, []byte(content)); err != nil {
 		return err
 	}
-	n.Agents = &AgentsDoc{Path: rel, MD5: agentsHash([]byte(content)), Size: len(content), UpdatedAt: now}
+	n.Agents = &AgentsDoc{Path: rel, Checksum: agentsHash([]byte(content)), Size: len(content), UpdatedAt: now}
 	return nil
 }
 
@@ -185,8 +185,8 @@ func ReadNodeAgents(n *Node) (string, error) {
 		}
 		return "", fmt.Errorf("读不了自定义 AGENTS.md（%s）：%w", abs, err)
 	}
-	if got := agentsHash(b); !strings.EqualFold(got, strings.TrimSpace(n.Agents.MD5)) {
-		return "", errors.New(agentsDriftText("md5 不符", rel))
+	if got := agentsHash(b); !strings.EqualFold(got, strings.TrimSpace(n.Agents.Checksum)) {
+		return "", errors.New(agentsDriftText("摘要不符", rel))
 	}
 	return string(b), nil
 }

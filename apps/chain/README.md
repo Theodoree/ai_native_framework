@@ -26,8 +26,9 @@
 | 实体        | 关键字段                                                                                                                                         |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Project     | key、name、repo、defaultBranch、chains、createdAt                                                                                                |
-| Chain       | key、type、version、nodes[]（key、type、review、power、harness、version）                                                                        |
-| Node        | key、type、review、power、harness、version、index、state、attempts[]、comments[]、agents{path,md5,size,updatedAt}、artifacts[]、rev                   |
+| Chain       | key、type、version、nodes[]（key、type、review、harness、version）
+                                                                        |
+| Node        | key、type、review、harness、version、index、state、attempts[]、comments[]、agents{path,checksum,size,updatedAt}、artifacts[]、rev                   |
 | Role        | id、projectKey、name、powers[]、createdAt（**没有口令**：角色是授予给账号的，不是一把钥匙）                                                      |
 | Requirement | id、projectKey、chainKey、chainVersion、context、images、source、branch、state、nodes[]、rev、reporter（谁提的、回告地址；接入层带过来的原样存） |
 | User        | id、username、passwordHash、admin、createdAt                                                                                                     |
@@ -132,14 +133,14 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 | 存在哪 | 说明 |
 | --- | --- |
 | 正文 | `$HOME/.<项目名>/agents/<需求 id>/<站 key>.md`（只建 `agents` 这一个文件夹；先写临时文件再改名，读的人不会读到写了一半的那份） |
-| 库里 | `nodes` 表的 `agents_path` / `agents_md5` / `agents_size` / `agents_updated_at` 四列，**没有正文列** |
+| 库里 | `nodes` 表的 `agents_path` / `agents_checksum` / `agents_size` / `agents_updated_at` 四列，**没有正文列** |
 | 路径形状 | 相对 AppHome 的路径，不是绝对路径——项目改名后 AppHome 跟着变，存绝对路径的老记录一律失效 |
 
-摘要字段叫 `md5`（用户原话），算的是 sha256：同一个职责、更强的摘要。
+摘要字段叫 `checksum`，算的是 sha256。**名字只承诺摘要，不承诺算法**：以前叫 `md5` 的字段算的也是 sha256，改成 `checksum` 是免得后来的人拿它去对 md5（老库里那一列留成死列，不再读）。
 
 接口沿用 `/rules` 路径，语义是**整份文档**：
 
-- `GET /api/requirements/{id}/nodes/{node}/rules` → `{content, path, md5, size, updatedAt}`；没有文档时 `content` 是空串。
+- `GET /api/requirements/{id}/nodes/{node}/rules` → `{content, path, checksum, size, updatedAt}`；没有文档时 `content` 是空串。
 - `POST` 同路径，请求体 `{content}` **整份覆盖**；`content` 全是空白＝清除（删文件、清字段、仍 200）；上限 256 KiB，超了 400 并报出实际字节数。
 - 这道门与评论同一条成员门（文案「改不了这一站的规则」），但自定义文档比评论危险得多：评论只留一句话，这份文档会被整份注入容器、在下一站真正执行。
 
@@ -157,7 +158,7 @@ $WORKSPACE/
 - 追加内容同时进 `CHAIN_AGENTS_APPEND` 与前缀 prompt：有的 agent 根本不读文件，prompt 是保底。
 - 重启重跑会按同一份内容重新注入，不需要人工重填。
 
-**对不上就不跑（fail-closed）**。每次读（含注入前）都重算摘要与库里的 `md5` 比对：文件被人手改过、或文件没了但库里还有记录，这一站直接拒绝执行，在该站留一条系统评论「自定义 AGENTS.md 与库里记录不符（md5 不符 / 文件缺失），这一站不跑」。不一致的内容绝不进容器——那等于让容器跑一份没人知道是什么的指令。
+**对不上就不跑（fail-closed）**。每次读（含注入前）都重算摘要与库里的 `checksum` 比对：文件被人手改过、或文件没了但库里还有记录，这一站直接拒绝执行，在该站留一条系统评论「自定义 AGENTS.md 与库里记录不符（摘要不符 / 文件缺失），这一站不跑」。不一致的内容绝不进容器——那等于让容器跑一份没人知道是什么的指令。
 
 **老数据**：以前存在节点上的 `rules[]` 会在读到这条需求时一次性搬成文件（一行一个「- 」列表项），搬完清空旧字段，幂等。代码不再往 `rules[]` 写。
 
@@ -181,13 +182,11 @@ $WORKSPACE/
 | POST       | `/api/requirements/{id}/nodes/{node}/reject`     | 驳回（reason 必填，409 表示不是当前站）                                                                                                           |
 | POST       | `/api/requirements/{id}/nodes/{node}/restart`    | 从这一站重跑（按不动就 403）                                                                                                                      |
 | POST       | `/api/requirements/{id}/nodes/{node}/comment`    | 评论（**项目成员**，不查权力）                                                                                                                    |
-| GET / POST | `/api/requirements/{id}/nodes/{node}/rules`      | 读 / 整份覆盖这一站的自定义 AGENTS.md：`{content, path, md5, size, updatedAt}`，空 content＝清除，上限 256 KiB（**项目成员**，不查权力）           |
+| GET / POST | `/api/requirements/{id}/nodes/{node}/rules`      | 读 / 整份覆盖这一站的自定义 AGENTS.md：`{content, path, checksum, size, updatedAt}`，空 content＝清除，上限 256 KiB（**项目成员**，不查权力）           |
 | POST       | `/api/requirements/{id}/images`                  | 传图：`multipart/form-data`，字段名 `files`（可多个）；一次 ≤5 张、每张 ≤5MB，按文件头认 png / jpeg / webp / gif；有一张不合规就整批 400 且不进盘 |
 | GET        | `/api/requirements/{id}/images/{name}`           | 取图：原样字节 + 正确的 `Content-Type` / `Content-Length`；文件名越界、或不属于这条需求，一律 404                                                 |
 | DELETE     | `/api/requirements/{id}/images/{name}`           | 删图：文件删掉、同时从 `Images` 里摘掉；找不到 404                                                                                                |
-| POST       | `/api/signup`                                    | **免登录**：只在库是空的时候可用（第一个注册的人就是管理员），之后 409                                                                            |
 | POST       | `/api/login`                                     | **免登录**：用户名 + 口令，发 Cookie `chain_session`（HttpOnly，7 天）                                                                            |
-| GET        | `/api/bootstrap`                                 | **免登录**：`{"signupAvailable": true}` 只在库是空的时候（还有没有人可注册）                                                                      |
 | POST       | `/api/logout`                                    | 删掉当前会话                                                                                                                                      |
 | GET        | `/api/me`                                        | 我是谁：`{user, memberships}`——账号（含是否管理员）+ 在每个项目里拿到了哪些角色与权力                                                             |
 | PUT        | `/api/me/password`                               | 改自己的口令（≥8 位）                                                                                                                             |
@@ -228,7 +227,7 @@ $WORKSPACE/
 
 | 动作                                      | 谁可以                                                                                                              |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| 注册第一个账号                            | 谁先来谁注册：库是空的时候 `POST /api/signup` 开，注册的人就是管理员；之后注册通道关死（409），其余账号只能管理员建 |
+| 造第一个账号                              | 命令行 `./chain user add -username admin -password <密码> -admin`（**没有自助注册**：`/api/signup`、`/api/bootstrap` 已删除，一律 404） |
 | 建项目                                    | 管理员（`POST /api/projects` 的第一道门）                                                                           |
 | 建角色 / 加成员 / 删角色                  | 管理员。把人放进项目只有这一个入口                                                                                  |
 | 提需求（界面）                            | 该项目的成员：任一权力即成员，管理员天生是                                                                          |
@@ -245,7 +244,7 @@ $WORKSPACE/
 
 判定只有一个地方：**管理员四权齐全**；普通账号取「在这个项目里被授予的所有角色的并集」。项目外的授予一律不算——跨项目越权就是在这里断掉的。
 
-不写权力时按节点类型给默认值（建链可逐站覆盖）：
+节点要哪一档权力，只看类型（没有逐站覆盖这回事）：
 
 | 节点类型  | 默认权力 |
 | --------- | -------- |
@@ -256,7 +255,9 @@ $WORKSPACE/
 | merge     | review   |
 | release   | release  |
 
-链条上每个节点可以写 `power` 覆盖默认值；需求进链那一刻把权力定死在快照里——之后改链条，不改已经在飞的需求。老库里节点没有 `power` 列的，落回类型默认（升级不该把已有需求变成谁也按不动）。
+**权力只由节点类型决定**，链条上不能逐站覆盖：同一类站永远是同一档权力，改链条也不会把某一站改成别的权力。所以「授予谁能按这类站」只取决于「这个人在这个项目里有没有这一档权力」。
+
+老库的 `nodes.power` 列还在，但代码既不读也不写（不 DROP COLUMN 是避免破坏性迁移）：升级不会把已有需求变成谁也按不动。
 
 角色本身没有口令、也不会过期：它是一个「名字 + 权力清单」，被授予给账号。授予关系存在 `assignments` 表里，删角色会连带删掉它的授予。
 
@@ -288,8 +289,19 @@ cd apps/chain
 export GOCACHE=$PWD/.cache/go-build GOPATH=$PWD/.cache/go
 go test ./...
 go run . -addr 127.0.0.1:8099 -exec fake     # 打开 http://127.0.0.1:8099
-# 打开页面先注册（库是空的，第一个注册的人就是管理员），之后用这个账号登录
+# 第一个账号只能从命令行造（没有自助注册）：
+go run . user add -username admin -password <至少 8 位> -admin
+# 库里一个账号都没有时，启动日志会提示这一行
 ```
+
+`chain user add` 就是「造账号」这一个子命令（口令规则与 `POST /api/users` 是同一处实现，撞名与短口令都建不成，退出码非 0）：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-username` | 必填 | 同一个库里不能重名 |
+| `-password` | 必填 | 至少 8 个字符 |
+| `-admin` | 关 | 建的是管理员；**已有账号不能靠这个参数升级** |
+| `-db-driver` / `-db` | `sqlite` / `data/chain.db` | 与服务同一套参数，指向同一个库 |
 
 要接真容器（需要本机 docker daemon）：
 

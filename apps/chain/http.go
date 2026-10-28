@@ -209,6 +209,12 @@ func (r *ginRouter) notFound(c *gin.Context) {
 		http.NotFound(c.Writer, c.Request)
 		return
 	}
+	// /api/** 下面没有 SPA 兜底：请求落在这里说明这个接口不存在，
+	// 与方法无关都该是 404 —— 「这条路已经删了」不该被说成「方法不对」。
+	if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+		http.NotFound(c.Writer, c.Request)
+		return
+	}
 	r.methodNotAllowed(c)
 }
 
@@ -730,14 +736,14 @@ func (s *Server) getNodeRule(c *gin.Context) {
 
 // agentsView 是读写两侧共用的响应形状：正文 + 库里的四个字段。
 func agentsView(n *Node, content string) map[string]any {
-	out := map[string]any{"content": content, "path": "", "md5": "", "size": 0, "updatedAt": ""}
+	out := map[string]any{"content": content, "path": "", "checksum": "", "size": 0, "updatedAt": ""}
 	if n.Agents != nil {
 		updated := ""
 		if !n.Agents.UpdatedAt.IsZero() {
 			updated = formatTime(n.Agents.UpdatedAt)
 		}
 		out["path"] = n.Agents.Path
-		out["md5"] = n.Agents.MD5
+		out["checksum"] = n.Agents.Checksum
 		out["size"] = n.Agents.Size
 		out["updatedAt"] = updated
 	}
