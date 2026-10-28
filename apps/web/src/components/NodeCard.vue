@@ -43,12 +43,27 @@ const rejectComment = computed(() => props.node.comments.find((c) => c.verdict =
 const lastAttempt = computed(() => props.node.attempts[props.node.attempts.length - 1] ?? null)
 
 /**
- * 标题行的副信息只留「审核方 · 状态 · N 条评论」。
- * 站名不进这一行（只由左边圆节点承担），模板也不再回显（它在下面的执行记录里）——
- * 同一件事在同一个屏幕上只出现一次。
+ * 标题行的副信息是「agent 运行时 · 版本 · 审核方 · 状态 · N 条评论」。
+ * 站名不进这一行（只由左边圆节点承担）。
  */
+/** 容器站（跑容器的）才有 agent 运行时；dev / merge 这类空站不跑容器。 */
+const isContainerNode = computed(() => ['create', 'assess', 'crosstest', 'release'].includes(props.node.type))
+
+/**
+ * 这一站跑的是哪个 agent 运行时、哪个版本。
+ * version 是镜像里那个 CLI 的版本，不是镜像 tag；没声明 harness 时用的是节点类型的默认模板，
+ * 这里就说「默认运行时」而不是编一个键名出来。空站没有这两个字段。
+ */
+const runtimeText = computed(() => {
+  // 空站没有运行时，这一格交给 subLine 统一拼成「空节点 · 人工审核 …」，别再把「人工」写两遍。
+  if (!isContainerNode.value) return ''
+  const harness = (props.node.harness ?? '').trim() === '' ? '默认运行时' : props.node.harness
+  const version = (props.node.version ?? '').trim() === '' ? 'latest' : props.node.version
+  return harness + ' · ' + version
+})
+
 const subLine = computed(() => {
-  const parts: string[] = []
+  const parts: string[] = [isContainerNode.value ? runtimeText.value : '空节点']
   parts.push(props.node.review === 'ai' ? 'AI 审核' : '人工审核')
   parts.push(fmtState(props.node.state))
   parts.push(props.node.comments.length + ' 条评论')
@@ -56,7 +71,7 @@ const subLine = computed(() => {
 })
 
 /** 这一站要的权力，以及我有没有；没有就禁用并说清缺哪个（按钮不隐藏）。 */
-const needPower = computed(() => powerForNode(props.node.type, props.node.power))
+const needPower = computed(() => powerForNode(props.node.type))
 const hasPower = computed(() => needPower.value !== '' && props.powers.includes(needPower.value))
 const denyText = computed(
   () =>

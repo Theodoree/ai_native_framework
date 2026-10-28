@@ -26,6 +26,7 @@ import type {
   Requirement,
   RequirementDetail as RequirementDetailData,
   SessionUser,
+  TemplateView,
 } from './types'
 
 type LoadState = 'loading' | 'ready' | 'error'
@@ -43,6 +44,10 @@ const memberships = ref<Membership[]>([])
 const authNotice = ref('')
 
 const projects = ref<Project[]>([])
+/** agent 运行时清单（GET /api/templates）：只给新建项目的链条编辑器用，拿不到也不挡主流程。 */
+const templates = ref<TemplateView[]>([])
+const templatesError = ref('')
+
 const projectsState = ref<LoadState>('loading')
 const projectsError = ref('')
 
@@ -129,11 +134,12 @@ async function refreshSession() {
   memberships.value = me.memberships ?? []
 }
 
-async function bootstrap() {
+/** 刷新页面时向 /api/me 要一次会话：401 就是没登录，直接给登录卡。 */
+async function restoreSession() {
   try {
     await refreshSession()
     sessionState.value = 'ready'
-    await loadProjects()
+    await Promise.all([loadProjects(), loadTemplates()])
   } catch (e) {
     // 401 是「没登录」的正常答复，不提示；连不上服务才把原因写在登录页上。
     const notLoggedIn = e instanceof api.ApiError && e.status === 401
@@ -147,16 +153,21 @@ async function doLogin(input: Credentials) {
   await refreshSession()
   authNotice.value = ''
   sessionState.value = 'ready'
-  await loadProjects()
+  await Promise.all([loadProjects(), loadTemplates()])
 }
 
-async function doSignup(input: Credentials) {
-  // 注册成功时后端已经下发会话，等价于登录成功。
-  await api.signup(input)
-  await refreshSession()
-  authNotice.value = ''
-  sessionState.value = 'ready'
-  await loadProjects()
+/**
+ * agent 运行时清单是「平台能力」，与项目无关；读失败不算页面错误——
+ * 链条编辑器退化成手填输入框，并把原因写在那一行。
+ */
+async function loadTemplates() {
+  try {
+    templates.value = await api.listTemplates()
+    templatesError.value = ''
+  } catch (e) {
+    templates.value = []
+    templatesError.value = messageOf(e, '拿不到 agent 运行时清单')
+  }
 }
 
 async function doLogout() {
@@ -316,7 +327,7 @@ function retryDetail() {
 }
 
 onMounted(() => {
-  void bootstrap()
+  void restoreSession()
 })
 </script>
 
@@ -330,7 +341,6 @@ onMounted(() => {
     v-else-if="sessionState === 'anon'"
     :notice="authNotice"
     :login="doLogin"
-    :signup="doSignup"
   />
 
   <a-layout v-else class="shell">
@@ -343,6 +353,8 @@ onMounted(() => {
         :change-password="doChangePassword"
         :view="view"
         :admin="isAdmin"
+        :templates="templates"
+        :templates-error="templatesError"
         @select="selectProject"
         @logout="doLogout"
         @nav="switchView"

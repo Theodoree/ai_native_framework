@@ -8,8 +8,19 @@ export interface ChainNodeDecl {
   key: string
   type: NodeType
   review: ReviewSide
-  /** 可选的逐站权力覆盖；不写就按节点类型的默认权力（后端 ValidPower 只认 review/dev/test/release）。 */
-  power?: string
+  /** 这一站用哪个 agent 运行时；不写后端按节点类型的默认模板。空节点（dev/merge）不能声明。 */
+  harness?: string
+  /** 镜像里 agent CLI 的版本（不是镜像 tag）；不写后端定成 latest。空节点不能声明。 */
+  version?: string
+}
+
+/** GET /api/templates 的一项：harness 的 key + 它跑的镜像 + 可选 agent 版本（latest 第一，倒序最多 10 个）。 */
+export interface TemplateView {
+  key: string
+  image: string
+  version: string
+  versions: string[]
+  timeout?: string
 }
 
 export interface Chain {
@@ -51,8 +62,10 @@ export interface Node {
   key: string
   type: NodeType
   review: ReviewSide
-  /** 进链时快照下来的那一站要求的权力（review/dev/test/release）；缺省时按类型默认。 */
-  power?: string
+  /** 进链时快照的 agent 运行时；空节点（dev/merge）没有这一项。 */
+  harness?: string
+  /** 进链时快照的 agent CLI 版本（不是镜像 tag）；空节点上后端也会写一个，展示时忽略。 */
+  version?: string
   /** 0 基下标：展示成「第 N 站」要 +1。 */
   index: number
   state: NodeState

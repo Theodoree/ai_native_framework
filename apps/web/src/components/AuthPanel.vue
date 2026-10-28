@@ -1,68 +1,41 @@
 <script setup lang="ts">
 /**
- * 登录 / 注册：一张卡片两态，切换不丢输入。
+ * 登录卡：内网部署，账号一律由管理员分配，前端不再提供注册入口。
  * 网络调用由 App 通过 props 传进来（与其余组件的约定一致），这里只管表单、禁用与就地报错。
- * 注册只在空库时可用：后端 409 的文案换成「已有账号，请先登录」，并把表单切回登录态。
  */
 import { computed, ref } from 'vue'
-import { ApiError } from '../api'
 import type { Credentials } from '../types'
 
 const props = defineProps<{
   /** 会话过期之类的提示语（由 App 在收到 401 时设置）。 */
   notice: string
   login: (input: Credentials) => Promise<void>
-  signup: (input: Credentials) => Promise<void>
 }>()
 
-const mode = ref<'login' | 'register'>('login')
-const username = ref('')
-const password = ref('')
+const username = ref("")
+const password = ref("")
 const busy = ref(false)
-const error = ref('')
+const error = ref("")
 
-const isRegister = computed(() => mode.value === 'register')
-const submitText = computed(() => (isRegister.value ? '注册并进入' : '登录'))
-const passwordPlaceholder = computed(() => (isRegister.value ? '至少 8 位' : '密码'))
-
-const hintText = computed(() =>
-  isRegister.value
-    ? '注册只在空库时可用，第一个账号就是管理员。'
-    : '登录后才能看到项目与需求；忘记密码请联系管理员重置。',
-)
-
-function switchMode(next: 'login' | 'register') {
-  if (busy.value) return
-  mode.value = next
-  error.value = ''
-}
+const hintText = computed(() => "登录后才能看到项目与需求；账号由管理员分配，忘记密码请联系管理员重置。")
 
 async function submit() {
   if (busy.value) return
-  error.value = ''
-  if (username.value.trim() === '') {
-    error.value = '用户名不能为空'
+  error.value = ""
+  if (username.value.trim() === "") {
+    error.value = "用户名不能为空"
     return
   }
-  if (password.value === '') {
-    error.value = '密码不能为空'
+  if (password.value === "") {
+    error.value = "密码不能为空"
     return
   }
   busy.value = true
   try {
     const input: Credentials = { username: username.value, password: password.value }
-    if (isRegister.value) await props.signup(input)
-    else await props.login(input)
+    await props.login(input)
   } catch (e) {
-    if (e instanceof ApiError && e.status === 409) {
-      // 409 只可能来自注册：这条通道关掉了，把用户送回登录态，别让人对着死表单重试。
-      mode.value = 'login'
-      error.value = '已有账号，请先登录'
-    } else if (e instanceof Error) {
-      error.value = e.message
-    } else {
-      error.value = '请求失败，请稍后再试'
-    }
+    error.value = e instanceof Error ? e.message : "请求失败，请稍后再试"
   } finally {
     busy.value = false
   }
@@ -82,27 +55,6 @@ async function submit() {
 
       <a-alert v-if="props.notice" class="auth__notice" type="warning">{{ props.notice }}</a-alert>
 
-      <div class="auth__tabs">
-        <button
-          type="button"
-          class="auth__tab"
-          :class="{ 'auth__tab--on': !isRegister }"
-          :disabled="busy"
-          @click="switchMode('login')"
-        >
-          登录
-        </button>
-        <button
-          type="button"
-          class="auth__tab"
-          :class="{ 'auth__tab--on': isRegister }"
-          :disabled="busy"
-          @click="switchMode('register')"
-        >
-          首次注册
-        </button>
-      </div>
-
       <a-form :model="{ username, password }" layout="vertical" class="auth__form">
         <a-form-item label="用户名">
           <a-input
@@ -116,7 +68,7 @@ async function submit() {
         <a-form-item label="密码">
           <a-input-password
             v-model="password"
-            :placeholder="passwordPlaceholder"
+            placeholder="密码"
             allow-clear
             :disabled="busy"
             @press-enter="submit"
@@ -133,7 +85,7 @@ async function submit() {
           :disabled="busy"
           @click="submit"
         >
-          {{ submitText }}
+          登录
         </a-button>
       </a-form>
 
