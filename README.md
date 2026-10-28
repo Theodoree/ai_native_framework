@@ -126,4 +126,4 @@ cd ../../apps/web && npm ci && npm run build    # 改前端后重建，产物进
 
 ## 贡献
 
-改动流程见 `CONTRIBUTING.md`，安全问题按 `SECURITY.md` 私下报告。
+改动流程见 `CONTRIBUTING.md`。
