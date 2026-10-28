@@ -3,7 +3,11 @@
 一条需求从提出到上线，中间只有两样东西：**链条**和**节点状态**。
 没有独立编排器，没有 CI 门禁，也不依赖 GitHub 的任何一套机制——一个 Go 二进制，页面、节点模板、镜像脚本全在里面。
 
-[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE) [![Release](https://img.shields.io/badge/release-v0.1.0-informational?style=flat-square)](CHANGELOG.md)
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
+<br>
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+<br>
+[![Release](https://img.shields.io/badge/release-v0.1.0-informational?style=flat-square)](CHANGELOG.md)
 
 ## 它是怎么排的
 
@@ -82,6 +86,23 @@ curl -X POST http://127.0.0.1:8099/api/intake/requirements \
 - 不是 CI：没有 required check、没有 PR 门禁，判定不发生在 YAML 里。
 - 不做插件管理：想让某个节点的 agent 多会一件事，写那一站的规则（内容只进容器、每次执行重算）。
 - 不做人员目录：账号、项目级角色、API 密钥三样，够用为止。
+
+## 还没做的
+
+完整清单与「开工前要先定什么」在 [docs/TODO.md](docs/TODO.md)，这里只列条目：
+
+- [ ] k3s 接入（现在只有本机 `docker run`）
+- [ ] MySQL 改造（`Store` 是接口，目前只有 SQLite 一个实现）
+- [ ] 多实例（单机单写者，库是本地文件）
+- [ ] 真节点镜像端到端（三个 Dockerfile 从没跑过真 agent）
+- [ ] 接入层回告的重试与签名（现在只发一次，失败只留一条事件）
+- [ ] 项目级管理员（现在只有全局管理员）
+- [ ] 审计日志（记到什么粒度、留存多久都还没定）
+- [ ] 会话续期与自助找回密码（现在 7 天固定、只能管理员重置）
+- [ ] 观测（只有 stdout 日志，无 metrics、无健康详情端点）
+- [ ] 图片扫描与缩略（现在只按文件头认类型、不处理）
+- [ ] 分支链条（只有线性六站，不能并行、不能停在两处）
+- [ ] 前端窄屏汉堡菜单、权力快照自动刷新、多链对比视图
 
 ## 文档在哪
 
