@@ -1,58 +1,118 @@
 # AI 原生研发交付引擎
 
-一条需求从提出到上线，中间只有两样东西：**节点**和**节点的状态**。没有独立编排器，没有 CI 门禁，也不依赖 GitHub 的任何一套机制。
+一条需求从提出到上线，中间只有两样东西：**链条**和**节点状态**。
+没有独立编排器，没有 CI 门禁，也不依赖 GitHub 的任何一套机制——一个 Go 二进制，页面、节点模板、镜像脚本全在里面。
 
-## 三个概念
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE) [![Release](https://img.shields.io/badge/release-v0.1.0-informational?style=flat-square)](CHANGELOG.md)
 
-- **链条**：节点顺序的声明。节点类型封闭为六类——`create`（建项目）、`assess`（需求评估）、`dev`（人在分支上开发）、`crosstest`（跨端测试）、`merge`（人在仓库里合并）、`release`（上线）。头必须是评估、尾必须是上线，中间随便排。
-- **需求**：进链即建分支，链的版本在进入那一刻被钉住。提出的东西是 fix bug 还是新功能，走同一条链。
-- **节点状态**：`pending → running → awaiting_review → accepted`。需求此刻站在哪，由「第一个还没通过的节点」推导出来，不需要额外记录位置。
+## 它是怎么排的
 
-驳回就是回滚到上一节点，历史一条都不删；第一站被驳回，等于整条需求被驳回。
+链条是节点顺序的声明，节点类型封闭为六类，头必须是需求评估、尾必须是上线：
 
-## 现在能跑什么
+```mermaid
+flowchart LR
+  req([需求]) --> assess[需求评估]
+  assess --> dev[开发]
+  dev --> crosstest[跨端测试]
+  crosstest --> merge[合并]
+  merge --> release[上线]
+  release --> done([交付])
+```
+
+其中「开发」「合并」是空节点——人在分支上干活、在仓库里合回主线，平台只记状态；其余节点起容器跑 agent，跑完把执行记录与结论写进这一站的评论区。
+
+需求此刻站在哪一层，由「第一个还没通过的节点」推导出来，不单独存一个位置字段：
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending
+  pending --> running: 开跑
+  running --> awaiting_review: 跑完（容器给结论 / 等人审）
+  awaiting_review --> accepted: 通过
+  awaiting_review --> rejected: 驳回
+  rejected --> running: 退回上一站
+  accepted --> [*]
+```
+
+驳回即回滚到上一站，历史一条不删；第一站被驳回等于整条需求被驳回。
+
+## Quick Start
+
+需要 Go 1.26+（前端产物已入库，不装 Node 也能跑）。
+
+```bash
+git clone https://github.com/Theodoree/ai_native_framework.git
+cd ai_native_framework/apps/chain
+go build -o chain .
+./chain                                    # 打开 http://127.0.0.1:8099
+```
+
+第一次打开直接注册：库是空的时候谁先注册谁就是管理员，之后注册一律关闭，其余账号由管理员在「用户」页建。
+
+默认 `-exec fake` 只写一条评论、不连外部服务。想接真容器：
+
+```bash
+./chain assets                             # 节点模板与镜像脚本展开到 ~/.ai_native_framework
+sh ~/.ai_native_framework/agent-image/build-images.sh
+DEEPSEEK_API_KEY=sk-... ./chain -exec docker
+```
+
+## 从平台外面提需求
+
+在「我的密钥」页建一把 API 密钥（`ak_…`，secret 只出现一次），之后：
+
+```bash
+curl -X POST http://127.0.0.1:8099/api/intake/requirements \
+  -H "Authorization: Bearer ak_..." \
+  -H "Content-Type: application/json" \
+  -d '{"project":"acme","context":"导出功能不支持 CSV，客户要"}'
+```
+
+拉结论走 `GET /api/intake/requirements/{id}`。整条需求被拒时会尽力回告一次，**回告失败不改状态**——拉模式永远是可信的那条路。
+
+## 它是什么
+
+- **一个二进制**：页面（Vue 3 + Arco Design Vue）`//go:embed` 进产物，节点模板与镜像脚本也在里面，`./chain assets` 就地展开。
+- **状态只有一个写者**：跑、通过、驳回、评论、重启都经状态机，HTTP 层只做校验与搬运。
+- **人保留否决权**：合并不由平台代做；人审节点的按钮只有人按得动。
+- **够小**：SQLite（纯 Go 驱动，免 cgo）单文件存全部状态；`Store` 是接口，换库只加一个实现。
+
+## 它不是什么
+
+- 不是 CI：没有 required check、没有 PR 门禁，判定不发生在 YAML 里。
+- 不做插件管理：想让某个节点的 agent 多会一件事，写那一站的规则（内容只进容器、每次执行重算）。
+- 不做人员目录：账号、项目级角色、API 密钥三样，够用为止。
+
+## 文档在哪
+
+| 想了解                       | 看哪里                                                |
+| ---------------------------- | ----------------------------------------------------- |
+| 架构、分层、一次需求流过什么 | `docs/architecture.md`                                |
+| 平台契约与全部 HTTP 接口     | `apps/chain/README.md`                                |
+| 前端契约                     | `apps/web/README.md`                                  |
+| 还没做的（k3s、MySQL 等）    | `docs/TODO.md`                                        |
+| 为什么这么做、放弃了什么     | `.agents/notes/`                                      |
+| 版本变更                     | `CHANGELOG.md`                                        |
+| 工作规则                     | `AGENTS.md` / `docs/AGENTS.md` / `docs/principles.md` |
+
+## 开发
 
 ```bash
 cd apps/chain
-export GOCACHE=$PWD/.cache/go-build GOPATH=$PWD/.cache/go
-go test ./...                                    # 状态机 + 存储 + 执行器 + 端到端 HTTP
-go run . -addr 127.0.0.1:8099 -exec fake         # 打开 http://127.0.0.1:8099
+GOCACHE=/tmp/gocache-chain go test ./...       # 状态机、存储、执行器、HTTP 端到端
+gofmt -l *.go && go vet ./...                  # 格式与静态检查
+
+cd ../../apps/web && npm ci && npm run build    # 改前端后重建，产物进 apps/chain/webui/dist
 ```
 
-第一次打开先注册：库是空的时候 `POST /api/signup` 开着，注册的人就是管理员；之后注册通通关死，其余账号由管理员在「用户」页建。
+改完前端记得重建：产物是入库的，`go:embed` 打的是它，忘了构建就等于没改。
 
-管理员建 project 并在「项目设置」里建角色、授角色；项目成员提需求，逐站运行 / 通过 / 驳回 / 评论 / 追加规则、重启节点，在需求详情里看图。事件流只追加，不参与任何判定。
+## 贡献
 
-平台外面（脚本、另一个系统）走接入层：在「我的密钥」页建一把 API 密钥（`ak_…`，secret 只出现一次），之后带 `Authorization: Bearer ak_…` 提需求、拉结论。密钥只认人、不分权，能不能进某个项目仍看那个账号的项目成员资格。整条需求被拒时会尽力回告一次，**回告失败不改状态**——所以拉模式永远是可信的那条路。接口表见 `apps/chain/README.md` 的「接入层」一节。
+见 `CONTRIBUTING.md`。安全问题请走 `SECURITY.md`，不要开公开 issue。
 
-- **存储**：SQLite（纯 Go 驱动，免 cgo），库文件默认 `data/chain.db`。`Store` 是接口，换 MySQL 只加一个实现。
-- **执行**：`-exec fake` 只写一条评论并声明自己没连过外部服务；`-exec docker` 会用 `docker run` 起真容器并注入 `BASE_URL` / 模型 / AGENTS.md / 需求正文，密钥只从环境变量取且会从日志里抹掉。想让某一站的 agent 多会一件事（插件、技能），写那一站的规则就够——平台不做插件管理，见 `apps/chain/README.md` 的「给 agent 加插件、加技能」。
-- **镜像**：节点镜像与 `nodes.yaml` 都编在二进制里；第一次用容器节点前先 `go run . assets` 把它们展开到 `$HOME/.<项目名>/`，再 `sh "$HOME/.<项目名>/agent-image/build-images.sh"` 本地烘三个 agent 镜像。来路与字段见 `apps/chain/README.md` 的「节点镜像从哪来」。
-- **前端**：Vue 3 + Vite + TS + Arco Design Vue（MIT，全量注册），构建产物已入库（`apps/chain/webui/dist`），被 `//go:embed` 打进二进制。改了 `apps/web` 要记得 `npm run build`。
+## License
 
-## 铁律
+MIT，见 `LICENSE`。
 
-1. **状态只有一个写者**：节点状态只能由状态机改，HTTP 层只做校验与搬运。
-2. **位置是推导出来的**：不存「当前位置」，只存每个节点的状态。
-3. **评论与执行记录只追加**：回滚重置状态，不删历史。
-4. **人保留否决权**：合并这件事永远由人按，平台不代做。
-5. **默认文件不改**：某一条需求某一步要加规则，追加到该节点上，不动默认 AGENTS.md。
-
-## 仓库结构
-
-| 路径                                                 | 装什么                                                                                                                                       |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/chain/`                                        | 链条平台：状态机、SQLite 存储、HTTP、容器执行器、嵌入的前端产物                                                                              |
-| `apps/web/`                                          | 前端源码：Vue 3 + Vite + TypeScript + Arco Design Vue                                                                                        |
-| `apps/chain/deploy/`                                 | 节点模板 `nodes.yaml`（改模板不用重编译）+ 自建 agent 镜像 `agent-image/`；编进二进制，`chain assets` 展开到家目录                           |
-| `CHANGELOG.md`                                       | 版本变更：按能力分组，不复述提交历史                                                                                                         |
-| `docs/architecture.md`                               | 架构总览：分层、模块地图、一次需求流过什么                                                                                                   |
-| `.agents/notes/proposed/p32-node-chain-alignment.md` | 需求基线：六类节点、链条规则、状态转换、五条收口假设                                                                                         |
-| `.agents/notes/proposed/p32-design-minimal.md`       | 设计：实体、不变量、九个接口、容器执行五步（其中「文件存储」已被 SQLite 取代，见 `.agents/notes/implemented/p33-sqlite-docker-frontend.md`） |
-| `AGENTS.md` / `docs/`                                | 工作规则与原则                                                                                                                               |
-
-## 关于被丢掉的前一版
-
-这个仓库此前是一套「声明 + CI 门禁 + 审计 Check Run」的实现，判据全部搬进 Go 引擎、静态判据写了二十几轮。它证明了一件事：**当判定层要靠静态扫描去猜「这段 YAML 会不会改写结论」时，输的永远是判据**。所以这一版换了观测点——结论由状态机产生，进度由节点状态推导，谁都不能靠改一行配置把结论说成绿的。
-
-[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
+[![](https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
