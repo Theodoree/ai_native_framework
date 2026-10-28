@@ -26,9 +26,8 @@
 | 实体        | 关键字段                                                                                                                                         |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Project     | key、name、repo、defaultBranch、chains、createdAt                                                                                                |
-| Chain       | key、type、version、nodes[]（key、type、review、harness、version）
-                                                                        |
-| Node        | key、type、review、harness、version、index、state、attempts[]、comments[]、agents{path,checksum,size,updatedAt}、artifacts[]、rev                   |
+| Chain       | key、type、version、nodes[]（key、type、review、harness、version）                                                                               |
+| Node        | key、type、review、harness、version、index、state、attempts[]、comments[]、agents{path,checksum,size,updatedAt}、artifacts[]、rev                |
 | Role        | id、projectKey、name、powers[]、createdAt（**没有口令**：角色是授予给账号的，不是一把钥匙）                                                      |
 | Requirement | id、projectKey、chainKey、chainVersion、context、images、source、branch、state、nodes[]、rev、reporter（谁提的、回告地址；接入层带过来的原样存） |
 | User        | id、username、passwordHash、admin、createdAt                                                                                                     |
@@ -130,11 +129,11 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 
 **正文存文件，库里只有路径与摘要**（用户口径：`数据库里面存路径和 md5，外面存文件`）：
 
-| 存在哪 | 说明 |
-| --- | --- |
-| 正文 | `$HOME/.<项目名>/agents/<需求 id>/<站 key>.md`（只建 `agents` 这一个文件夹；先写临时文件再改名，读的人不会读到写了一半的那份） |
-| 库里 | `nodes` 表的 `agents_path` / `agents_checksum` / `agents_size` / `agents_updated_at` 四列，**没有正文列** |
-| 路径形状 | 相对 AppHome 的路径，不是绝对路径——项目改名后 AppHome 跟着变，存绝对路径的老记录一律失效 |
+| 存在哪   | 说明                                                                                                                           |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| 正文     | `$HOME/.<项目名>/agents/<需求 id>/<站 key>.md`（只建 `agents` 这一个文件夹；先写临时文件再改名，读的人不会读到写了一半的那份） |
+| 库里     | `nodes` 表的 `agents_path` / `agents_checksum` / `agents_size` / `agents_updated_at` 四列，**没有正文列**                      |
+| 路径形状 | 相对 AppHome 的路径，不是绝对路径——项目改名后 AppHome 跟着变，存绝对路径的老记录一律失效                                       |
 
 摘要字段叫 `checksum`，算的是 sha256。**名字只承诺摘要，不承诺算法**：以前叫 `md5` 的字段算的也是 sha256，改成 `checksum` 是免得后来的人拿它去对 md5（老库里那一列留成死列，不再读）。
 
@@ -172,7 +171,7 @@ $WORKSPACE/
 | ---------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | GET        | `/`                                              | 内嵌前端（`webui/dist`）                                                                                                                          |
 | GET        | `/assets/`                                       | 内嵌前端的静态资源                                                                                                                                |
-| GET        | `/api/templates`                                | 节点模板表：`[{key, image, version, versions, timeout}]`（登录即可）。建链时前端拿它填 harness 下拉框与版本候选                          |
+| GET        | `/api/templates`                                 | 节点模板表：`[{key, image, version, versions, timeout}]`（登录即可）。建链时前端拿它填 harness 下拉框与版本候选                                   |
 | GET / POST | `/api/projects`                                  | 列表只回我参与的项目（管理员回全部）/ 创建（key 重复 409）。**管理员**；只写 project 本身，不授予任何人角色                                       |
 | GET        | `/api/requirements`                              | 只回我参与的项目下的需求                                                                                                                          |
 | POST       | `/api/p/{project}/requirements`                  | 提需求（body: context、images、source、chain）。**项目成员**：任一权力即成员，管理员天生是                                                        |
@@ -182,7 +181,7 @@ $WORKSPACE/
 | POST       | `/api/requirements/{id}/nodes/{node}/reject`     | 驳回（reason 必填，409 表示不是当前站）                                                                                                           |
 | POST       | `/api/requirements/{id}/nodes/{node}/restart`    | 从这一站重跑（按不动就 403）                                                                                                                      |
 | POST       | `/api/requirements/{id}/nodes/{node}/comment`    | 评论（**项目成员**，不查权力）                                                                                                                    |
-| GET / POST | `/api/requirements/{id}/nodes/{node}/rules`      | 读 / 整份覆盖这一站的自定义 AGENTS.md：`{content, path, checksum, size, updatedAt}`，空 content＝清除，上限 256 KiB（**项目成员**，不查权力）           |
+| GET / POST | `/api/requirements/{id}/nodes/{node}/rules`      | 读 / 整份覆盖这一站的自定义 AGENTS.md：`{content, path, checksum, size, updatedAt}`，空 content＝清除，上限 256 KiB（**项目成员**，不查权力）     |
 | POST       | `/api/requirements/{id}/images`                  | 传图：`multipart/form-data`，字段名 `files`（可多个）；一次 ≤5 张、每张 ≤5MB，按文件头认 png / jpeg / webp / gif；有一张不合规就整批 400 且不进盘 |
 | GET        | `/api/requirements/{id}/images/{name}`           | 取图：原样字节 + 正确的 `Content-Type` / `Content-Length`；文件名越界、或不属于这条需求，一律 404                                                 |
 | DELETE     | `/api/requirements/{id}/images/{name}`           | 删图：文件删掉、同时从 `Images` 里摘掉；找不到 404                                                                                                |
@@ -225,16 +224,16 @@ $WORKSPACE/
 
 ### 谁能做什么
 
-| 动作                                      | 谁可以                                                                                                              |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| 动作                                      | 谁可以                                                                                                                                  |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | 造第一个账号                              | 命令行 `./chain user add -username admin -password <密码> -admin`（**没有自助注册**：`/api/signup`、`/api/bootstrap` 已删除，一律 404） |
-| 建项目                                    | 管理员（`POST /api/projects` 的第一道门）                                                                           |
-| 建角色 / 加成员 / 删角色                  | 管理员。把人放进项目只有这一个入口                                                                                  |
-| 提需求（界面）                            | 该项目的成员：任一权力即成员，管理员天生是                                                                          |
-| 提需求 / 拉结论（接入层）                 | 该项目的成员（管理员天生是；普通账号要有这个项目里任一角色）                                                        |
-| 按节点（run / accept / reject / restart） | 有这个节点所要权力的人                                                                                              |
-| 看需求、看图、看列表                      | 列表只回我参与的项目；单条需求与图片要成员资格（401 → 404 → 403）                                                   |
-| 评论、自定义 AGENTS.md                    | 该项目的成员，不查权力                                                                                              |
+| 建项目                                    | 管理员（`POST /api/projects` 的第一道门）                                                                                               |
+| 建角色 / 加成员 / 删角色                  | 管理员。把人放进项目只有这一个入口                                                                                                      |
+| 提需求（界面）                            | 该项目的成员：任一权力即成员，管理员天生是                                                                                              |
+| 提需求 / 拉结论（接入层）                 | 该项目的成员（管理员天生是；普通账号要有这个项目里任一角色）                                                                            |
+| 按节点（run / accept / reject / restart） | 有这个节点所要权力的人                                                                                                                  |
+| 看需求、看图、看列表                      | 列表只回我参与的项目；单条需求与图片要成员资格（401 → 404 → 403）                                                                       |
+| 评论、自定义 AGENTS.md                    | 该项目的成员，不查权力                                                                                                                  |
 
 > 建项目限管理员、加成员也是管理员专属，所以「建完项目自己进不去」这个缝不存在：建项目的人一定是管理员，管理员天生算任何项目的成员。普通账号的项目成员资格只有一个来源——管理员在项目设置里授予一个角色。
 
@@ -256,6 +255,8 @@ $WORKSPACE/
 | release   | release  |
 
 **权力只由节点类型决定**，链条上不能逐站覆盖：同一类站永远是同一档权力，改链条也不会把某一站改成别的权力。所以「授予谁能按这类站」只取决于「这个人在这个项目里有没有这一档权力」。
+
+链条编辑器里不显示任何权力字样：**权力由节点类型决定，只用于后端鉴权与按钮预禁用**，界面上不展示、也没有可选项。
 
 老库的 `nodes.power` 列还在，但代码既不读也不写（不 DROP COLUMN 是避免破坏性迁移）：升级不会把已有需求变成谁也按不动。
 
@@ -296,12 +297,12 @@ go run . user add -username admin -password <至少 8 位> -admin
 
 `chain user add` 就是「造账号」这一个子命令（口令规则与 `POST /api/users` 是同一处实现，撞名与短口令都建不成，退出码非 0）：
 
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `-username` | 必填 | 同一个库里不能重名 |
-| `-password` | 必填 | 至少 8 个字符 |
-| `-admin` | 关 | 建的是管理员；**已有账号不能靠这个参数升级** |
-| `-db-driver` / `-db` | `sqlite` / `data/chain.db` | 与服务同一套参数，指向同一个库 |
+| 参数                 | 默认                       | 说明                                         |
+| -------------------- | -------------------------- | -------------------------------------------- |
+| `-username`          | 必填                       | 同一个库里不能重名                           |
+| `-password`          | 必填                       | 至少 8 个字符                                |
+| `-admin`             | 关                         | 建的是管理员；**已有账号不能靠这个参数升级** |
+| `-db-driver` / `-db` | `sqlite` / `data/chain.db` | 与服务同一套参数，指向同一个库               |
 
 要接真容器（需要本机 docker daemon）：
 
@@ -357,3 +358,5 @@ cd ../web && npm run build      # 输出到 ../chain/webui/dist
 8. 角色不能跨 project：一个角色只在一个 project 里有意义。
 9. 角色没有过期时间、也没有审计：授予与收回都不留事件，谁有过什么角色只能查当前表。
 10. 已有账号不能升级为管理员，只能新建一个管理员账号：`POST /api/users` 的 body 带 `admin: true` 即可（默认 false）。没有把管理员降回普通账号的接口，也没有分级——管理员天生四权齐全。
+11. 管理员 `GET /api/me` 的 `memberships` 是空数组：授予只记在 `assignments` 表里，管理员不落授予记录，它的四权是判定时短路给的；项目列表与需求可见性走的是同一个短路，所以不受影响。
+12. 项目改名后，老库里的自定义 AGENTS.md 会因为「摘要不符 / 文件缺失」判定拒跑这一站——路径记的是相对 AppHome 的路径，项目名一换，AppHome 跟着变。重新存一次内容即可；平台不回填、不搬文件。
