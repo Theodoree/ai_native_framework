@@ -128,6 +128,4 @@ cd ../../apps/web && npm ci && npm run build    # 改前端后重建，产物进
 
 见 `CONTRIBUTING.md`。安全问题请走 `SECURITY.md`，不要开公开 issue。
 
-## License
-
 MIT，见 `LICENSE`。
