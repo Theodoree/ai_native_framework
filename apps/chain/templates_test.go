@@ -42,14 +42,15 @@ func TestTemplateFileReadsRepoDeclaration(t *testing.T) {
 		if !ok {
 			t.Fatalf("声明文件里应当有模板 %s，实际只有 %s", key, strings.Join(sortedKeys(table.Templates), "、"))
 		}
-		// 声明文件里写的是 ${APP}/agent-xxx，加载时就把项目名展开掉，运行期不再含占位符。
-		if tmpl.Image != CurrentAppName()+"/agent-"+key {
-			t.Fatalf("模板 %s 的 image 应当展开成 %s/agent-%s，实际 %q", key, CurrentAppName(), key, tmpl.Image)
+		// 声明文件里写的是 ${APP}/agent-xxx:latest，加载时就把项目名展开掉，运行期不再含占位符。
+		if want := CurrentAppName() + "/agent-" + key + ":latest"; tmpl.Image != want {
+			t.Fatalf("模板 %s 的 image 应当展开成 %s，实际 %q", key, want, tmpl.Image)
 		}
-		if tmpl.Version != defaultImageVersion {
-			t.Fatalf("模板 %s 的 version 应当是 %s，实际 %q", key, defaultImageVersion, tmpl.Version)
+		if tmpl.Version != defaultAgentVersion {
+			t.Fatalf("模板 %s 的 version 应当是 %s，实际 %q", key, defaultAgentVersion, tmpl.Version)
 		}
-		if want := CurrentAppName() + "/agent-" + key + ":" + defaultImageVersion; tmpl.ImageRef() != want {
+		// 镜像引用就是声明里那一个：version（CLI 版本）不参与拼 tag。
+		if want := CurrentAppName() + "/agent-" + key + ":latest"; tmpl.ImageRef() != want {
 			t.Fatalf("模板 %s 的镜像引用应当是 %s，实际 %q", key, want, tmpl.ImageRef())
 		}
 		if len(tmpl.Command) != 1 || tmpl.Command[0] != "/opt/agent/entrypoint.sh" {

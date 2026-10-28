@@ -41,18 +41,21 @@ func main() {
 	}
 	defer store.Close()
 
-	var exec Executor = FakeExecutor{}
-	if *execKind == "docker" {
-		// 三级回落：仓库里的 → 家目录展开的 → 内嵌默认表。ResolveTemplateFile 会说清楚用了哪个。
-		path := strings.TrimSpace(*templates)
-		if path == "" {
-			path = ResolveTemplateFile(log.Printf)
-		}
-		table, err := LoadTemplatesOrFallback(path, log.Printf)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("节点模板表：%s（模板 %s）", orNone(table.Source, "内嵌默认"), strings.Join(sortedKeys(table.Templates), "、"))
+	// 模板表与执行器种类无关：假执行器也要照声明回镜像与版本（前端下拉框与建链校验共用）。
+	// 三级回落：仓库里的 → 家目录展开的 → 内嵌默认表。ResolveTemplateFile 会说清楚用了哪个。
+	path := strings.TrimSpace(*templates)
+	if path == "" {
+		path = ResolveTemplateFile(log.Printf)
+	}
+	table, err := LoadTemplatesOrFallback(path, log.Printf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("节点模板表：%s（模板 %s）", orNone(table.Source, "内嵌默认"), strings.Join(sortedKeys(table.Templates), "、"))
+
+	var exec Executor
+	switch *execKind {
+	case "docker":
 		exec = DockerExecutor{
 			Templates: table.Templates,
 			Nodes:     table.Nodes,
@@ -68,7 +71,9 @@ func main() {
 				return strings.TrimSpace(p.Repo)
 			},
 		}
-	} else if *execKind != "fake" {
+	case "fake":
+		exec = FakeExecutor{Templates: table.Templates, Nodes: table.Nodes}
+	default:
 		log.Fatalf("不认识的执行器：%s（只有 fake 与 docker）", *execKind)
 	}
 

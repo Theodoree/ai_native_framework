@@ -54,6 +54,12 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 // makeBareRepo 造一个只有一次提交（分支 main、文件 hello.txt）的本地裸库。
 func makeBareRepo(t *testing.T) string {
 	t.Helper()
+	return makeBareRepoWith(t, map[string]string{"hello.txt": "from entrypoint test\n"})
+}
+
+// makeBareRepoWith 造一个内容自定的本地裸库：仓库要自带 AGENTS.md 时用它。
+func makeBareRepoWith(t *testing.T, files map[string]string) string {
+	t.Helper()
 	requireGit(t)
 	root := t.TempDir()
 	src := filepath.Join(root, "src")
@@ -67,8 +73,10 @@ func makeBareRepo(t *testing.T) string {
 		}
 		gitRun(t, src, "symbolic-ref", "HEAD", "refs/heads/main")
 	}
-	if err := os.WriteFile(filepath.Join(src, "hello.txt"), []byte("from entrypoint test\n"), 0o644); err != nil {
-		t.Fatalf("写文件失败：%v", err)
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("写文件失败：%v", err)
+		}
 	}
 	gitRun(t, src, "add", "-A")
 	gitRun(t, src, "commit", "-m", "init")
@@ -136,7 +144,8 @@ func TestEntrypointClonesBranchAndRunsAgent(t *testing.T) {
 	if !strings.Contains(out, "CHAIN_VERDICT: pass") {
 		t.Fatalf("agent 自己给的结论没被原样带出来：\n%s", out)
 	}
-	if _, err := os.Stat(filepath.Join(work, "hello.txt")); err != nil {
+	// 仓库是工作区的子目录（$WORKSPACE/$SOURCE）：clone 落在 work/repo 里。
+	if _, err := os.Stat(filepath.Join(work, "repo", "hello.txt")); err != nil {
 		t.Fatalf("工作区里没有仓库文件 hello.txt（clone 没真发生）：%v\n%s", err, out)
 	}
 }
@@ -227,5 +236,83 @@ func TestEntrypointAgentFailureWithoutMarkerIsReject(t *testing.T) {
 	}
 	if !strings.Contains(out, "CHAIN_VERDICT: reject agent 退出码 7") {
 		t.Fatalf("agent 失败没打带退出码的 reject：\n%s", out)
+	}
+}
+
+// TestEntrypointResolvesAgentVersionThroughNpx —— 版本是数据不是镜像产物：
+// 脚本必须把 CHAIN_AGENT + CHAIN_AGENT_VERSION 交给 npx 去解析，且默认值是 latest。
+// 用一个假的 npx（把收到的参数打出来）钉住命令行长什么样，不联网、不装包。
+func TestEntrypointResolvesAgentVersionThroughNpx(t *testing.T) {
+	bin := t.TempDir()
+	npx := filepath.Join(bin, "npx")
+	body := "#!/bin/sh\necho \"npx-args: $*\"\necho \"CHAIN_VERDICT: pass\"\n"
+	if err := os.WriteFile(npx, []byte(body), 0o755); err != nil {
+		t.Fatalf("写假的 npx 失败：%v", err)
+	}
+	work := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, "repo", ".git"), 0o755); err != nil {
+		t.Fatalf("造 mount 用的 .git 失败：%v", err)
+	}
+	path := bin + string(os.PathListSeparator) + os.Getenv("PATH")
+
+	out, code := runEntrypoint(t, map[string]string{
+		"CHAIN_WORKSPACE_MODE": "mount",
+		"CHAIN_WORK_DIR":       work,
+		"CHAIN_NODE":           "crosstest",
+		"CHAIN_REQUIREMENT":    "REQ-1",
+		"CHAIN_AGENT":          "codex",
+		"CHAIN_AGENT_VERSION":  "0.9.9",
+		"AGENT_CMD":            "",
+		"PATH":                 path,
+	})
+	if code != 0 {
+		t.Fatalf("应当跑完退 0，实际 %d\n%s", code, out)
+	}
+	if !strings.Contains(out, "npx-args: -y @openai/codex@0.9.9 exec") {
+		t.Fatalf("没有按 CHAIN_AGENT_VERSION 解析出 CLI 版本（期望 npx -y @openai/codex@0.9.9 exec）：\n%s", out)
+	}
+	if !strings.Contains(out, "CHAIN_AGENT_VERSION=0.9.9") {
+		t.Fatalf("版本没有原样打出来，日志里查不到跑了哪个版本：\n%s", out)
+	}
+
+	// 没声明版本时按 latest 解析——不要求镜像预装任何版本。
+	out, code = runEntrypoint(t, map[string]string{
+		"CHAIN_WORKSPACE_MODE": "mount",
+		"CHAIN_WORK_DIR":       work,
+		"CHAIN_NODE":           "assess",
+		"CHAIN_REQUIREMENT":    "REQ-2",
+		"CHAIN_AGENT":          "deepseek-harness",
+		"CHAIN_AGENT_VERSION":  "",
+		"AGENT_CMD":            "",
+		"PATH":                 path,
+	})
+	if code != 0 {
+		t.Fatalf("没声明版本也应当跑完退 0，实际 %d\n%s", code, out)
+	}
+	if !strings.Contains(out, "npx-args: -y @deepseek-ai/dsh@latest") {
+		t.Fatalf("没声明版本时应当按 latest 解析：\n%s", out)
+	}
+}
+
+// TestEntrypointRejectsUnknownAgentWithoutCommand —— 认不出 CHAIN_AGENT 又没有 AGENT_CMD：
+// 退 73 且留一行 reject（不许自己猜一个 CLI 去跑）。
+func TestEntrypointRejectsUnknownAgentWithoutCommand(t *testing.T) {
+	work := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, "repo", ".git"), 0o755); err != nil {
+		t.Fatalf("造 mount 用的 .git 失败：%v", err)
+	}
+	out, code := runEntrypoint(t, map[string]string{
+		"CHAIN_WORKSPACE_MODE": "mount",
+		"CHAIN_WORK_DIR":       work,
+		"CHAIN_NODE":           "assess",
+		"CHAIN_REQUIREMENT":    "REQ-1",
+		"CHAIN_AGENT":          "",
+		"AGENT_CMD":            "",
+	})
+	if code != 73 {
+		t.Fatalf("认不出 agent 应退 73，实际 %d\n%s", code, out)
+	}
+	if !strings.Contains(out, "CHAIN_VERDICT: reject") || !strings.Contains(out, "认不出") {
+		t.Fatalf("应当在标记里说清为什么退 73：\n%s", out)
 	}
 }

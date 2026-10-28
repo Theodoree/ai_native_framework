@@ -25,6 +25,8 @@ func cn(key, typ, review string) ChainNode {
 // newReviewServer 起一个用指定链条与执行器的服务，省掉「先建 project」那一步。
 func newReviewServer(t *testing.T, c Chain, exec Executor) (*httptest.Server, Store) {
 	t.Helper()
+	// 同 newTestServer：把家目录隔离掉，别往真家目录写自定义 AGENTS.md。
+	t.Setenv("HOME", t.TempDir())
 	store, err := OpenStore("sqlite", filepath.Join(t.TempDir(), "chain.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -196,6 +198,9 @@ func TestReviewRejectWithoutReasonFallsBackToHuman(t *testing.T) {
 
 // alwaysVerdict 是不听话的容器：不管节点声明谁审，它都自称通过。
 type alwaysVerdict struct{ verdict string }
+
+// TemplateKeys：这个替身只关心结论，模板键跟假执行器一致即可。
+func (a alwaysVerdict) TemplateKeys() []string { return fakeTemplateKeys() }
 
 func (a alwaysVerdict) Run(r *Requirement, n *Node, now time.Time) (Attempt, Comment, []string) {
 	att, c, arts := FakeExecutor{}.Run(r, n, now)

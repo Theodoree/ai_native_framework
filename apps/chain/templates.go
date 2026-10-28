@@ -24,9 +24,12 @@ const templateFileVersion = 1
 // 展开态（二进制脱离仓库）里它在 $HOME/.<项目名>/nodes.yaml——见 ResolveTemplateFile。
 const DefaultTemplateFile = "deploy/nodes.yaml"
 
-// defaultImageVersion 是模板没写 version 时补在镜像名后面的 tag。
-// 默认 latest：本地 build 出来的就是它，换版本在 nodes.yaml 里改一行。
-const defaultImageVersion = "latest"
+// defaultAgentVersion 是节点没写 version 时的 agent CLI 版本。
+//
+// 注意语义：version 是「镜像里那个 agent CLI 的版本」，不是镜像 tag。
+// 镜像是运行时（npx 之类）的容器，CLI 版本由环境变量交给它自己解析，
+// 所以换 CLI 版本不需要重烘镜像——这是数据，不是构建产物。
+const defaultAgentVersion = "latest"
 
 // 两类工作区获取方式：clone 是默认（容器自己拉代码），mount 只给本地开发的绝对路径。
 const (
@@ -48,13 +51,38 @@ type templateFileSpec struct {
 	Nodes     map[string]string       `yaml:"nodes" json:"nodes"`
 }
 
+// versionList 是 versions 的声明类型：条目必须是字符串。
+//
+// 为什么不用裸 []string：yaml.v3 会把 `versions: [1.0]` 里的 1.0 顺手转成字符串 "1.0"，
+// 于是「写错成数字」被静默接受，前端下拉框里冒出一个谁也不认识的版本号。
+// 这里逐条看 Tag，不是字符串就报错停下（fail-closed，不猜作者的意思）。
+type versionList []string
+
+func (l *versionList) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.SequenceNode {
+		return fmt.Errorf("versions 必须是数组，得到 %s", node.Tag)
+	}
+	out := make([]string, 0, len(node.Content))
+	for _, item := range node.Content {
+		if item.Kind != yaml.ScalarNode || item.Tag != "!!str" {
+			return fmt.Errorf("versions 的条目必须是字符串，得到 %s（%q）", item.Tag, item.Value)
+		}
+		out = append(out, item.Value)
+	}
+	*l = out
+	return nil
+}
+
 type templateSpec struct {
 	Image string `yaml:"image" json:"image"`
-	// Version 是镜像 tag；留空按 latest。image 自己带 tag 时以 image 为准。
-	Version string            `yaml:"version" json:"version"`
-	Command []string          `yaml:"command" json:"command"`
-	Env     map[string]string `yaml:"env" json:"env"`
-	Timeout string            `yaml:"timeout" json:"timeout"`
+	// Version 是镜像里那个 agent CLI 的版本，不是镜像 tag；留空按 latest。
+	Version string `yaml:"version" json:"version"`
+	// Versions 是「这个 harness 能选哪些版本」，缺省只有 latest；
+	// 只用来给前端列下拉框，真正用哪个由 version（或节点声明）决定。
+	Versions versionList       `yaml:"versions" json:"versions"`
+	Command  []string          `yaml:"command" json:"command"`
+	Env      map[string]string `yaml:"env" json:"env"`
+	Timeout  string            `yaml:"timeout" json:"timeout"`
 }
 
 // defaultNodeTemplates 是六类节点的默认模板键；dev/merge 是空节点，不跑容器。
@@ -144,17 +172,28 @@ func buildTable(spec templateFileSpec, path string) (*TemplateTable, error) {
 		}
 		version := strings.TrimSpace(t.Version)
 		if version == "" {
-			version = defaultImageVersion
+			version = defaultAgentVersion
+		}
+		// versions 是给下拉框的候选。条目为空、或整段不是字符串数组，
+		// 一律在读表时就报错停下：静默忽略会让前端显示一个永远拉不到的版本。
+		versions := make([]string, 0, len(t.Versions))
+		for _, v := range t.Versions {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				return nil, fmt.Errorf("模板 %s 的 versions 里有空条目", k)
+			}
+			versions = append(versions, v)
 		}
 		// image 里可以写 ${APP}/agent-codex：加载时就把项目名换掉，
 		// 这样运行期拿到的 Template 不再含占位符（改项目名也不必重写资产）。
 		out.Templates[k] = Template{
-			Key:     k,
-			Image:   ExpandPlaceholders(strings.TrimSpace(t.Image)),
-			Version: version,
-			Command: t.Command,
-			Env:     t.Env,
-			Timeout: d,
+			Key:      k,
+			Image:    ExpandPlaceholders(strings.TrimSpace(t.Image)),
+			Version:  version,
+			Versions: versions,
+			Command:  t.Command,
+			Env:      t.Env,
+			Timeout:  d,
 		}
 	}
 	for _, nodeType := range sortedKeys(spec.Nodes) {

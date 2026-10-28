@@ -4,8 +4,16 @@
 # 「链条上哪一站用哪个模板」。改这里不需要改 Go 代码、也不需要重新编译。
 #
 # 项目名不写死：image 里的 ${APP} 在加载时换成当前项目名（-app > CHAIN_APP > 编译期默认）。
-# 换镜像版本有两种写法：改下面的 version（默认 latest），或把 image 写成带 tag 的完整引用
-# （如 registry.example.com/agent-codex:1.2.3）—— 最后一段带 ':' 时 version 就不再生效。
+# 注意两件不同的事：
+#   image    = 镜像引用，原样交给 docker（要带 tag，如 ${APP}/agent-codex:latest）
+#   version  = 镜像里那个 agent CLI 的版本（默认 latest），由 entrypoint 在运行时解析
+# 换 CLI 版本**不需要重烘镜像**：镜像是运行时，版本是数据。将来真把 harness 烘进镜像
+# （image:tag = harness@version）时才会让两者绑在一起，本期不做。
+#
+# 每个模板还能写 versions：这是「前端下拉框里能选哪些 CLI 版本」，不写就只有 latest。
+# GET /api/templates 固定把 latest 排第一，后面按版本倒序最多再给 10 个
+# （codex / claude 这类工具没有「大版本」概念，按最近十个小版本给更贴合它们的发版节奏）。
+# 它只是候选清单：用户仍可自由输入版本，写在这里的版本与镜像可不可用无关。
 #
 # 镜像怎么来：agent-image/build-images.sh 三条 docker build 就得到下面这三个 tag；
 # 二进制脱离仓库时先跑 chain assets 把它展开到 $HOME/.<项目名>/。
@@ -13,24 +21,27 @@ version: 1
 
 templates:
   codex:
-    image: ${APP}/agent-codex
+    image: ${APP}/agent-codex:latest
     version: latest
+    versions: ["0.164.0", "0.163.0", "0.162.1"]
     command: ["/opt/agent/entrypoint.sh"]
     timeout: 30m
     env:
       AGENT_NAME: codex
 
   claude:
-    image: ${APP}/agent-claude
+    image: ${APP}/agent-claude:latest
     version: latest
+    versions: ["2.1.311", "2.1.310", "2.1.300"]
     command: ["/opt/agent/entrypoint.sh"]
     timeout: 30m
     env:
       AGENT_NAME: claude
 
   deepseek-harness:
-    image: ${APP}/agent-deepseek-harness
+    image: ${APP}/agent-deepseek-harness:latest
     version: latest
+    versions: ["0.2.1", "0.2.1-rc.2", "0.2.0"]
     command: ["/opt/agent/entrypoint.sh"]
     timeout: 30m
     env:

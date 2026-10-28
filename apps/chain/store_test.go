@@ -29,8 +29,11 @@ func TestStoreKeepsNodeOrderAndChildren(t *testing.T) {
 	}}
 	now := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
 	r := NewRequirement("REQ-1", &Project{Key: "demo"}, chain, "把登录页做出来", []string{"shot.png"}, "api", now)
+	t.Setenv("HOME", t.TempDir())
 	n := r.Nodes[1]
-	n.Rules = []string{"先看测试覆盖率"}
+	if err := SetNodeAgents(n, r.ID, n.Key, "先看测试覆盖率", now); err != nil {
+		t.Fatal(err)
+	}
 	n.Artifacts = []string{"report.md"}
 	n.Attempts = append(n.Attempts, Attempt{N: 1, StartedAt: now, EndedAt: now.Add(time.Minute), ExitCode: 0, Template: "codex", Log: "ok", Outcome: "succeeded"})
 	n.Comments = append(n.Comments, Comment{ID: "c1", AuthorType: "container", Author: "codex", Body: "第一句", Verdict: "", At: now})
@@ -58,8 +61,15 @@ func TestStoreKeepsNodeOrderAndChildren(t *testing.T) {
 	if len(g.Comments) != 2 || g.Comments[0].Body != "第一句" || g.Comments[1].Verdict != "approve" {
 		t.Fatalf("评论丢了或顺序乱了：%+v", g.Comments)
 	}
-	if len(g.Rules) != 1 || g.Rules[0] != "先看测试覆盖率" {
-		t.Fatalf("追加规则丢了：%+v", g.Rules)
+	// 库里只有路径与摘要：正文在文件里，读的时候要能从同一份文件取回来。
+	if g.Agents == nil || g.Agents.Path == "" || g.Agents.MD5 == "" {
+		t.Fatalf("自定义 AGENTS.md 的记录丢了：%+v", g.Agents)
+	}
+	if len(g.Rules) != 0 {
+		t.Fatalf("代码不再往旧形状 rules 里写：%+v", g.Rules)
+	}
+	if body, err := ReadNodeAgents(g); err != nil || body != "先看测试覆盖率" {
+		t.Fatalf("按库里的路径读不回正文：%q / %v", body, err)
 	}
 	if len(g.Artifacts) != 1 || g.Artifacts[0] != "report.md" {
 		t.Fatalf("产物丢了：%+v", g.Artifacts)

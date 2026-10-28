@@ -144,20 +144,29 @@ func TestOnlyCurrentNodeIsActionable(t *testing.T) {
 	}
 }
 
-func TestRulesAndCommentsAppend(t *testing.T) {
+func TestAgentsDocAndCommentsAppend(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	r, _, _ := mustReq(t)
 	now := time.Now()
-	if err := r.AddRule("assess", "评估时必须读 docs/architecture.md", now); err != nil {
+	n := r.Node("assess")
+	if err := SetNodeAgents(n, r.ID, n.Key, "评估时必须读 docs/architecture.md", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.AddComment("assess", "alice", "先看设计文件", now); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Node("assess").Rules) != 1 || len(r.Node("assess").Comments) != 1 {
-		t.Fatal("追加规则与评论都应落在节点上")
+	if n.Agents == nil || n.Agents.Size == 0 || len(n.Comments) != 1 {
+		t.Fatal("自定义 AGENTS.md 与评论都应落在节点上")
 	}
-	if err := r.AddRule("assess", "  ", now); err == nil {
-		t.Fatal("空规则应当报错")
+	if got, err := ReadNodeAgents(n); err != nil || got != "评估时必须读 docs/architecture.md" {
+		t.Fatalf("读回来的正文不对：%q / %v", got, err)
+	}
+	// 空正文＝清除：字段清空、文件删掉。
+	if err := SetNodeAgents(n, r.ID, n.Key, "   ", now); err != nil {
+		t.Fatal(err)
+	}
+	if n.Agents != nil {
+		t.Fatalf("空白正文应当清除这一站的文档，实际 %+v", n.Agents)
 	}
 }
 

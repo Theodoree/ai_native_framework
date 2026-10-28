@@ -10,6 +10,10 @@ import (
 // 只把「这一站要做的事」写成一条评论与一份产物，好让状态机先跑通。
 type Executor interface {
 	Run(r *Requirement, n *Node, now time.Time) (Attempt, Comment, []string)
+	// TemplateKeys 是本执行器认得的 harness 键（容器模板名），升序。
+	// 服务端在「建链」与 GET /api/templates 两处要用它：前者提前拒绝认不出的 harness，
+	// 后者给前端渲染下拉框。放在接口上而不是让 http 层去摸具体实现。
+	TemplateKeys() []string
 }
 
 // 六类节点各自默认的容器模板：可新增模板，这里只记下默认三种。
@@ -63,16 +67,54 @@ func parseVerdict(out string) (verdict string, reason string) {
 type FakeExecutor struct {
 	AIVerdict string
 	AIReason  string
+	// Templates / Nodes 是声明的模板表（deploy/nodes.yaml 那份）。
+	// 留空就用内嵌默认表：假执行器不接 docker，但前端下拉框与建链校验要用同一份声明，
+	// 否则「-exec fake 启动时 /api/templates 只有 latest」会变成一条假事实。
+	Templates map[string]Template
+	Nodes     map[string]string
+}
+
+// tables 返回这个假执行器实际用的模板表：声明优先，没声明就用内嵌默认表。
+func (f FakeExecutor) tables() map[string]Template {
+	if len(f.Templates) > 0 {
+		return f.Templates
+	}
+	return defaultTemplateRegistry()
+}
+
+// TemplateKeys 给假执行器也配上模板键：不接 docker 时前端仍要能列出下拉选项。
+func (f FakeExecutor) TemplateKeys() []string { return sortedKeys(f.tables()) }
+
+// fakeTemplateKeys 是内嵌默认表的三个键，给「只关心键名」的测试与桩用。
+func fakeTemplateKeys() []string {
+	return sortedKeys(defaultTemplateRegistry())
+}
+
+// TemplateList 让假执行器也能回镜像与版本：前端不接 docker 时照样要渲染下拉框。
+func (f FakeExecutor) TemplateList() []Template {
+	reg := f.tables()
+	out := make([]Template, 0, len(reg))
+	for _, k := range sortedKeys(reg) {
+		out = append(out, reg[k])
+	}
+	return out
 }
 
 func (f FakeExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Comment, []string) {
+	// 节点声明了 harness 就用它，否则按类型映射——与真执行器同一套选择顺序。
 	tmpl := defaultTemplates[n.Type]
+	if v, ok := f.Nodes[n.Type]; ok {
+		tmpl = v
+	}
+	if h := strings.TrimSpace(n.Harness); h != "" {
+		tmpl = h
+	}
 	body := strings.Join([]string{
 		fmt.Sprintf("【假执行】模板 %s，节点 %s（%s）", tmpl, n.Key, n.Type),
 		fmt.Sprintf("注入：BASE_URL、model、AGENTS.md（默认文件不改）"),
 		fmt.Sprintf("需求：%s，分支 %s", r.ID, r.Branch),
 		fmt.Sprintf("需求正文：%s", oneLine(r.Context)),
-		rulesLine(n.Rules),
+		agentsLine(n),
 		fmt.Sprintf("本次调用没有连任何外部服务。"),
 	}, "\n")
 	a := Attempt{
@@ -105,11 +147,17 @@ func verdictLine(n *Node, verdict, reason string) string {
 	return "审核方：AI 自审，结论 " + verdict + "：" + reason
 }
 
-func rulesLine(rules []string) string {
-	if len(rules) == 0 {
-		return "追加规则：无"
+// agentsLine 是评论里「这一站有没有自定义 AGENTS.md」那一行。
+// 有就报字节数与摘要前缀：人能从库里那份记录核对上，不必去翻家目录。
+func agentsLine(n *Node) string {
+	if n == nil || n.Agents == nil || strings.TrimSpace(n.Agents.Path) == "" {
+		return "自定义 AGENTS.md：无（只有平台的默认职责与仓库策略指针）"
 	}
-	return "追加规则：" + strings.Join(rules, "；")
+	md5 := n.Agents.MD5
+	if len(md5) > 12 {
+		md5 = md5[:12]
+	}
+	return fmt.Sprintf("自定义 AGENTS.md：%d 字节，%s…（%s）", n.Agents.Size, md5, n.Agents.Path)
 }
 
 func oneLine(s string) string {

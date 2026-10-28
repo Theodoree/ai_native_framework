@@ -17,47 +17,46 @@ import (
 // 六类节点的默认模板只是默认值——声明文件 deploy/nodes.yaml 里的才是准的。
 type Template struct {
 	Key string `json:"key"`
-	// Image 是镜像仓库地址，可以不带 tag（如 ${APP}/agent-codex）；tag 由 Version 补。
+	// Image 是镜像引用，原样交给 docker——要带 tag（如 ${APP}/agent-codex:latest）。
+	// Version 不是 tag，见下面那行注释。
 	Image string `json:"image"`
-	// Version 是镜像 tag，默认 latest；image 自己带 tag 时以 image 为准。
-	Version string            `json:"version,omitempty"`
-	Command []string          `json:"command"`
-	Env     map[string]string `json:"env,omitempty"`
-	Timeout time.Duration     `json:"timeout,omitempty"`
+	// Version 是镜像里那个 agent CLI 的版本（默认 latest），不是镜像 tag。
+	// 它与 Image 互不影响：换 CLI 版本不改镜像引用，见 ImageRef 的说明。
+	Version string `json:"version,omitempty"`
+	// Versions 是可以选的版本候选，只用于 /api/templates 的下拉框；缺省只有 latest。
+	Versions []string          `json:"versions,omitempty"`
+	Command  []string          `json:"command"`
+	Env      map[string]string `json:"env,omitempty"`
+	Timeout  time.Duration     `json:"timeout,omitempty"`
 }
 
-// ImageRef 给出真正传给 docker 的镜像引用。
-// 规则只有一条：最后一段已经带 tag（含 `:`）就原样用，否则补 :<Version>；
-// Version 为空补 latest。${APP} 占位符在这里再展开一次——加载时已经展开过，
-// 这里是给直接构造 Template 的调用方（测试、内嵌表）兜底。
+// ImageRef 给出真正传给 docker 的镜像引用：就是声明里写的那一个，原样使用。
+//
+// 为什么不拿 Version 去拼 tag：Version 是「镜像里那个 agent CLI 的版本」，
+// 不是镜像 tag。镜像里已经装着运行时（npx 之类），换 CLI 版本不需要重烘镜像，
+// 所以镜像引用与 CLI 版本是两件互不影响的事实。
+//
+// 将来若真把 harness 烘进镜像（image:tag = harness@version），再加一个显式的
+// packaged 开关来拼 tag——本期不做，免得两个语义又混在一起。
+//
+// ${APP} 占位符在这里再展开一次：加载时已经展开过，这里是给直接构造 Template
+// 的调用方（测试、内嵌表）兜底。
 func (t Template) ImageRef() string {
-	img := ExpandPlaceholders(strings.TrimSpace(t.Image))
-	if img == "" {
-		return ""
-	}
-	version := strings.TrimSpace(t.Version)
-	if version == "" {
-		version = defaultImageVersion
-	}
-	// 只看最后一段：registry.example.com:5000/agent 里的端口号不算 tag。
-	last := img
-	if i := strings.LastIndex(img, "/"); i >= 0 {
-		last = img[i+1:]
-	}
-	if strings.Contains(last, ":") {
-		return img
-	}
-	return img + ":" + version
+	return ExpandPlaceholders(strings.TrimSpace(t.Image))
 }
+
+// defaultImageTag 是内嵌兜底表里镜像的 tag。它只是「本地 build 出来的那个 tag」，
+// 与 Template.Version（agent CLI 版本）不是一回事——两个都恰好叫 latest 纯属巧合。
+const defaultImageTag = "latest"
 
 // defaultTemplateRegistry 是内嵌兜底表（没有任何声明文件时用它）。
 // 镜像名指向 deploy/agent-image/ 里本地 build 的 tag：没 build 过就以
 // 「容器没跑起来」落一条评论，而不是静默成功。
 func defaultTemplateRegistry() map[string]Template {
 	return map[string]Template{
-		"deepseek-harness": {Key: "deepseek-harness", Image: appPlaceholder + "/agent-deepseek-harness", Version: defaultImageVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
-		"codex":            {Key: "codex", Image: appPlaceholder + "/agent-codex", Version: defaultImageVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
-		"claude":           {Key: "claude", Image: appPlaceholder + "/agent-claude", Version: defaultImageVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
+		"deepseek-harness": {Key: "deepseek-harness", Image: appPlaceholder + "/agent-deepseek-harness:" + defaultImageTag, Version: defaultAgentVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
+		"codex":            {Key: "codex", Image: appPlaceholder + "/agent-codex:" + defaultImageTag, Version: defaultAgentVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
+		"claude":           {Key: "claude", Image: appPlaceholder + "/agent-claude:" + defaultImageTag, Version: defaultAgentVersion, Command: []string{"/opt/agent/entrypoint.sh"}},
 	}
 }
 
@@ -85,7 +84,7 @@ func LoadTemplates(path string) (map[string]Template, error) {
 		}
 		t.Image = ExpandPlaceholders(t.Image)
 		if t.Version == "" {
-			t.Version = defaultImageVersion
+			t.Version = defaultAgentVersion
 		}
 		out[k] = t
 	}
@@ -107,14 +106,61 @@ type DockerExecutor struct {
 	// Repo 给出这条需求的仓库地址：HTTP(S)/SSH 地址就交给容器自己 clone；
 	// 只有本机绝对路径目录才挂进去（开发捷径）。空串表示没配仓库。
 	Repo func(*Requirement) string
+	// Source 是仓库在工作区里的子目录名（默认 repo）。
+	// 工作区根放平台写的 AGENTS.md，仓库必须待在子目录里：
+	// 这样「平台这份」与「仓库自带那份」是两个文件，谁也不动谁。
+	Source string
 }
 
-// nodeTemplateKey：声明优先，没声明退回内嵌默认值。
-func (d DockerExecutor) nodeTemplateKey(nodeType string) string {
-	if v, ok := d.Nodes[nodeType]; ok {
+// defaultSourceDir 是仓库在工作区里的默认目录名。
+const defaultSourceDir = "repo"
+
+// sourceDir 是这一次用的仓库子目录名。
+func (d DockerExecutor) sourceDir() string {
+	if s := strings.TrimSpace(d.Source); s != "" {
+		return s
+	}
+	return defaultSourceDir
+}
+
+// nodeTemplateKey 决定这一站用哪个模板，顺序是：
+//  1. 节点自己声明的 harness（配置节点时选的 agent 运行时）
+//  2. deploy/nodes.yaml 的 nodes 段（节点类型 → 模板）
+//  3. 内嵌默认表 defaultTemplates
+//
+// 三层都空 = 这一站不跑容器（空节点），由人动手。
+func (d DockerExecutor) nodeTemplateKey(n *Node) string {
+	if h := strings.TrimSpace(n.Harness); h != "" {
+		return h
+	}
+	if v, ok := d.Nodes[n.Type]; ok {
 		return v
 	}
-	return defaultTemplates[nodeType]
+	return defaultTemplates[n.Type]
+}
+
+// agentVersion 是这一站要跑的 agent CLI 版本：节点声明优先，其次模板声明，最后 latest。
+// 它只影响容器里的 CLI，不影响镜像引用。
+func agentVersion(n *Node, tmpl Template) string {
+	if v := strings.TrimSpace(n.Version); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(tmpl.Version); v != "" {
+		return v
+	}
+	return defaultAgentVersion
+}
+
+// TemplateKeys 是这台执行器认得的 harness 键，升序——建链校验与前端下拉框都读它。
+func (d DockerExecutor) TemplateKeys() []string { return d.templateKeys() }
+
+// TemplateList 把整张模板表按 key 升序交出去：GET /api/templates 用它拼下拉框。
+func (d DockerExecutor) TemplateList() []Template {
+	out := make([]Template, 0, len(d.Templates))
+	for _, k := range d.templateKeys() {
+		out = append(out, d.Templates[k])
+	}
+	return out
 }
 
 // repoOf 拿这条需求的仓库地址；没接线就是空串。
@@ -160,12 +206,18 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 	if !IsContainer(n.Type) {
 		return d.failed(r, n, now, "", fmt.Sprintf("节点 %s（%s）是空节点，不跑容器", n.Key, n.Type))
 	}
-	tmplKey := d.nodeTemplateKey(n.Type)
+	tmplKey := d.nodeTemplateKey(n)
 	tmpl, ok := d.Templates[tmplKey]
 	if !ok {
 		return d.failed(r, n, now, tmplKey, fmt.Sprintf("没有这个容器模板：%s（模板表里只有 %s）", tmplKey, strings.Join(d.templateKeys(), "、")))
 	}
-
+	// 自定义 AGENTS.md：注入前重算摘要与库里比对，对不上这一站就不跑。
+	// 不一致的内容绝不进容器 —— 那等于让容器跑一份没人知道是什么的指令。
+	appendText, err := ReadNodeAgents(n)
+	if err != nil {
+		return d.failed(r, n, now, tmplKey, agentsDriftComment(err))
+	}
+	source := d.sourceDir()
 	key := os.Getenv(d.apiKeyEnv())
 	// 默认 clone：容器自己拉代码，宿主不碰工作区。
 	// 只有仓库写成本机绝对路径（开发时）才挂进去——那是捷径，不是常态。
@@ -182,18 +234,27 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 	}
 	args := []string{"run", "--rm", "-i", "--init", "--network", d.network()}
 	args = append(args, "--label", "chain.requirement="+r.ID, "--label", "chain.node="+n.Key)
+	// 挂载点也是工作区里的那个子目录：工作区根留给平台写的 AGENTS.md。
 	if mountDir != "" {
-		args = append(args, "--mount", "type=bind,source="+mountDir+",target=/work", "--workdir", "/work")
+		args = append(args, "--mount", "type=bind,source="+mountDir+",target="+workspaceRoot+"/"+source, "--workdir", workspaceRoot)
 	}
 	env := []string{
 		"BASE_URL=" + d.BaseURL,
 		"CHAIN_MODEL=" + d.Model,
-		"CHAIN_AGENTS_MD=" + nodeAgents(n),
+		// 整份 AGENTS.md 的正文 + 站在工作区里的仓库子目录名。
+		// 追加内容另外再给一份：有的 agent 不读文件，prompt 是保底。
+		"CHAIN_AGENTS_MD=" + agentsDocText(n, source, appendText),
+		"CHAIN_AGENTS_APPEND=" + appendText,
+		"CHAIN_SOURCE=" + source,
 		"CHAIN_REQUIREMENT=" + r.ID,
 		"CHAIN_NODE=" + n.Key,
 		"CHAIN_REPO=" + repo,
 		"CHAIN_BRANCH=" + r.Branch,
 		"CHAIN_WORKSPACE_MODE=" + workspaceMode,
+		// 哪个 agent CLI、什么版本：entrypoint 靠这两个决定跑什么。
+		// version 是自由输入（前端 allow-create），这里只负责原样交过去，不做白名单。
+		"CHAIN_AGENT=" + tmplKey,
+		"CHAIN_AGENT_VERSION=" + agentVersion(n, tmpl),
 		"CHAIN_CONTEXT=" + r.Context,
 	}
 	// 模板自己声明的环境变量（如 AGENT_NAME）排在最后，允许它们覆盖上面的默认值。
@@ -221,7 +282,7 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 	cmd.Stdout = out
 	cmd.Stderr = out
 
-	err := cmd.Run()
+	err = cmd.Run()
 	exit := 0
 	outcome := "succeeded"
 	if err != nil {
@@ -244,7 +305,7 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 		log = "命令: " + shown + "\n错误: " + redact(err.Error(), key) + "\n---\n" + outText
 	}
 	verdict, reason := parseVerdict(outText)
-	workspaceLine := fmt.Sprintf("工作区 clone：%s（容器自己 clone 这条分支）", orNone(repo, "（没配仓库）"))
+	workspaceLine := fmt.Sprintf("工作区 clone：%s（容器自己 clone 到 %s/%s）", orNone(repo, "（没配仓库）"), workspaceRoot, source)
 	if mountDir != "" {
 		workspaceLine = fmt.Sprintf("工作区 mount：%s（开发捷径：挂本机目录，不 clone）", mountDir)
 	}
@@ -253,7 +314,7 @@ func (d DockerExecutor) Run(r *Requirement, n *Node, now time.Time) (Attempt, Co
 		fmt.Sprintf("分支 %s，退出码 %d，结论 %s", r.Branch, exit, outcome),
 		workspaceLine,
 		verdictLine(n, verdict, reason),
-		rulesLine(n.Rules),
+		agentsLine(n),
 		"--- 容器输出（尾部）---",
 		outText,
 	}, "\n")
@@ -296,17 +357,27 @@ func (d DockerExecutor) templateKeys() []string {
 	return out
 }
 
-// nodeAgents 是这一站交给容器的指令：默认文件 + 本站追加的规则。
-// 追加只进容器，不改仓库里的默认文件。
+// workspaceRoot 是容器里的工作区根：AGENTS.md 在根上，仓库是它的子目录（见 Source）。
+const workspaceRoot = "/work"
+
 // nl 用字节拼出来：源码里直接写转义会被这条工具链吃掉一层，见 README「已知边界」。
 var nl = string([]byte{10})
 
-func nodeAgents(n *Node) string {
-	lines := []string{"你是链条上的一站：节点 " + n.Key + "（" + n.Type + "）。", "完成本节点职责后把结论写进评论。"}
-	if len(n.Rules) > 0 {
-		lines = append(lines, "本站追加规则："+nl+strings.Join(n.Rules, nl))
+// agentsDocText 拼出整份 $WORKSPACE/AGENTS.md 的正文：默认职责 + 仓库策略指针 + 本站追加。
+//
+// 每次都整份重写，所以这份文件是我们自己的；仓库自带的 AGENTS.md 在 <source>/AGENTS.md，
+// 一个字都不动（用户原话：「不是改原始 AGENTS.md」）。没有追加内容时不留空小节。
+func agentsDocText(n *Node, source, appendText string) string {
+	lines := []string{
+		"你是链条上的一站：节点 " + n.Key + "（" + n.Type + "）。",
+		"完成本节点职责后把结论写进评论；想自审表态就打一行 CHAIN_VERDICT: pass 或 CHAIN_VERDICT: reject 原因。",
+		"仓库自带的策略在 " + source + "/AGENTS.md，存在就先读它，与本文冲突时以本文为准。",
 	}
-	return strings.Join(lines, nl)
+	doc := strings.Join(lines, nl)
+	if strings.TrimSpace(appendText) == "" {
+		return doc
+	}
+	return doc + nl + nl + "## 本站临时追加" + nl + nl + strings.TrimRight(appendText, nl) + nl
 }
 
 // redact 把密钥从要落盘的文本里抹掉：日志会进数据库、进页面，等于公开。

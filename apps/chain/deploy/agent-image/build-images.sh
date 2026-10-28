@@ -11,7 +11,13 @@
 set -eu
 cd "$(dirname "$0")"
 
+# 项目名那一行里的 ${APP} 是展开占位符：chain assets 会把它换成真名。
+# 仓库里没展开的这份跑起来时它不存在，所以这一行临时关掉 set -u——
+# 否则用户看到的是 "APP: unbound variable" 这种 shell 内部错误，
+# 而不是下面那句「没有项目名」的人话。
+set +u
 APP_NAME="${APP_NAME:-${APP}}"
+set -u
 VERSION="${VERSION:-latest}"
 : "${APP_NAME:?没有项目名：先跑 chain assets 展开，或 APP_NAME=名字 sh build-images.sh}"
 

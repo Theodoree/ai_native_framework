@@ -10,7 +10,7 @@
 - **需求**：进链即建分支（`req/<project>/<id>`），链的版本在进入时被钉住。
 - **节点状态机**：pending → running → awaiting_review → accepted；rejected 是回滚标记。
 - **谁审**：每个节点声明 `review: ai | human`。ai 的节点由容器自己定案，human 的节点停在待审等人按。
-- **评论、追加规则、执行记录**：都留在节点上，只追加不删。
+- **评论、执行记录**：留在节点上，只追加不删。**自定义 AGENTS.md**：整份读写（空＝清除），正文存文件、库里只留路径与摘要。
 - **拒绝**：回滚到上一节点，历史不清；首站被拒等于整条需求被拒。
 
 ## 它不做什么
@@ -26,8 +26,8 @@
 | 实体        | 关键字段                                                                                                                                         |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Project     | key、name、repo、defaultBranch、chains、createdAt                                                                                                |
-| Chain       | key、type、version、nodes[]（key、type、review、power）                                                                                          |
-| Node        | key、type、review、power、index、state、attempts[]、comments[]、rules[]、artifacts[]、rev                                                        |
+| Chain       | key、type、version、nodes[]（key、type、review、power、harness、version）                                                                        |
+| Node        | key、type、review、power、harness、version、index、state、attempts[]、comments[]、agents{path,md5,size,updatedAt}、artifacts[]、rev                   |
 | Role        | id、projectKey、name、powers[]、createdAt（**没有口令**：角色是授予给账号的，不是一把钥匙）                                                      |
 | Requirement | id、projectKey、chainKey、chainVersion、context、images、source、branch、state、nodes[]、rev、reporter（谁提的、回告地址；接入层带过来的原样存） |
 | User        | id、username、passwordHash、admin、createdAt                                                                                                     |
@@ -61,7 +61,18 @@ go run . assets --dry-run                             # 先看会展开哪些文
 go run . assets                                       # 展开到 $HOME/.<项目名>/
 ```
 
-`image` 是镜像**仓库路径**，`version` 是 tag：`image: ${APP}/agent-codex` + `version: 0.1.0` 合起来是 `<项目名>/agent-codex:0.1.0`，`version` 不给就是 `latest`。`image` 最后一段自带 tag（如 `registry.example.com:5000/app/agent-codex:1.2.3`）时以 `image` 为准、`version` 不再参与——只看最后一个 `/` 之后那一段，所以 registry 的端口号不会被当成 tag。项目名解析顺序是 `-app` > `CHAIN_APP` > 编译期默认（`-ldflags "-X main.appName=…"` 可改）。
+模板里有两个**互不相干**的字段：
+
+- `image` 是镜像引用，**原样**交给 `docker run`（自己带 tag，如 `${APP}/agent-codex:latest`）。
+- `version` 是**镜像里那个 agent CLI 的版本**（默认 `latest`），跟 tag 没关系：换 CLI 版本不用重烘镜像，容器的 `entrypoint.sh` 按它去 `npx -y <包>@<版本>` 解析。
+
+将来真把 harness 烘进镜像（`image:tag = harness@version`）时两者才会绑在一起，本期没做，代码里只留了注释。
+
+节点级还能各自覆盖：`harness` 决定用哪个模板（`codex` / `claude` / `deepseek-harness`），`version` 决定这一站跑哪个 CLI 版本。选择顺序是**节点声明 > 类型映射 > 内嵌默认**；进链时这两个字段就定成快照，事后改模板表不影响在跑的需求。空节点（`dev` / `merge`）声明 harness / version 会被拒——它不跑容器。
+
+`versions` 是给前端下拉框的候选清单（`GET /api/templates` 取，`latest` 排第一，其余按版本倒序最多 10 个），**不是白名单**：手填一个没列出来的版本照样跑（自由输入，allow-create）。
+
+项目名解析顺序是 `-app` > `CHAIN_APP` > 编译期默认（`-ldflags "-X main.appName=…"` 可改）。
 
 - 扩展名 `.yaml`/`.yml` 按 YAML 读，其余后缀仍走早期版本的扁平 JSON 格式（老配置不用改）。
 - 声明文件**不存在**时打一行日志回落内嵌默认表，服务照常起（部署里还没放这个文件时不至于起不来）。
@@ -96,11 +107,11 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 
 `${APP}` 是占位符：加载模板时换成当前项目名，`chain assets` 展开时也会把它换成真名写进 `nodes.yaml` 和 `build-images.sh`。所以项目改名之后（`-app` / `CHAIN_APP` / 编译期 `-ldflags`）模板表与脚本都不用动。
 
-镜像里只是 `node:22-slim` + git + 一个 agent CLI + `entrypoint.sh`。容器内的 clone / 写 AGENTS.md / 跑 agent / 报 `CHAIN_VERDICT:` 都归 `entrypoint.sh` 管。
+镜像里只有 `node:22-slim` + git + `entrypoint.sh`，**不预装 agent CLI**——版本是数据不是构建产物，容器里按 `CHAIN_AGENT` + `CHAIN_AGENT_VERSION` 用 `npx` 解析。想钉死某个版本（离线部署）就在 Dockerfile 里预装并打开 `ENV AGENT_CMD`，那时版本由镜像定。容器内的 clone / 写 AGENTS.md / 跑 agent / 报 `CHAIN_VERDICT:` 都归 `entrypoint.sh` 管。
 
 ### 注入什么、代码怎么进容器
 
-注入的环境变量：`BASE_URL`、`CHAIN_MODEL`、`CHAIN_AGENTS_MD`（默认职责 + 本站追加规则，不改仓库里的 AGENTS.md）、`CHAIN_REQUIREMENT`、`CHAIN_NODE`、`CHAIN_BRANCH`、`CHAIN_CONTEXT`、`CHAIN_REPO`（project 的 repo 原值）、`CHAIN_WORKSPACE_MODE`（`clone` / `mount`），以及（存在时）`CHAIN_MODEL_KEY`。模板自己的 `env` 追加在这批之后，同名的覆盖。
+注入的环境变量：`BASE_URL`、`CHAIN_MODEL`、`CHAIN_AGENTS_MD`（**整份** `$WORKSPACE/AGENTS.md` 的正文：默认职责 + 仓库策略指针 + 本站追加）、`CHAIN_AGENTS_APPEND`（只有本站追加那一段，同一份内容也拼进前缀 prompt，给不读文件的 agent 兜底）、`CHAIN_REQUIREMENT`、`CHAIN_NODE`、`CHAIN_BRANCH`、`CHAIN_CONTEXT`、`CHAIN_REPO`（project 的 repo 原值）、`CHAIN_WORKSPACE_MODE`（`clone` / `mount`）、`CHAIN_SOURCE`（仓库在工作区里的子目录名，默认 `repo`）、`CHAIN_AGENT`（跑哪个 CLI，就是模板键）、`CHAIN_AGENT_VERSION`（那个 CLI 的版本），以及（存在时）`CHAIN_MODEL_KEY`。模板自己的 `env` 追加在这批之后，同名的覆盖。
 
 代码获取**默认是 clone**：容器拿到 `CHAIN_REPO` + `CHAIN_BRANCH`，在容器里自己 `git clone --depth 1 --branch`。只有 project 的 repo 是本机绝对路径且目录存在时才改成挂载（`--mount type=bind,…,target=/work`），那是**本地开发捷径**——执行记录里会写清这次是 clone 还是 mount。
 
@@ -112,17 +123,47 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 
 密钥只从环境变量取，且执行日志会把它替换成 `***`；未知模板 fail-closed（不猜镜像）。
 
-### 给 agent 加插件、加技能
+### 给 agent 加插件、加技能：写这一站的自定义 AGENTS.md
 
-平台不做插件管理：没有「装 skill / 装插件 / 挂 MCP」这类配置项，节点声明里也没有对应字段。想让某一站的 agent 多会一件事，写进那一站的规则就够了。
+平台不做插件管理：没有「装 skill / 装插件 / 挂 MCP」这类配置项，节点声明里也没有对应字段。想让某一站的 agent 多会一件事，就给这一站写一份自定义 AGENTS.md——它会被注入容器的工作区，等于给这一站的 agent 加了一段临时策略（用户口径：「因为现在的 AGENTS.md 没有办法满足现在的功能，所以我需要临时追加一些信息」）。
 
-接口是 `POST /api/requirements/{id}/nodes/{node}/rules`，请求体 `rule`（`body` 也认），空规则被拒（`追加的规则不能为空`）。规则会被拼进这一站下一次执行的容器 AGENTS.md，所以它比评论危险：同一道成员门，但文案点明动的是这一站的规则（见「评论与规则：要成员，不要权力」）。
+**正文存文件，库里只有路径与摘要**（用户口径：`数据库里面存路径和 md5，外面存文件`）：
 
-注入是**每次执行重算**的。`CHAIN_AGENTS_MD` = 两行默认职责 + `本站追加规则：` + 该站全部规则（按追加顺序）；entrypoint 拿到后，`/work/AGENTS.md` 存在就往后追加一段 `## 本次节点的追加策略`，不存在才整份写入，没这个变量就沿用仓库里那份。所以改规则在下一次执行就生效，不用重建镜像。规则只能追加，没有删除单条规则的接口。
+| 存在哪 | 说明 |
+| --- | --- |
+| 正文 | `$HOME/.<项目名>/agents/<需求 id>/<站 key>.md`（只建 `agents` 这一个文件夹；先写临时文件再改名，读的人不会读到写了一半的那份） |
+| 库里 | `nodes` 表的 `agents_path` / `agents_md5` / `agents_size` / `agents_updated_at` 四列，**没有正文列** |
+| 路径形状 | 相对 AppHome 的路径，不是绝对路径——项目改名后 AppHome 跟着变，存绝对路径的老记录一律失效 |
+
+摘要字段叫 `md5`（用户原话），算的是 sha256：同一个职责、更强的摘要。
+
+接口沿用 `/rules` 路径，语义是**整份文档**：
+
+- `GET /api/requirements/{id}/nodes/{node}/rules` → `{content, path, md5, size, updatedAt}`；没有文档时 `content` 是空串。
+- `POST` 同路径，请求体 `{content}` **整份覆盖**；`content` 全是空白＝清除（删文件、清字段、仍 200）；上限 256 KiB，超了 400 并报出实际字节数。
+- 这道门与评论同一条成员门（文案「改不了这一站的规则」），但自定义文档比评论危险得多：评论只留一句话，这份文档会被整份注入容器、在下一站真正执行。
+
+**注入（每次执行整份重写）**。工作区布局是用户定的：
+
+```
+$WORKSPACE/
+           AGENTS.md      ← 平台写（默认职责 + 仓库策略指针 + 本站追加），每次整份重写
+           $SOURCE/       ← git clone 出来的仓库（默认名 repo，CHAIN_SOURCE 可改）
+```
+
+- `$WORKSPACE/AGENTS.md` 是我们自己的文件，每次执行整份重写：两行默认职责 + 一句指针「仓库自带的策略在 `$SOURCE/AGENTS.md`，存在就先读它，与本文冲突时以本文为准」；这一站有追加内容时再接一段 `## 本站临时追加`。没有追加内容就不留空小节。
+- 仓库自带的 `$SOURCE/AGENTS.md` **一个字都不动**（用户口径：「不是改原始 AGENTS.md」）。用例 `TestWorkspaceAgentsLayout` 断言它逐字节不变。
+- agent 的 cwd 是工作区根，不是仓库目录：它要同时看到 `AGENTS.md` 与仓库子目录。
+- 追加内容同时进 `CHAIN_AGENTS_APPEND` 与前缀 prompt：有的 agent 根本不读文件，prompt 是保底。
+- 重启重跑会按同一份内容重新注入，不需要人工重填。
+
+**对不上就不跑（fail-closed）**。每次读（含注入前）都重算摘要与库里的 `md5` 比对：文件被人手改过、或文件没了但库里还有记录，这一站直接拒绝执行，在该站留一条系统评论「自定义 AGENTS.md 与库里记录不符（md5 不符 / 文件缺失），这一站不跑」。不一致的内容绝不进容器——那等于让容器跑一份没人知道是什么的指令。
+
+**老数据**：以前存在节点上的 `rules[]` 会在读到这条需求时一次性搬成文件（一行一个「- 」列表项），搬完清空旧字段，幂等。代码不再往 `rules[]` 写。
 
 只有「每次执行都要有、且与具体需求无关」的东西（新的 CLI、系统依赖）才动 Dockerfile 与 entrypoint，因为那属于镜像。
 
-一句话：**随需求变的能力写规则，随平台变的能力进镜像**。
+一句话：**随需求变的能力写这一站的 AGENTS.md，随平台变的能力进镜像**。
 
 ## HTTP 接口
 
@@ -130,6 +171,7 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 | ---------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | GET        | `/`                                              | 内嵌前端（`webui/dist`）                                                                                                                          |
 | GET        | `/assets/`                                       | 内嵌前端的静态资源                                                                                                                                |
+| GET        | `/api/templates`                                | 节点模板表：`[{key, image, version, versions, timeout}]`（登录即可）。建链时前端拿它填 harness 下拉框与版本候选                          |
 | GET / POST | `/api/projects`                                  | 列表只回我参与的项目（管理员回全部）/ 创建（key 重复 409）。**管理员**；只写 project 本身，不授予任何人角色                                       |
 | GET        | `/api/requirements`                              | 只回我参与的项目下的需求                                                                                                                          |
 | POST       | `/api/p/{project}/requirements`                  | 提需求（body: context、images、source、chain）。**项目成员**：任一权力即成员，管理员天生是                                                        |
@@ -139,7 +181,7 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 | POST       | `/api/requirements/{id}/nodes/{node}/reject`     | 驳回（reason 必填，409 表示不是当前站）                                                                                                           |
 | POST       | `/api/requirements/{id}/nodes/{node}/restart`    | 从这一站重跑（按不动就 403）                                                                                                                      |
 | POST       | `/api/requirements/{id}/nodes/{node}/comment`    | 评论（**项目成员**，不查权力）                                                                                                                    |
-| POST       | `/api/requirements/{id}/nodes/{node}/rules`      | 往这一站追加规则，默认 AGENTS.md 不改（**项目成员**，不查权力）                                                                                   |
+| GET / POST | `/api/requirements/{id}/nodes/{node}/rules`      | 读 / 整份覆盖这一站的自定义 AGENTS.md：`{content, path, md5, size, updatedAt}`，空 content＝清除，上限 256 KiB（**项目成员**，不查权力）           |
 | POST       | `/api/requirements/{id}/images`                  | 传图：`multipart/form-data`，字段名 `files`（可多个）；一次 ≤5 张、每张 ≤5MB，按文件头认 png / jpeg / webp / gif；有一张不合规就整批 400 且不进盘 |
 | GET        | `/api/requirements/{id}/images/{name}`           | 取图：原样字节 + 正确的 `Content-Type` / `Content-Length`；文件名越界、或不属于这条需求，一律 404                                                 |
 | DELETE     | `/api/requirements/{id}/images/{name}`           | 删图：文件删掉、同时从 `Images` 里摘掉；找不到 404                                                                                                |
@@ -193,7 +235,7 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 | 提需求 / 拉结论（接入层）                 | 该项目的成员（管理员天生是；普通账号要有这个项目里任一角色）                                                        |
 | 按节点（run / accept / reject / restart） | 有这个节点所要权力的人                                                                                              |
 | 看需求、看图、看列表                      | 列表只回我参与的项目；单条需求与图片要成员资格（401 → 404 → 403）                                                   |
-| 评论、追加规则                            | 该项目的成员，不查权力                                                                                              |
+| 评论、自定义 AGENTS.md                    | 该项目的成员，不查权力                                                                                              |
 
 > 建项目限管理员、加成员也是管理员专属，所以「建完项目自己进不去」这个缝不存在：建项目的人一定是管理员，管理员天生算任何项目的成员。普通账号的项目成员资格只有一个来源——管理员在项目设置里授予一个角色。
 
@@ -231,11 +273,11 @@ APP_NAME=别的名字 sh build-images.sh      # 换前缀（要和 nodes.yaml �
 
 没有权力时按钮按不动，只能看。这是刻意的：宽进来一次就会变成常态。
 
-### 评论与规则：要成员，不要权力
+### 评论与自定义 AGENTS.md：要成员，不要权力
 
-`comment` 与 `rules`（给这一站追加规则）不校验**权力**，但要校验**成员资格**：是这个项目的人才能说话，作者记成账号名。
+`comment` 与 `rules`（读写这一站的自定义 AGENTS.md）不校验**权力**，但要校验**成员资格**：是这个项目的人才能说话，作者记成账号名。
 
-评论以前对任何登录的人开放，现在收进项目边界。规则比评论更严——它会被拼进容器的 AGENTS.md，影响容器下一步怎么干，所以走的是同一条成员门，文案是「改不了这一站的规则」。
+评论以前对任何登录的人开放，现在收进项目边界。自定义 AGENTS.md 比评论更严——它会被整份注入容器的工作区、影响容器下一步怎么干，所以走的是同一条成员门，文案是「改不了这一站的规则」。
 
 ## 怎么跑
 

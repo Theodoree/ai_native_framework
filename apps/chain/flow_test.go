@@ -143,6 +143,8 @@ func grantRole(t *testing.T, ts *httptest.Server, project, roleName, username st
 
 func newTestServer(t *testing.T) (*httptest.Server, Store, string) {
 	t.Helper()
+	// 自定义 AGENTS.md 落在 $HOME/.<项目名>/agents 下：不隔离的话测试会往真家目录写。
+	t.Setenv("HOME", t.TempDir())
 	path := filepath.Join(t.TempDir(), "chain.db")
 	store, err := OpenStore("sqlite", path)
 	if err != nil {

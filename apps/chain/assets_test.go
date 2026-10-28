@@ -160,11 +160,11 @@ func TestImageRefForms(t *testing.T) {
 		tmpl Template
 		want string
 	}{
-		{"不带 tag 补 latest", Template{Image: "demo_app/agent-codex"}, "demo_app/agent-codex:latest"},
-		{"带 tag 原样", Template{Image: "registry.example.com:5000/agent/codex:1.2.3", Version: "latest"}, "registry.example.com:5000/agent/codex:1.2.3"},
-		{"占位符替换后补 latest", Template{Image: appPlaceholder + "/agent-claude"}, "demo_app/agent-claude:latest"},
-		{"手动指定版本", Template{Image: "demo_app/agent-deepseek-harness", Version: "0.9.0"}, "demo_app/agent-deepseek-harness:0.9.0"},
-		{"registry 端口不算 tag", Template{Image: "registry.example.com:5000/agent/codex", Version: "1.0"}, "registry.example.com:5000/agent/codex:1.0"},
+		{"带 tag 原样", Template{Image: "demo_app/agent-codex:latest"}, "demo_app/agent-codex:latest"},
+		{"带别的 tag 也原样", Template{Image: "registry.example.com:5000/agent/codex:1.2.3"}, "registry.example.com:5000/agent/codex:1.2.3"},
+		{"占位符展开", Template{Image: appPlaceholder + "/agent-claude:latest"}, "demo_app/agent-claude:latest"},
+		{"CLI 版本不参与拼 tag", Template{Image: "demo_app/agent-deepseek-harness:latest", Version: "0.9.0"}, "demo_app/agent-deepseek-harness:latest"},
+		{"改版本镜像一字不变", Template{Image: "demo_app/agent-codex:2026.1", Version: "0.164.0"}, "demo_app/agent-codex:2026.1"},
 	}
 	for _, c := range cases {
 		if got := c.tmpl.ImageRef(); got != c.want {
