@@ -126,4 +126,4 @@ cd ../../apps/web && npm ci && npm run build    # 改前端后重建，产物进
 
 ## 贡献
 
-见 `CONTRIBUTING.md`。安全问题请走 `SECURITY.md`，不要开公开 issue。许可证是 MIT，全文在 `LICENSE`。
+改动流程见 `CONTRIBUTING.md`，安全问题按 `SECURITY.md` 私下报告。
