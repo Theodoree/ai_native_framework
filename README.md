@@ -1,13 +1,12 @@
 # AI 原生研发交付引擎
 
-一条需求从提出到上线，中间只有两样东西：**链条**和**节点状态**。
-没有独立编排器，没有 CI 门禁，也不依赖 GitHub 的任何一套机制——一个 Go 二进制，页面、节点模板、镜像脚本全在里面。
+一条需求提进来，按顺序走过几站，每站由人或容器处理，通过了才往下走。整个平台是一个 Go 程序，浏览器打开就能用。
 
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev) [![Vue](https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vue.js&logoColor=white)](https://vuejs.org) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE) [![Release](https://img.shields.io/badge/release-v0.1.0-informational?style=flat-square)](CHANGELOG.md) [![powered by dsh](https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
-## 它是怎么排的
+## 一条需求怎么走
 
-链条是节点顺序的声明，节点类型封闭为六类，头必须是需求评估、尾必须是上线：
+链条就是站的顺序。第一站固定是需求评估，最后一站固定是上线，中间可以放开发、跨端测试、合并：
 
 ```mermaid
 flowchart LR
@@ -19,26 +18,28 @@ flowchart LR
   release --> done([交付])
 ```
 
-其中「开发」「合并」是空节点——人在分支上干活、在仓库里合回主线，平台只记状态；其余节点起容器跑 agent，跑完把执行记录与结论写进这一站的评论区。
+「开发」和「合并」这两站是空的：你自己在分支上写代码、自己在仓库里合回主线，平台只记这站做完没做。其余几站平台会起一个容器让 agent 去干，干完把输出和结论贴进这一站的评论区。
 
-需求此刻站在哪一层，由「第一个还没通过的节点」推导出来，不单独存一个位置字段：
+需求现在停在哪一站，不单独存字段：从头数，第一个还没通过的站就是它当前的位置。
+
+每一站内部只有五种状态：
 
 ```mermaid
 stateDiagram-v2
   [*] --> pending
   pending --> running: 开跑
-  running --> awaiting_review: 跑完（容器给结论 / 等人审）
+  running --> awaiting_review: 跑完了
   awaiting_review --> accepted: 通过
   awaiting_review --> rejected: 驳回
-  rejected --> running: 退回上一站
+  rejected --> running: 退回上一站重来
   accepted --> [*]
 ```
 
-驳回即回滚到上一站，历史一条不删；第一站被驳回等于整条需求被驳回。
+驳回就是退回上一站，之前的记录一条都不删。如果第一站就被驳回，整条需求被拒。
 
-## Quick Start
+## 跑起来
 
-需要 Go 1.26+（前端产物已入库，不装 Node 也能跑）。
+需要 Go 1.26 以上。前端文件已经放在仓库里，不用装 Node。
 
 ```bash
 git clone https://github.com/Theodoree/ai_native_framework.git
@@ -47,19 +48,25 @@ go build -o chain .
 ./chain                                    # 打开 http://127.0.0.1:8099
 ```
 
-第一次打开没有注册入口：先用命令行建第一个管理员 `./chain user add -username admin -password <至少 8 位> -admin`，之后所有人由管理员在「用户」页建账号。
-
-默认 `-exec fake` 只写一条评论、不连外部服务。想接真容器：
+页面没有注册入口。先建一个管理员：
 
 ```bash
-./chain assets                             # 节点模板与镜像脚本展开到 ~/.ai_native_framework
+./chain user add -username admin -password 至少八位的密码 -admin
+```
+
+之后所有账号都由管理员在「用户」页添加。
+
+默认是 `-exec fake`：不真的跑容器，只写一条假评论，用来点页面。要真的起容器：
+
+```bash
+./chain assets                             # 把节点模板和镜像脚本解到 ~/.ai_native_framework
 sh ~/.ai_native_framework/agent-image/build-images.sh
 DEEPSEEK_API_KEY=sk-... ./chain -exec docker
 ```
 
-## 从平台外面提需求
+## 从别的系统提需求
 
-在「我的密钥」页建一把 API 密钥（`ak_…`，secret 只出现一次），之后：
+先在「我的密钥」页建一把 API 密钥（`ak_` 开头，只在建的时候显示一次），然后：
 
 ```bash
 curl -X POST http://127.0.0.1:8099/api/intake/requirements \
@@ -68,24 +75,24 @@ curl -X POST http://127.0.0.1:8099/api/intake/requirements \
   -d '{"project":"acme","context":"导出功能不支持 CSV，客户要"}'
 ```
 
-拉结论走 `GET /api/intake/requirements/{id}`。整条需求被拒时会尽力回告一次，**回告失败不改状态**——拉模式永远是可信的那条路。
+再用 `GET /api/intake/requirements/{id}` 查结果。整条需求被拒时平台会往你给的回调地址发一次通知；发不出去也不影响需求状态，自己来查最靠谱。
 
 ## 它是什么
 
-- **一个二进制**：页面（Vue 3 + Arco Design Vue）`//go:embed` 进产物，节点模板与镜像脚本也在里面，`./chain assets` 就地展开。
-- **状态只有一个写者**：跑、通过、驳回、评论、重启都经状态机，HTTP 层只做校验与搬运。
-- **人保留否决权**：合并不由平台代做；人审节点的按钮只有人按得动。
-- **够小**：SQLite（纯 Go 驱动，免 cgo）单文件存全部状态；`Store` 是接口，换库只加一个实现。
+- **一个程序**：页面（Vue 3 + Arco Design Vue）、节点模板、镜像脚本都打在同一个二进制里，`./chain assets` 可以把模板和脚本展开到磁盘上改。
+- **状态只有一处能改**：开跑、通过、驳回、评论、重启都走同一套状态机，接口层只做校验和转发。
+- **人保留否决权**：合并不由平台代做；需要人审的站，按钮只有人按得动。
+- **很小**：所有状态存在一个 SQLite 文件里（纯 Go 驱动，不用 cgo）。存储是接口，换数据库只要再写一个实现。
 
 ## 它不是什么
 
-- 不是 CI：没有 required check、没有 PR 门禁，判定不发生在 YAML 里。
-- 不做插件管理：想让某个节点的 agent 多会一件事，写那一站的规则（内容只进容器、每次执行重算）。
-- 不做人员目录：账号、项目级角色、API 密钥三样，够用为止。
+- 不是 CI：没有 required check，也没有 PR 门禁，判定不写在 YAML 里。
+- 不管插件：想让某站的 agent 多会一件事，就写那一站的规则，规则只喂给容器。
+- 不是人员目录：账号、项目里的角色、API 密钥，三样够用为止。
 
 ## 还没做的
 
-完整清单与「开工前要先定什么」在 [docs/TODO.md](docs/TODO.md)，这里只列条目：
+完整清单和「开工前要先定什么」在 [docs/TODO.md](docs/TODO.md)，这里只列条目：
 
 - [ ] k3s 接入（现在只有本机 `docker run`）
 - [ ] MySQL 改造（`Store` 是接口，目前只有 SQLite 一个实现）
@@ -122,8 +129,4 @@ gofmt -l *.go && go vet ./...                  # 格式与静态检查
 cd ../../apps/web && npm ci && npm run build    # 改前端后重建，产物进 apps/chain/webui/dist
 ```
 
-改完前端记得重建：产物是入库的，`go:embed` 打的是它，忘了构建就等于没改。
-
-## 贡献
-
-改动流程见 `CONTRIBUTING.md`。
+改了前端记得重建：产物是入库的，`go:embed` 打的就是它，忘了构建等于没改。
